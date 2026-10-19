@@ -124,6 +124,16 @@ class CustomerDataStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_wallet_user
                     ON wallet_ledger(tenant_id, telegram_id, ledger_id);
+                CREATE TRIGGER IF NOT EXISTS wallet_ledger_no_update
+                BEFORE UPDATE ON wallet_ledger
+                BEGIN
+                    SELECT RAISE(ABORT, 'wallet ledger is append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS wallet_ledger_no_delete
+                BEFORE DELETE ON wallet_ledger
+                BEGIN
+                    SELECT RAISE(ABORT, 'wallet ledger is append-only');
+                END;
                 CREATE TABLE IF NOT EXISTS payment_attempts (
                     tenant_id TEXT NOT NULL,
                     payment_id TEXT NOT NULL,

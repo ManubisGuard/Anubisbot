@@ -102,6 +102,24 @@ class CustomerDataStoreTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(self.store.wallet_balance(1001), 5000)
 
+    def test_wallet_ledger_is_append_only_at_database_level(self):
+        ledger_id = self.store.post_wallet_entry(
+            telegram_id=1001, idempotency_key="append-only-entry",
+            amount_minor=1250, entry_type="deposit",
+        )
+        with sqlite3.connect(self.path) as db:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                db.execute("UPDATE wallet_ledger SET amount_minor=9999 WHERE ledger_id=?", (ledger_id,))
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                db.execute("DELETE FROM wallet_ledger WHERE ledger_id=?", (ledger_id,))
+        self.assertEqual(self.store.wallet_balance(1001), 1250)
+        # Corrections must be represented by a separate compensating entry.
+        self.store.post_wallet_entry(
+            telegram_id=1001, idempotency_key="append-only-reversal",
+            amount_minor=-250, entry_type="reversal", reference="append-only-entry",
+        )
+        self.assertEqual(self.store.wallet_balance(1001), 1000)
+
     def test_conflicting_idempotency_key_is_rejected(self):
         self.store.post_wallet_entry(
             telegram_id=1001, idempotency_key="same-key", amount_minor=5000,
