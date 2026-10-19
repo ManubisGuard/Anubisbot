@@ -177,6 +177,25 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         service = self.bot.data.get_customer_service("svc-private-refresh", telegram_id=998)
         self.assertEqual(service["traffic_used_bytes"], 123)
 
+    async def test_customer_can_request_private_subscription_qr(self):
+        self.bot.data.ensure_customer(999, first_name="QR owner")
+        self.bot.data.upsert_service(service_id="svc-qr", telegram_id=999, panel_id="pg-qr",
+            provider_user_id="qr-user", status="active")
+        with self.bot.data._connect() as db:
+            db.execute("UPDATE customer_services SET username=?,subscription_url=? WHERE tenant_id=? AND service_id=?",
+                ("qr-user", "https://sub.example/private-token", self.bot.data.tenant_id, "svc-qr"))
+        self.bot.api.send_photo_bytes = AsyncMock()
+        with patch("manubisguard.telegram.customer_bot.make_subscription_qr_png", return_value=b"PNGDATA") as make_qr:
+            await self.bot._handle_callback({"id": "qr-cb", "from": {"id": 999},
+                "message": {"chat": {"id": 999, "type": "private"}},
+                "data": "customer:service_qr:svc-qr"})
+        make_qr.assert_called_once_with("https://sub.example/private-token")
+        self.bot.api.send_photo_bytes.assert_awaited_once()
+        args = self.bot.api.send_photo_bytes.await_args.args
+        self.assertEqual(args[0], 999)
+        self.assertEqual(args[2], b"PNGDATA")
+        self.assertNotIn("private-token", self.bot.api.send_photo_bytes.await_args.kwargs.get("caption", ""))
+
     async def test_customer_cannot_open_another_users_service_detail(self):
         self.bot.data.ensure_customer(998, first_name="Other owner")
         self.bot.data.upsert_service(

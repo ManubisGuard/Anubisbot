@@ -70,8 +70,59 @@ class TelegramBotAPI:
             raise TelegramAPIError(f"Telegram API rejected {method} (code {result.get('error_code', 'unknown')})")
         return result.get("result")
 
+    def _upload_sync(self, method: str, payload: dict[str, Any], filename: str,
+                     content: bytes, content_type: str, file_field: str = "document") -> Any:
+        boundary = "----ManubisGuardUploadBoundary"
+        parts: list[bytes] = []
+        for key, value in payload.items():
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, separators=(",", ":"))
+            parts.extend([
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode(),
+                str(value).encode("utf-8"), b"\r\n",
+            ])
+        parts.extend([
+            f"--{boundary}\r\n".encode(),
+            f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'.encode(),
+            f"Content-Type: {content_type}\r\n\r\n".encode(), content, b"\r\n",
+            f"--{boundary}--\r\n".encode(),
+        ])
+        request = urllib.request.Request(
+            API_ROOT.format(token=self._config.token, method=method),
+            data=b"".join(parts),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                     "User-Agent": "ManubisGuard-Preview/0.2"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._config.request_timeout) as response:
+                result = json.loads(response.read().decode())
+        except urllib.error.HTTPError as exc:
+            raise TelegramAPIError(f"Telegram HTTP error ({exc.code}) for {method}") from None
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            raise TelegramAPIError(f"Telegram network/response error for {method}: {type(exc).__name__}") from None
+        if not result.get("ok"):
+            raise TelegramAPIError(f"Telegram API rejected {method} (code {result.get('error_code', 'unknown')})")
+        return result.get("result")
+
     async def call(self, method: str, payload: dict[str, Any] | None = None) -> Any:
         return await asyncio.to_thread(self._request_sync, method, payload)
+
+    async def send_document_bytes(self, chat_id: int, filename: str, content: bytes,
+                                  content_type: str = "application/octet-stream",
+                                  caption: str | None = None) -> None:
+        payload: dict[str, Any] = {"chat_id": chat_id, "protect_content": True}
+        if caption:
+            payload["caption"] = caption[:1024]
+        await asyncio.to_thread(self._upload_sync, "sendDocument", payload, filename, content, content_type)
+
+    async def send_photo_bytes(self, chat_id: int, filename: str, content: bytes,
+                               caption: str | None = None) -> None:
+        payload: dict[str, Any] = {"chat_id": chat_id, "protect_content": True}
+        if caption:
+            payload["caption"] = caption[:1024]
+        await asyncio.to_thread(self._upload_sync, "sendPhoto", payload, filename, content, "image/png", "photo")
 
     async def send_text(self, chat_id: int, text: str, keyboard: dict[str, Any] | None = None) -> None:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text, "protect_content": True}

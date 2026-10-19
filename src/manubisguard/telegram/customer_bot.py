@@ -17,6 +17,9 @@ from manubisguard.telegram.content_admin import (
     begin_content_edit, content_admin_keyboard, content_value, save_pending_content,
 )
 from manubisguard.telegram.content_store import BotContentStore
+from manubisguard.telegram.subscription_qr import (
+    SubscriptionQRError, make_subscription_qr_png, validate_subscription_url,
+)
 from manubisguard.customer_store import CustomerDataStore, CustomerStoreError
 from manubisguard.panels.registry import default_registry
 from manubisguard.sales.service import CustomerPurchaseService, CustomerServiceChangeService, PurchaseNeedsReconciliation
@@ -1390,17 +1393,34 @@ class CustomerBot:
         chat_id = chat.get("id")
         if not isinstance(chat_id, int):
             return
-        if data.startswith(("customer:service_detail:", "customer:service_refresh:")):
+        if data.startswith(("customer:service_detail:", "customer:service_refresh:", "customer:service_qr:")):
             if not isinstance(uid, int):
                 return
             is_refresh = data.startswith("customer:service_refresh:")
-            prefix = "customer:service_refresh:" if is_refresh else "customer:service_detail:"
+            is_qr = data.startswith("customer:service_qr:")
+            prefix = ("customer:service_refresh:" if is_refresh else
+                      "customer:service_qr:" if is_qr else "customer:service_detail:")
             service_id = data.partition(prefix)[2]
             service = self.data.get_customer_service(service_id, telegram_id=uid)
             refresh_ok = False
             if service and is_refresh:
                 refresh_ok = await self._refresh_customer_service_snapshot(service=service, telegram_id=uid)
                 service = self.data.get_customer_service(service_id, telegram_id=uid)
+            if service and is_qr:
+                try:
+                    qr_png = make_subscription_qr_png(service.get("subscription_url"))
+                    safe_service_id = re.sub(r"[^A-Za-z0-9_-]", "_", service_id)[:48] or "service"
+                    await self.api.send_photo_bytes(
+                        chat_id, f"subscription-{safe_service_id}.png", qr_png,
+                        caption="🔐 QR خصوصی اشتراک شما\nفقط در اختیار خودتان نگه دارید.",
+                    )
+                except SubscriptionQRError:
+                    await self.api.send_text(chat_id, "لینک اشتراک معتبر نیست یا تولید QR در این محیط آماده نیست؛ لینک ذخیره‌شده تغییر نکرده است.", BACK_MENU)
+                    return
+                except TelegramAPIError as exc:
+                    LOG.warning("Could not send subscription QR (%s)", type(exc).__name__)
+                    await self.api.send_text(chat_id, "ارسال QR ناموفق بود؛ لطفاً کمی بعد دوباره تلاش کنید.", BACK_MENU)
+                    return
             if not service:
                 await self.api.send_text(chat_id, "این سرویس وجود ندارد یا متعلق به حساب شما نیست.", BACK_MENU)
                 return
@@ -1438,13 +1458,20 @@ class CustomerBot:
                 lines.append("\nاین اطلاعات در همین درخواست از پنل خوانده شد؛ در صورت ناقص بودن پاسخ پنل، بعضی مقادیر قبلی حفظ می‌شوند.")
             else:
                 lines.append("\nاطلاعات مصرف/انقضا ممکن است تا بررسی بعدی پنل به‌روز نشده باشد.")
-            await self.api.send_text(chat_id, "\n".join(lines), {
-                "inline_keyboard": [
-                    [{"text": "🔄 به‌روزرسانی از پنل", "callback_data": f"customer:service_refresh:{service['service_id']}"}],
-                    [{"text": "⬅️ بازگشت به سرویس‌ها", "callback_data": "customer:services"}],
-                    [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
-                ]
-            })
+            detail_keyboard = {"inline_keyboard": [
+                [{"text": "🔄 به‌روزرسانی از پنل", "callback_data": f"customer:service_refresh:{service['service_id']}"}],
+                [{"text": "⬅️ بازگشت به سرویس‌ها", "callback_data": "customer:services"}],
+                [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
+            ]}
+            if service.get("subscription_url"):
+                try:
+                    validate_subscription_url(service["subscription_url"])
+                    detail_keyboard["inline_keyboard"].insert(
+                        1, [{"text": "▦ دریافت QR اشتراک", "callback_data": f"customer:service_qr:{service['service_id']}"}]
+                    )
+                except SubscriptionQRError:
+                    pass
+            await self.api.send_text(chat_id, "\n".join(lines), detail_keyboard)
             return
         if data.startswith(("customer:renew_confirm:", "customer:topup_confirm:")):
             if not isinstance(uid, int):
