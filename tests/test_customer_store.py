@@ -216,6 +216,27 @@ class CustomerDataStoreTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(self.store.wallet_balance(1001), 2500)
 
+    def test_concurrent_verified_payment_replays_credit_wallet_once(self):
+        self.store.create_payment_attempt(
+            payment_id="pay-concurrent-settle", telegram_id=1001, provider="mock",
+            amount_minor=3200, currency="IRR", idempotency_key="intent-concurrent-settle",
+        )
+        def settle(_):
+            return self.store.settle_verified_wallet_deposit(
+                payment_id="pay-concurrent-settle", verified_amount_minor=3200,
+                verified_currency="IRR", external_reference="provider-concurrent-ref",
+            )
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(settle, (1, 2)))
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(self.store.wallet_balance(1001), 3200)
+        self.assertEqual([e["event_type"] for e in self.store.list_payment_attempt_events("pay-concurrent-settle")],
+                         ["created", "verified"])
+        with self.store._connect() as db:
+            rows = db.execute("SELECT COUNT(*) FROM wallet_ledger WHERE tenant_id=? AND idempotency_key=?",
+                              (self.store.tenant_id, "payment:pay-concurrent-settle")).fetchone()[0]
+        self.assertEqual(rows, 1)
+
     def test_payment_amount_mismatch_does_not_credit_wallet(self):
         self.store.create_payment_attempt(
             payment_id="pay-2", telegram_id=1001, provider="mock", amount_minor=2500,
