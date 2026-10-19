@@ -215,6 +215,15 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_message(command)
         self.assertEqual(self.bot.data.wallet_balance(999),2500)
         self.assertEqual(self.bot.data.get_payment_attempt(payment_id)["status"],"verified")
+        events = self.bot.data.list_payment_attempt_events(payment_id)
+        self.assertEqual([event["event_type"] for event in events], ["created", "verified"])
+        self.assertEqual(events[-1]["actor_telegram_id"], 6883349141)
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":f"/payment-events {payment_id}"})
+        history = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("سابقه تغییرناپذیر پرداخت", history)
+        self.assertIn("bank-ref-12345", history)
+        self.assertIn("6883349141", history)
 
     async def test_manual_deposit_amount_mismatch_never_credits_wallet(self):
         await self.bot._handle_message({
@@ -228,6 +237,19 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(self.bot.data.wallet_balance(999),0)
         self.assertEqual(self.bot.data.get_payment_attempt(payment_id)["status"],"pending")
+
+    async def test_customer_cannot_read_payment_audit_events(self):
+        self.bot.data.ensure_customer(999)
+        self.bot.data.create_payment_attempt(payment_id="private-audit-payment", telegram_id=999,
+            provider="manual", amount_minor=500, currency="IRR", idempotency_key="private-audit-intent")
+        self.bot.data.settle_verified_wallet_deposit(payment_id="private-audit-payment",
+            verified_amount_minor=500, verified_currency="IRR", external_reference="private-bank-ref",
+            verified_by=6883349141)
+        await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},
+            "text":"/payment-events private-audit-payment"})
+        response = self.bot.api.send_text.await_args.args[1]
+        self.assertNotIn("private-bank-ref", response)
+        self.assertNotIn("سابقه تغییرناپذیر پرداخت", response)
 
     async def test_admin_wallet_credit_is_idempotent_by_receipt_reference(self):
         self.bot.data.ensure_customer(999)

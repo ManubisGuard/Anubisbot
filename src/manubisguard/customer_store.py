@@ -153,6 +153,27 @@ class CustomerDataStore:
                     FOREIGN KEY(tenant_id, telegram_id)
                         REFERENCES customer_users(tenant_id, telegram_id)
                 );
+                CREATE TABLE IF NOT EXISTS payment_attempt_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL,
+                    payment_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL CHECK(event_type IN ('created','verified','failed')),
+                    actor_telegram_id INTEGER,
+                    amount_minor INTEGER NOT NULL CHECK(amount_minor > 0),
+                    currency TEXT NOT NULL CHECK(length(currency) = 3),
+                    external_reference TEXT NOT NULL DEFAULT '',
+                    failure_code TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(tenant_id,payment_id) REFERENCES payment_attempts(tenant_id,payment_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_payment_attempt_events
+                    ON payment_attempt_events(tenant_id,payment_id,event_id);
+                CREATE TRIGGER IF NOT EXISTS payment_attempt_events_no_update
+                BEFORE UPDATE ON payment_attempt_events
+                BEGIN SELECT RAISE(ABORT, 'payment attempt events are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS payment_attempt_events_no_delete
+                BEFORE DELETE ON payment_attempt_events
+                BEGIN SELECT RAISE(ABORT, 'payment attempt events are append-only'); END;
                 CREATE TABLE IF NOT EXISTS customer_orders (
                     tenant_id TEXT NOT NULL,
                     order_id TEXT NOT NULL,
@@ -920,6 +941,9 @@ class CustomerDataStore:
                    VALUES(?,?,?,?,?,?,'pending',?)""",
                 (self.tenant_id, payment_id, telegram_id, provider, amount_minor, currency, idempotency_key),
             )
+            db.execute("""INSERT INTO payment_attempt_events
+                (tenant_id,payment_id,event_type,amount_minor,currency) VALUES(?,?,'created',?,?)""",
+                (self.tenant_id, payment_id, amount_minor, currency))
             db.commit()
             return payment_id
         except Exception:
@@ -990,11 +1014,17 @@ class CustomerDataStore:
                 idempotency_key=f"wallet-credit:payment:{payment_id}",
                 payload={"public_order_id": payment_id[:20], "amount_minor": verified_amount_minor,
                          "currency": verified_currency})
-            db.execute(
+            cur = db.execute(
                 """UPDATE payment_attempts SET status='verified',external_reference=?,
                    updated_at=CURRENT_TIMESTAMP WHERE tenant_id=? AND payment_id=? AND status='pending'""",
                 (external_reference[:256], self.tenant_id, payment_id),
             )
+            if cur.rowcount != 1:
+                raise CustomerStoreError("Payment status changed during settlement")
+            db.execute("""INSERT INTO payment_attempt_events
+                (tenant_id,payment_id,event_type,actor_telegram_id,amount_minor,currency,external_reference)
+                VALUES(?,?,'verified',?,?,?,?)""",
+                (self.tenant_id, payment_id, verified_by, verified_amount_minor, verified_currency, external_reference[:256]))
             db.commit()
             return ledger_id
         except Exception:
@@ -1011,6 +1041,14 @@ class CustomerDataStore:
         with self._connect() as db:
             row = db.execute(sql, args).fetchone()
         return dict(row) if row else None
+
+    def list_payment_attempt_events(self, payment_id: str) -> list[dict[str, Any]]:
+        """Return tenant-scoped immutable lifecycle events for a payment attempt."""
+        with self._connect() as db:
+            rows = db.execute("""SELECT event_id,payment_id,event_type,actor_telegram_id,amount_minor,
+                currency,external_reference,failure_code,created_at FROM payment_attempt_events
+                WHERE tenant_id=? AND payment_id=? ORDER BY event_id""", (self.tenant_id, payment_id)).fetchall()
+        return [dict(row) for row in rows]
 
     def fail_payment_attempt(self, *, payment_id: str, failure_code: str) -> None:
         """Fail only a pending payment, atomically; never overwrite a verified settlement."""
@@ -1037,6 +1075,11 @@ class CustomerDataStore:
             )
             if cur.rowcount != 1:
                 raise CustomerStoreError("Payment state changed; refusing to mark it failed")
+            db.execute("""INSERT INTO payment_attempt_events
+                (tenant_id,payment_id,event_type,amount_minor,currency,failure_code)
+                SELECT tenant_id,payment_id,'failed',amount_minor,currency,?
+                FROM payment_attempts WHERE tenant_id=? AND payment_id=?""",
+                (failure_code[:128], self.tenant_id, payment_id))
             db.commit()
         except Exception:
             db.rollback()

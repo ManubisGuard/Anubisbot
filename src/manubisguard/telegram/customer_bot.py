@@ -324,6 +324,9 @@ class CustomerBot:
         if is_admin and command == "/wallet-credit":
             await self._admin_wallet_credit(chat_id, text, uid)
             return
+        if is_admin and command == "/payment-events":
+            await self._admin_payment_events(chat_id, text)
+            return
         if is_admin and command == "/trust-channel":
             await self._admin_trust_channel_command(chat_id, text)
             return
@@ -722,6 +725,29 @@ class CustomerBot:
             {"amount_minor": amount, "currency": currency.upper(), "public_order_id": payment_id[:20]},
             f"wallet-credit:payment:{payment_id}")
         await self.api.send_text(chat_id, f"شارژ تأیید و به‌صورت idempotent ثبت شد؛ کاربر {target}، مبلغ {amount:,} {currency.upper()}، دفترکل #{ledger_id}.", self._customer_menu())
+
+    async def _admin_payment_events(self, chat_id: int, text: str) -> None:
+        """Read-only private-admin view of the immutable payment lifecycle audit."""
+        payment_id = text.partition(" ")[2].strip()
+        if not payment_id or len(payment_id) > 128 or any(ch.isspace() for ch in payment_id):
+            await self.api.send_text(chat_id, "فرمت: /payment-events PAYMENT_ID", self._customer_menu())
+            return
+        events = self.data.list_payment_attempt_events(payment_id)
+        if not events:
+            await self.api.send_text(chat_id, "برای این شناسه رویداد پرداختی پیدا نشد.", self._customer_menu())
+            return
+        labels = {"created": "ایجاد درخواست", "verified": "تأیید پرداخت", "failed": "رد/شکست پرداخت"}
+        lines = [f"🧾 سابقه تغییرناپذیر پرداخت: {payment_id}"]
+        for event in events[:30]:
+            line = f"• {labels.get(event['event_type'], event['event_type'])} | {event['amount_minor']:,} {event['currency']} | {event['created_at']}"
+            if event.get("actor_telegram_id") is not None:
+                line += f" | مدیر: {event['actor_telegram_id']}"
+            if event.get("external_reference"):
+                line += f" | مرجع: {event['external_reference']}"
+            if event.get("failure_code"):
+                line += f" | کد خطا: {event['failure_code']}"
+            lines.append(line)
+        await self.api.send_text(chat_id, "\n".join(lines), self._customer_menu())
 
     async def _admin_wallet_credit(self, chat_id: int, text: str, admin_id: int) -> None:
         # Manual credit only after the operator has independently verified the receipt/payment.
@@ -1352,6 +1378,7 @@ class CustomerBot:
                 return
             elif section == "finance":
                 body = ("💰 مدیریت مالی\nدرخواست‌های شارژ را بررسی کن؛ /wallet-verify و /wallet-credit فقط برای مدیر مجاز هستند.\n"
+                        "سابقه تغییرناپذیر یک پرداخت: /payment-events PAYMENT_ID\n"
                         "کد تخفیف: /discount add CODE | PERCENT | MAX_USES | EXPIRES_EPOCH | PRODUCT_IDS_CSV، سپس /discount list یا /discount enable CODE on|off.\n"
                         "عملیات تمدید/افزایش ترافیک نیازمند بررسی: /service-operations [reconcile_required|pending|completed|refunded|all]\n"
                         "جزئیات عملیات: /service-operation OPERATION_ID\n"

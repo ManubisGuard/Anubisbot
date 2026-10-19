@@ -276,6 +276,9 @@ class CustomerDataStoreTests(unittest.TestCase):
         attempt = self.store.get_payment_attempt("pay-failed-once")
         self.assertEqual(attempt["status"], "failed")
         self.assertEqual(attempt["failure_code"], "receipt_not_confirmed")
+        events = self.store.list_payment_attempt_events("pay-failed-once")
+        self.assertEqual([e["event_type"] for e in events], ["created", "failed"])
+        self.assertEqual(events[-1]["failure_code"], "receipt_not_confirmed")
         self.assertEqual(self.store.wallet_balance(1001), 0)
 
     def test_payment_idempotency_conflict_and_pending_multiplicity(self):
@@ -292,6 +295,33 @@ class CustomerDataStoreTests(unittest.TestCase):
                 payment_id="pay-5", telegram_id=1001, provider="mock", amount_minor=3000,
                 currency="IRR", idempotency_key="intent-3",
             )
+
+    def test_payment_attempt_audit_is_atomic_immutable_and_tenant_scoped(self):
+        self.store.create_payment_attempt(
+            payment_id="pay-audit", telegram_id=1001, provider="manual",
+            amount_minor=1200, currency="IRR", idempotency_key="intent-audit",
+        )
+        self.assertEqual([e["event_type"] for e in self.store.list_payment_attempt_events("pay-audit")], ["created"])
+        self.store.settle_verified_wallet_deposit(
+            payment_id="pay-audit", verified_amount_minor=1200, verified_currency="IRR",
+            external_reference="bank-reference-audit", verified_by=9001,
+        )
+        # Exact replay returns the same settlement without adding a second audit event or credit.
+        self.store.settle_verified_wallet_deposit(
+            payment_id="pay-audit", verified_amount_minor=1200, verified_currency="IRR",
+            external_reference="bank-reference-audit", verified_by=9001,
+        )
+        events = self.store.list_payment_attempt_events("pay-audit")
+        self.assertEqual([e["event_type"] for e in events], ["created", "verified"])
+        self.assertEqual(events[-1]["actor_telegram_id"], 9001)
+        self.assertEqual(events[-1]["external_reference"], "bank-reference-audit")
+        self.assertEqual(self.store.wallet_balance(1001), 1200)
+        self.assertEqual(CustomerDataStore(self.path, tenant_id="bot-beta").list_payment_attempt_events("pay-audit"), [])
+        with self.store._connect() as db:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                db.execute("UPDATE payment_attempt_events SET actor_telegram_id=1 WHERE tenant_id=? AND payment_id=?", (self.store.tenant_id, "pay-audit"))
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                db.execute("DELETE FROM payment_attempt_events WHERE tenant_id=? AND payment_id=?", (self.store.tenant_id, "pay-audit"))
 
     def test_product_supports_metered_modes_and_rejects_missing_rate(self):
         self.store.put_product(product_id="hourly", title="Hourly", price_minor=0,
