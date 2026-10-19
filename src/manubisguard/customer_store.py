@@ -1884,10 +1884,12 @@ class CustomerDataStore:
         db = self._connect()
         try:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT status,telegram_id,product_id,amount_minor,currency FROM customer_orders WHERE tenant_id=? AND order_id=?", (self.tenant_id, order_id)).fetchone()
+            row = db.execute("SELECT status,telegram_id,product_id,amount_minor,currency,provider_reference FROM customer_orders WHERE tenant_id=? AND order_id=?", (self.tenant_id, order_id)).fetchone()
             if not row:
                 raise CustomerStoreError("Order not found")
             if row["status"] == "active":
+                if service_id != order_id or str(row["provider_reference"] or "") != provider_reference[:256]:
+                    raise CustomerStoreError("Completed order replay conflicts with service or provider reference")
                 db.commit(); return
             if row["status"] != "provisioning":
                 raise CustomerStoreError("Order is not in provisioning state")

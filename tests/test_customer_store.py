@@ -156,6 +156,32 @@ class CustomerDataStoreTests(unittest.TestCase):
             self.store.transition_order(order_id="order-2", new_status="active",
                                         provider_reference="different-provider-svc")
 
+    def test_finalize_product_order_replay_rejects_mismatched_provider_identity(self):
+        self.store.put_product(product_id="finalize-basic", title="Finalize Basic", price_minor=1000,
+                               currency="IRR", duration_hours=24, traffic_bytes=1024)
+        order = self.store.create_order(order_id="finalize-order", telegram_id=1001,
+                                        product_id="finalize-basic", idempotency_key="finalize-buy")
+        self.store.transition_order(order_id=order["order_id"], new_status="paid")
+        self.store.transition_order(order_id=order["order_id"], new_status="provisioning")
+        self.store.create_metered_service(service_id=order["order_id"], telegram_id=1001,
+            product={"product_id":"finalize-basic", "panel_id":"panel-finalize", "pricing_mode":"fixed",
+                     "currency":"IRR", "unit_price_minor":0, "duration_hours":24, "traffic_bytes":1024},
+            provider_user_id="provider-user-1", username="alice-finalize", subscription_url=None, now=1000)
+        self.store.finalize_product_order(order_id=order["order_id"], service_id=order["order_id"],
+                                          provider_reference="provider-user-1")
+        # Exact replay is harmless, but a changed provider identity or service ID must fail closed.
+        self.store.finalize_product_order(order_id=order["order_id"], service_id=order["order_id"],
+                                          provider_reference="provider-user-1")
+        with self.assertRaisesRegex(CustomerStoreError, "conflicts with service or provider reference"):
+            self.store.finalize_product_order(order_id=order["order_id"], service_id=order["order_id"],
+                                              provider_reference="provider-user-2")
+        with self.assertRaisesRegex(CustomerStoreError, "conflicts with service or provider reference"):
+            self.store.finalize_product_order(order_id=order["order_id"], service_id="other-service",
+                                              provider_reference="provider-user-1")
+        current = self.store.get_order_by_idempotency("finalize-buy", 1001)
+        self.assertEqual(current["status"], "active")
+        self.assertEqual(current["provider_reference"], "provider-user-1")
+
     def test_verified_payment_credits_wallet_once(self):
         self.store.create_payment_attempt(
             payment_id="pay-1", telegram_id=1001, provider="mock", amount_minor=2500,
