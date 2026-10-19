@@ -923,11 +923,14 @@ class CustomerDataStore:
         Call only after a trusted provider adapter has verified signature, merchant, amount,
         currency, and final settlement status. This method itself is not a gateway verifier.
         """
-        if not external_reference.strip():
-            raise CustomerStoreError("Verified external payment reference is required")
+        external_reference = external_reference.strip()
+        if not external_reference or len(external_reference) > 256:
+            raise CustomerStoreError("Verified external payment reference is required and must be at most 256 characters")
         if isinstance(verified_amount_minor, bool) or not isinstance(verified_amount_minor, int) or not 0 < verified_amount_minor <= 2**63 - 1:
             raise CustomerStoreError("Verified payment amount must be a positive signed 64-bit integer")
         verified_currency = verified_currency.upper()
+        if len(verified_currency) != 3 or not verified_currency.isascii() or not verified_currency.isalpha():
+            raise CustomerStoreError("Verified payment currency must be a three-letter ASCII code")
         db = self._connect()
         try:
             db.execute("BEGIN IMMEDIATE")
@@ -954,6 +957,13 @@ class CustomerDataStore:
                 raise CustomerStoreError("Payment is not pending")
             if int(row["amount_minor"]) != verified_amount_minor or row["currency"] != verified_currency:
                 raise CustomerStoreError("Verified payment amount or currency does not match intent")
+            duplicate_reference = db.execute(
+                """SELECT payment_id FROM payment_attempts
+                   WHERE tenant_id=? AND provider=? AND external_reference=? AND payment_id<>?""",
+                (self.tenant_id, row["provider"], external_reference, payment_id),
+            ).fetchone()
+            if duplicate_reference:
+                raise CustomerStoreError("External payment reference is already assigned to another payment")
             db.execute(
                 """INSERT INTO wallet_ledger
                    (tenant_id,telegram_id,idempotency_key,amount_minor,currency,entry_type,reference,note)
@@ -990,7 +1000,11 @@ class CustomerDataStore:
         return dict(row) if row else None
 
     def fail_payment_attempt(self, *, payment_id: str, failure_code: str) -> None:
-        with self._connect() as db:
+        """Fail only a pending payment, atomically; never overwrite a verified settlement."""
+        db = self._connect()
+        try:
+            # Serialize with settlement so a stale read cannot overwrite a verified payment.
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 "SELECT status FROM payment_attempts WHERE tenant_id=? AND payment_id=?",
                 (self.tenant_id, payment_id),
@@ -998,13 +1012,24 @@ class CustomerDataStore:
             if not row:
                 raise CustomerStoreError("Payment attempt not found")
             if row["status"] == "failed":
+                db.commit()
                 return
             if row["status"] != "pending":
                 raise CustomerStoreError("Only pending payments can be failed")
-            db.execute(
-                "UPDATE payment_attempts SET status='failed',failure_code=?,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=? AND payment_id=?",
+            cur = db.execute(
+                """UPDATE payment_attempts
+                   SET status='failed',failure_code=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE tenant_id=? AND payment_id=? AND status='pending'""",
                 (failure_code[:128], self.tenant_id, payment_id),
             )
+            if cur.rowcount != 1:
+                raise CustomerStoreError("Payment state changed; refusing to mark it failed")
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     def outstanding_debt(self, telegram_id: int, currency: str = "IRR") -> int:
         with self._connect() as db:

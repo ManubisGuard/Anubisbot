@@ -162,6 +162,56 @@ class CustomerDataStoreTests(unittest.TestCase):
             )
         self.assertEqual(self.store.wallet_balance(1001), 0)
 
+    def test_external_payment_reference_cannot_credit_two_intents(self):
+        self.store.create_payment_attempt(
+            payment_id="pay-reference-a", telegram_id=1001, provider="manual",
+            amount_minor=900, currency="IRR", idempotency_key="intent-reference-a",
+        )
+        self.store.create_payment_attempt(
+            payment_id="pay-reference-b", telegram_id=1001, provider="manual",
+            amount_minor=900, currency="IRR", idempotency_key="intent-reference-b",
+        )
+        self.store.settle_verified_wallet_deposit(
+            payment_id="pay-reference-a", verified_amount_minor=900,
+            verified_currency="IRR", external_reference="same-external-reference",
+        )
+        with self.assertRaisesRegex(CustomerStoreError, "already assigned"):
+            self.store.settle_verified_wallet_deposit(
+                payment_id="pay-reference-b", verified_amount_minor=900,
+                verified_currency="IRR", external_reference="same-external-reference",
+            )
+        self.assertEqual(self.store.get_payment_attempt("pay-reference-a")["status"], "verified")
+        self.assertEqual(self.store.get_payment_attempt("pay-reference-b")["status"], "pending")
+        self.assertEqual(self.store.wallet_balance(1001), 900)
+
+    def test_verified_payment_cannot_be_overwritten_as_failed(self):
+        self.store.create_payment_attempt(
+            payment_id="pay-race-verified", telegram_id=1001, provider="manual",
+            amount_minor=1800, currency="IRR", idempotency_key="intent-race-verified",
+        )
+        self.store.settle_verified_wallet_deposit(
+            payment_id="pay-race-verified", verified_amount_minor=1800,
+            verified_currency="IRR", external_reference="manual-ref-race",
+            verified_by=9001,
+        )
+        with self.assertRaisesRegex(CustomerStoreError, "Only pending payments"):
+            self.store.fail_payment_attempt(payment_id="pay-race-verified", failure_code="late_failure")
+        attempt = self.store.get_payment_attempt("pay-race-verified")
+        self.assertEqual(attempt["status"], "verified")
+        self.assertEqual(self.store.wallet_balance(1001), 1800)
+
+    def test_fail_payment_attempt_is_idempotent_for_already_failed_attempt(self):
+        self.store.create_payment_attempt(
+            payment_id="pay-failed-once", telegram_id=1001, provider="manual",
+            amount_minor=700, currency="IRR", idempotency_key="intent-failed-once",
+        )
+        self.store.fail_payment_attempt(payment_id="pay-failed-once", failure_code="receipt_not_confirmed")
+        self.store.fail_payment_attempt(payment_id="pay-failed-once", failure_code="second_call")
+        attempt = self.store.get_payment_attempt("pay-failed-once")
+        self.assertEqual(attempt["status"], "failed")
+        self.assertEqual(attempt["failure_code"], "receipt_not_confirmed")
+        self.assertEqual(self.store.wallet_balance(1001), 0)
+
     def test_payment_idempotency_conflict_and_pending_multiplicity(self):
         self.store.create_payment_attempt(
             payment_id="pay-3", telegram_id=1001, provider="mock", amount_minor=1000,
