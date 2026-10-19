@@ -1,0 +1,59 @@
+# Secrets and local configuration; only explicit templates may be committed.
+.env*
+!.env.example
+!.env.test.example
+
+# Local databases and runtime state
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-wal
+*.db-shm
+
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+
+# Frontend/build outputs
+node_modules/
+dist/
+build/
+
+# Backups, logs, archives, and local artifacts
+*.bak
+*.bak-*
+*.backup
+*.log
+*.zip
+.DS_Store
+
+# Confidential internal research; keep outside the source-control allowlist.
+/CHAT_HANDOFF.md
+/CUSTOMER_PRODUCT_ACCEPTANCE_MATRIX.md
+/CUSTOMER_PURCHASE_FLOW_AUDIT.md
+/FAOXIMA_AUDIT.md
+/FEATURE_ROADMAP_2026-10-19.md
+/HANDOFF_PROMPT_FOR_NEXT_AI_FA.md
+/MAIN_ZIP_SOURCE_MAP.md
+/MIRZABOT_AUDIT.md
+/PAYMENT_FLOW_AUDIT.md
+/PGCLOCKBOT_REVERSE_ENGINEERING_AUDIT.md
+/PRODUCT_BLUEPRINT_PHASES_2026-10-19.md
+/PRODUCT_PHASE_PLAN_V2_2026-10-19.md
+/REFERENCE_FEATURE_MATRIX.md
+/REFERENCE_PAYMENT_FULFILLMENT_AUDIT.md
+/TODO.md
+/docs/
+
+# Local-only staging assets (contain deployment-specific configuration)
+/webapp/Caddyfile.stage
+/webapp/brand.json
