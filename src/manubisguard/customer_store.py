@@ -1095,14 +1095,15 @@ class CustomerDataStore:
         try:
             db.execute("BEGIN IMMEDIATE")
             prior = db.execute(
-                """SELECT telegram_id,amount_minor,currency,entry_type,ledger_id
+                """SELECT telegram_id,amount_minor,currency,entry_type,reference,ledger_id
                    FROM wallet_ledger WHERE tenant_id=? AND idempotency_key=?""",
                 (self.tenant_id, idempotency_key),
             ).fetchone()
             if prior:
                 same = (int(prior["telegram_id"]) == telegram_id
                         and int(prior["amount_minor"]) == amount_minor
-                        and prior["currency"] == currency and prior["entry_type"] == entry_type)
+                        and prior["currency"] == currency and prior["entry_type"] == entry_type
+                        and prior["reference"] == reference[:256])
                 if not same:
                     raise CustomerStoreError("Idempotency key reused with different transaction data")
                 db.commit()

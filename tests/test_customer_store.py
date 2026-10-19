@@ -352,6 +352,29 @@ class CustomerDataStoreTests(unittest.TestCase):
         self.assertNotIn("admin private audit detail", pending[0].payload_json)
         self.assertNotIn("password", pending[0].payload_json)
 
+    def test_wallet_idempotency_rejects_different_reference(self):
+        first_id = self.store.post_wallet_entry(
+            telegram_id=1001, idempotency_key="same-key", amount_minor=1000,
+            currency="IRR", entry_type="admin_credit", reference="receipt-A",
+        )
+        replay_id = self.store.post_wallet_entry(
+            telegram_id=1001, idempotency_key="same-key", amount_minor=1000,
+            currency="IRR", entry_type="admin_credit", reference="receipt-A",
+        )
+        self.assertEqual(replay_id, first_id)
+        with self.assertRaisesRegex(CustomerStoreError, "different transaction data"):
+            self.store.post_wallet_entry(
+                telegram_id=1001, idempotency_key="same-key", amount_minor=1000,
+                currency="IRR", entry_type="admin_credit", reference="receipt-B",
+            )
+        self.assertEqual(self.store.wallet_balance(1001), 1000)
+        with self.store._connect() as db:
+            rows = db.execute(
+                "SELECT COUNT(*) FROM wallet_ledger WHERE tenant_id=? AND idempotency_key=?",
+                (self.store.tenant_id, "same-key"),
+            ).fetchone()[0]
+        self.assertEqual(rows, 1)
+
     def test_wallet_cannot_go_negative(self):
         with self.assertRaisesRegex(CustomerStoreError, "Insufficient"):
             self.store.post_wallet_entry(
