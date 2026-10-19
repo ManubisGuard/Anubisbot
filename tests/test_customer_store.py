@@ -182,6 +182,24 @@ class CustomerDataStoreTests(unittest.TestCase):
         self.assertEqual(current["status"], "active")
         self.assertEqual(current["provider_reference"], "provider-user-1")
 
+    def test_metered_service_replay_rejects_changed_provider_identity(self):
+        product = {"product_id":"identity-basic", "panel_id":"identity-panel", "pricing_mode":"fixed",
+                   "currency":"IRR", "unit_price_minor":0, "duration_hours":24, "traffic_bytes":1024}
+        self.store.create_metered_service(service_id="identity-service", telegram_id=1001, product=product,
+            provider_user_id="provider-user-original", username="alice-identity",
+            subscription_url="https://sub.example/original", now=1000)
+        # A byte-for-byte identity replay is accepted.
+        self.store.create_metered_service(service_id="identity-service", telegram_id=1001, product=product,
+            provider_user_id="provider-user-original", username="alice-identity",
+            subscription_url="https://sub.example/original", now=1001)
+        with self.assertRaisesRegex(CustomerStoreError, "different customer, provider identity"):
+            self.store.create_metered_service(service_id="identity-service", telegram_id=1001, product=product,
+                provider_user_id="provider-user-swapped", username="alice-identity",
+                subscription_url="https://sub.example/original", now=1002)
+        stored = self.store.get_customer_service("identity-service", 1001)
+        self.assertEqual(stored["provider_user_id"], "provider-user-original")
+        self.assertEqual(stored["subscription_url"], "https://sub.example/original")
+
     def test_verified_payment_credits_wallet_once(self):
         self.store.create_payment_attempt(
             payment_id="pay-1", telegram_id=1001, provider="mock", amount_minor=2500,

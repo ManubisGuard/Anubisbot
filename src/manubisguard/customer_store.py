@@ -1624,11 +1624,17 @@ class CustomerDataStore:
                  str(product.get("currency", "IRR")), int(product.get("unit_price_minor", 0)),
                  now, 0, "0", billing_status),
             )
-            existing = db.execute("SELECT telegram_id,product_id,reseller_account_id FROM customer_services WHERE tenant_id=? AND service_id=?", (self.tenant_id, service_id)).fetchone()
+            existing = db.execute("""SELECT telegram_id,product_id,panel_id,provider_user_id,username,
+                subscription_url,reseller_account_id FROM customer_services
+                WHERE tenant_id=? AND service_id=?""", (self.tenant_id, service_id)).fetchone()
             if (not existing or int(existing["telegram_id"]) != telegram_id
                     or existing["product_id"] != str(product.get("product_id", ""))
+                    or str(existing["panel_id"] or "") != str(product.get("panel_id", ""))
+                    or str(existing["provider_user_id"] or "") != str(provider_user_id or "")
+                    or str(existing["username"] or "") != str(username or "")
+                    or str(existing["subscription_url"] or "") != str(subscription_url or "")
                     or str(existing["reseller_account_id"] or "") != str(reseller_account_id or "")):
-                raise CustomerStoreError("Service ID is already bound to a different customer, reseller or product")
+                raise CustomerStoreError("Service ID is already bound to a different customer, provider identity, reseller or product")
 
     def get_customer_service(self, service_id: str, telegram_id: int | None = None) -> dict[str, Any] | None:
         with self._connect() as db:
