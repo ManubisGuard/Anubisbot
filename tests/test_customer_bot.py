@@ -128,6 +128,55 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://secret.invalid/sub/abc", detail)
         self.assertIn("ممکن است تا بررسی بعدی پنل", detail)
 
+    async def test_customer_service_refresh_reads_provider_and_updates_snapshot(self):
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+        from manubisguard.panels.contracts import PanelUser
+        self.bot.data.register_panel_connection(panel_id="pg-refresh", label="PG", provider="pasarguard",
+            base_url="https://pg.example", auth_mode="api_key", secret_ref="env:PG_KEY", enabled=True)
+        self.bot.data.ensure_customer(999, first_name="Service owner")
+        self.bot.data.upsert_service(service_id="svc-refresh", telegram_id=999, product_id="prod-a",
+            panel_id="pg-refresh", provider_user_id="123", status="active",
+            expires_at="2026-11-01T00:00:00Z", traffic_limit_bytes=10 * 1024**3,
+            traffic_used_bytes=2 * 1024**3)
+        with self.bot.data._connect() as db:
+            db.execute("UPDATE customer_services SET username=? WHERE tenant_id=? AND service_id=?",
+                ("user-refresh", self.bot.data.tenant_id, "svc-refresh"))
+        fake_adapter = SimpleNamespace(
+            capabilities=AsyncMock(return_value=SimpleNamespace(read_status=True, read_usage=True)),
+            get_user=AsyncMock(return_value=PanelUser(provider_user_id="123", username="user-refresh",
+                status="active", used_bytes=4 * 1024**3, data_limit_bytes=12 * 1024**3,
+                expire_at=datetime(2026, 12, 1, tzinfo=timezone.utc), subscription_url=None)),
+            get_usage=AsyncMock(return_value={"used_bytes": 4 * 1024**3, "data_limit_bytes": 12 * 1024**3}),
+        )
+        with patch.object(self.bot.registry, "get", return_value=fake_adapter):
+            await self.bot._handle_callback({"id": "refresh-cb", "from": {"id": 999},
+                "message": {"chat": {"id": 999, "type": "private"}},
+                "data": "customer:service_refresh:svc-refresh"})
+        service = self.bot.data.get_customer_service("svc-refresh", telegram_id=999)
+        self.assertEqual(service["traffic_used_bytes"], 4 * 1024**3)
+        self.assertEqual(service["traffic_limit_bytes"], 12 * 1024**3)
+        self.assertEqual(service["expires_at"], "2026-12-01T00:00:00Z")
+        self.assertTrue(service["provider_checked_at"])
+        self.assertIn("اطلاعات از پنل تازه شد", self.bot.api.send_text.await_args.args[1])
+        fake_adapter.get_user.assert_awaited_once()
+        fake_adapter.get_usage.assert_awaited_once()
+
+    async def test_customer_service_refresh_does_not_call_provider_for_other_owner(self):
+        self.bot.data.ensure_customer(998, first_name="Other owner")
+        self.bot.data.upsert_service(service_id="svc-private-refresh", telegram_id=998, panel_id="pg-refresh",
+            provider_user_id="123", status="active", traffic_used_bytes=123)
+        with self.bot.data._connect() as db:
+            db.execute("UPDATE customer_services SET username=? WHERE tenant_id=? AND service_id=?",
+                ("other-user", self.bot.data.tenant_id, "svc-private-refresh"))
+        with patch.object(self.bot.registry, "get") as registry_get:
+            await self.bot._handle_callback({"id": "refresh-private", "from": {"id": 999},
+                "message": {"chat": {"id": 999, "type": "private"}},
+                "data": "customer:service_refresh:svc-private-refresh"})
+        registry_get.assert_not_called()
+        service = self.bot.data.get_customer_service("svc-private-refresh", telegram_id=998)
+        self.assertEqual(service["traffic_used_bytes"], 123)
+
     async def test_customer_cannot_open_another_users_service_detail(self):
         self.bot.data.ensure_customer(998, first_name="Other owner")
         self.bot.data.upsert_service(

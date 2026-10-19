@@ -1806,6 +1806,34 @@ class CustomerDataStore:
                     or str(existing["reseller_account_id"] or "") != str(reseller_account_id or "")):
                 raise CustomerStoreError("Service ID is already bound to a different customer, provider identity, reseller or product")
 
+    def update_customer_service_snapshot(self, *, service_id: str, telegram_id: int, panel_id: str,
+                                         provider_user_id: str, fields: dict[str, Any]) -> bool:
+        """Persist a validated read-only provider snapshot without changing billing state."""
+        allowed = {"status", "expires_at", "traffic_limit_bytes", "traffic_used_bytes", "subscription_url"}
+        if not fields or set(fields) - allowed:
+            raise CustomerStoreError("Invalid provider snapshot fields")
+        if "status" in fields and fields["status"] not in {
+            "pending", "active", "limited", "expired", "suspended", "failed", "deleted", "disabled"
+        }:
+            raise CustomerStoreError("Invalid provider snapshot status")
+        for key in ("traffic_limit_bytes", "traffic_used_bytes"):
+            if key in fields and (isinstance(fields[key], bool) or not isinstance(fields[key], int) or fields[key] < 0):
+                raise CustomerStoreError("Invalid provider traffic counter")
+        if "subscription_url" in fields and (not isinstance(fields["subscription_url"], str) or len(fields["subscription_url"]) > 4096):
+            raise CustomerStoreError("Invalid provider subscription URL")
+        columns = {"status": "status", "expires_at": "expires_at", "traffic_limit_bytes": "traffic_limit_bytes",
+                   "traffic_used_bytes": "traffic_used_bytes", "subscription_url": "subscription_url"}
+        assignments = ",".join(f"{columns[key]}=?" for key in fields)
+        values = list(fields.values())
+        values.extend([self.tenant_id, service_id, telegram_id, panel_id, provider_user_id])
+        with self._connect() as db:
+            cur = db.execute(
+                f"UPDATE customer_services SET {assignments},provider_checked_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP "
+                "WHERE tenant_id=? AND service_id=? AND telegram_id=? AND panel_id=? AND provider_user_id=?",
+                values,
+            )
+        return cur.rowcount == 1
+
     def get_customer_service(self, service_id: str, telegram_id: int | None = None) -> dict[str, Any] | None:
         with self._connect() as db:
             if telegram_id is None:

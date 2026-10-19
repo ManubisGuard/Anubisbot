@@ -1285,6 +1285,87 @@ class CustomerBot:
         buttons.append(keyboard.get("inline_keyboard", [[{"text":"⬅️ منو","callback_data":"customer:home"}]])[0])
         await self.api.send_text(chat_id, "\n".join(lines), {"inline_keyboard": buttons})
 
+    async def _refresh_customer_service_snapshot(self, *, service: dict[str, Any], telegram_id: int) -> bool:
+        """Fetch a read-only provider snapshot; never mutate provider or billing state."""
+        from manubisguard.panels.contracts import PanelConnection
+        panel_id = str(service.get("panel_id") or "")
+        username = str(service.get("username") or "")
+        provider_user_id = str(service.get("provider_user_id") or "")
+        if not panel_id or not username or not provider_user_id:
+            return False
+        row = self.data.get_panel_connection(panel_id)
+        if not row or not row.get("enabled"):
+            return False
+        connection = PanelConnection(
+            id=row["panel_id"], tenant_id=self.data.tenant_id, name=row["label"],
+            kind=row["provider"], base_url=row["base_url"], auth_mode=row["auth_mode"],
+            secret_ref=row["secret_ref"], enabled=bool(row["enabled"]), verify_tls=True,
+            metadata=row.get("metadata") or {},
+        )
+        try:
+            adapter = self.registry.get(connection.kind)
+            capabilities = await adapter.capabilities(connection)
+            if not capabilities.read_status:
+                return False
+            live_user = await adapter.get_user(connection, username)
+            if not live_user.username or live_user.username.strip().casefold() != username.strip().casefold():
+                return False
+            if connection.kind == "pasarguard" and str(live_user.provider_user_id or "") != provider_user_id:
+                return False
+            fields: dict[str, Any] = {}
+            status_map = {
+                "active": "active", "enabled": "active", "on": "active", "true": "active", "1": "active",
+                "limited": "limited", "expired": "expired", "disabled": "suspended", "disable": "suspended",
+                "inactive": "suspended", "off": "suspended", "false": "suspended", "0": "suspended",
+                "suspended": "suspended", "deleted": "deleted", "pending": "pending", "failed": "failed",
+            }
+            raw_status = str(live_user.status or live_user.raw_status or "").strip().lower()
+            normalized_status = status_map.get(raw_status)
+            if normalized_status:
+                fields["status"] = normalized_status
+            if live_user.expire_at is not None:
+                expire_at = live_user.expire_at
+                if expire_at.tzinfo is None:
+                    expire_at = expire_at.replace(tzinfo=timezone.utc)
+                fields["expires_at"] = expire_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            # Provider mappers may use zero as a fallback for a missing field. Keep
+            # existing counters in that ambiguous case; prefer the dedicated usage
+            # endpoint and accept only explicit byte counters.
+            if isinstance(live_user.data_limit_bytes, int) and not isinstance(live_user.data_limit_bytes, bool) and live_user.data_limit_bytes > 0:
+                fields["traffic_limit_bytes"] = live_user.data_limit_bytes
+            if isinstance(live_user.used_bytes, int) and not isinstance(live_user.used_bytes, bool) and live_user.used_bytes > 0:
+                fields["traffic_used_bytes"] = live_user.used_bytes
+            get_usage = getattr(adapter, "get_usage", None)
+            if capabilities.read_usage and callable(get_usage):
+                identifier = provider_user_id if connection.kind == "pasarguard" else username
+                try:
+                    usage = await get_usage(connection, identifier)
+                    if isinstance(usage, dict):
+                        nested = next((usage[k] for k in ("usage", "data", "result", "obj") if isinstance(usage.get(k), dict)), {})
+                        sources = [usage, nested]
+                        used = next((source[k] for source in sources for k in
+                            ("used_bytes", "used_traffic_bytes") if k in source), None)
+                        limit = next((source[k] for source in sources for k
+                            in ("data_limit_bytes", "total_bytes") if k in source), None)
+                        if isinstance(used, int) and not isinstance(used, bool) and used >= 0:
+                            fields["traffic_used_bytes"] = used
+                        if isinstance(limit, int) and not isinstance(limit, bool) and limit >= 0:
+                            fields["traffic_limit_bytes"] = limit
+                except Exception:
+                    # A failed usage query must not erase previously stored counters.
+                    pass
+            if live_user.subscription_url:
+                fields["subscription_url"] = live_user.subscription_url
+            if not fields:
+                return False
+            return self.data.update_customer_service_snapshot(
+                service_id=str(service["service_id"]), telegram_id=telegram_id, panel_id=panel_id,
+                provider_user_id=provider_user_id, fields=fields,
+            )
+        except Exception as exc:
+            LOG.warning("Customer service refresh failed (%s)", type(exc).__name__)
+            return False
+
     async def _handle_callback(self, query: dict[str, Any]) -> None:
         callback_id = query.get("id")
         message = query.get("message") or {}
@@ -1309,11 +1390,17 @@ class CustomerBot:
         chat_id = chat.get("id")
         if not isinstance(chat_id, int):
             return
-        if data.startswith("customer:service_detail:"):
+        if data.startswith(("customer:service_detail:", "customer:service_refresh:")):
             if not isinstance(uid, int):
                 return
-            service_id = data.partition("customer:service_detail:")[2]
+            is_refresh = data.startswith("customer:service_refresh:")
+            prefix = "customer:service_refresh:" if is_refresh else "customer:service_detail:"
+            service_id = data.partition(prefix)[2]
             service = self.data.get_customer_service(service_id, telegram_id=uid)
+            refresh_ok = False
+            if service and is_refresh:
+                refresh_ok = await self._refresh_customer_service_snapshot(service=service, telegram_id=uid)
+                service = self.data.get_customer_service(service_id, telegram_id=uid)
             if not service:
                 await self.api.send_text(chat_id, "این سرویس وجود ندارد یا متعلق به حساب شما نیست.", BACK_MENU)
                 return
@@ -1322,6 +1409,7 @@ class CustomerBot:
                          "failed": "ناموفق", "deleted": "حذف‌شده"}
             lines = [
                 "🔐 جزئیات سرویس",
+                ("✅ اطلاعات از پنل تازه شد." if refresh_ok else "⚠️ به‌روزرسانی کامل نشد؛ اطلاعات ذخیره‌شده حفظ شده است." if is_refresh else ""),
                 f"شناسه: {service['service_id']}",
                 f"نام کاربری: {service.get('username') or '—'}",
                 f"وضعیت: {status_fa.get(service.get('status'), service.get('status') or 'نامشخص')}",
@@ -1346,9 +1434,13 @@ class CustomerBot:
                 lines.extend(["", "لینک خصوصی اشتراک:", str(service["subscription_url"])])
             else:
                 lines.extend(["", "لینک اشتراک در اطلاعات محلی ثبت نشده است."])
-            lines.append("\nاطلاعات مصرف/انقضا ممکن است تا بررسی بعدی پنل به‌روز نشده باشد.")
+            if refresh_ok:
+                lines.append("\nاین اطلاعات در همین درخواست از پنل خوانده شد؛ در صورت ناقص بودن پاسخ پنل، بعضی مقادیر قبلی حفظ می‌شوند.")
+            else:
+                lines.append("\nاطلاعات مصرف/انقضا ممکن است تا بررسی بعدی پنل به‌روز نشده باشد.")
             await self.api.send_text(chat_id, "\n".join(lines), {
                 "inline_keyboard": [
+                    [{"text": "🔄 به‌روزرسانی از پنل", "callback_data": f"customer:service_refresh:{service['service_id']}"}],
                     [{"text": "⬅️ بازگشت به سرویس‌ها", "callback_data": "customer:services"}],
                     [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
                 ]
