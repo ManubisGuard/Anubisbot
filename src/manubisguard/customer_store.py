@@ -863,13 +863,16 @@ class CustomerDataStore:
         try:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT status FROM customer_orders WHERE tenant_id=? AND order_id=?",
+                "SELECT status,provider_reference FROM customer_orders WHERE tenant_id=? AND order_id=?",
                 (self.tenant_id, order_id),
             ).fetchone()
             if not row:
                 raise CustomerStoreError("Order not found")
             current = str(row["status"])
             if new_status == current:
+                stored_reference = str(row["provider_reference"] or "")
+                if provider_reference and stored_reference != provider_reference[:256]:
+                    raise CustomerStoreError("Order status replay conflicts with provider reference")
                 db.commit()
                 return
             if new_status not in transitions.get(current, set()):

@@ -151,6 +151,10 @@ class CustomerDataStoreTests(unittest.TestCase):
         self.store.transition_order(order_id="order-2", new_status="paid")
         self.store.transition_order(order_id="order-2", new_status="provisioning")
         self.store.transition_order(order_id="order-2", new_status="active", provider_reference="provider-svc")
+        self.store.transition_order(order_id="order-2", new_status="active", provider_reference="provider-svc")
+        with self.assertRaisesRegex(CustomerStoreError, "conflicts with provider reference"):
+            self.store.transition_order(order_id="order-2", new_status="active",
+                                        provider_reference="different-provider-svc")
 
     def test_verified_payment_credits_wallet_once(self):
         self.store.create_payment_attempt(
