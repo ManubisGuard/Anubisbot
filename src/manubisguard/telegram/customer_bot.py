@@ -969,7 +969,8 @@ class CustomerBot:
                 lines.append(f"  حجم: {used:.2f}/{total:.2f} GiB")
             if int(service.get("outstanding_debt_minor") or 0):
                 lines.append(f"  بدهی معوق: {int(service['outstanding_debt_minor']):,} {service['currency']}")
-            if service.get("subscription_url"): lines.append(f"  لینک خصوصی: {service['subscription_url']}")
+            buttons.append([{"text": f"🔎 جزئیات {service['service_id'][:12]}",
+                             "callback_data": f"customer:service_detail:{service['service_id']}"}])
             if service.get("status") in {"active", "limited", "expired"} and service.get("pricing_mode") not in {"hourly", "usage"}:
                 buttons.append([{"text": f"⏳ تمدید {service['service_id'][:12]}", "callback_data": f"customer:renew_confirm:{service['service_id']}"}])
                 if int(service.get("traffic_limit_bytes") or 0) > 0:
@@ -1307,6 +1308,51 @@ class CustomerBot:
             await self.api.answer_callback(callback_id)
         chat_id = chat.get("id")
         if not isinstance(chat_id, int):
+            return
+        if data.startswith("customer:service_detail:"):
+            if not isinstance(uid, int):
+                return
+            service_id = data.partition("customer:service_detail:")[2]
+            service = self.data.get_customer_service(service_id, telegram_id=uid)
+            if not service:
+                await self.api.send_text(chat_id, "این سرویس وجود ندارد یا متعلق به حساب شما نیست.", BACK_MENU)
+                return
+            status_fa = {"pending": "در انتظار", "active": "فعال", "limited": "محدود",
+                         "expired": "منقضی", "suspended": "تعلیق‌شده",
+                         "failed": "ناموفق", "deleted": "حذف‌شده"}
+            lines = [
+                "🔐 جزئیات سرویس",
+                f"شناسه: {service['service_id']}",
+                f"نام کاربری: {service.get('username') or '—'}",
+                f"وضعیت: {status_fa.get(service.get('status'), service.get('status') or 'نامشخص')}",
+                f"مدل صورتحساب: {service.get('pricing_mode') or '—'}",
+            ]
+            if service.get("expires_at"):
+                lines.append(f"انقضا: {service['expires_at']}")
+            limit_bytes = int(service.get("traffic_limit_bytes") or 0)
+            used_bytes = int(service.get("traffic_used_bytes") or 0)
+            if limit_bytes > 0:
+                remaining_bytes = max(0, limit_bytes - used_bytes)
+                lines.extend([
+                    f"مصرف: {used_bytes / (1024 ** 3):.2f} GiB",
+                    f"سقف حجم: {limit_bytes / (1024 ** 3):.2f} GiB",
+                    f"حجم باقی‌مانده محاسباتی: {remaining_bytes / (1024 ** 3):.2f} GiB",
+                ])
+            if service.get("provider_checked_at"):
+                lines.append(f"آخرین بررسی ثبت‌شده پنل: {service['provider_checked_at']}")
+            if int(service.get("outstanding_debt_minor") or 0):
+                lines.append(f"بدهی معوق: {int(service['outstanding_debt_minor']):,} {service.get('currency') or ''}")
+            if service.get("subscription_url"):
+                lines.extend(["", "لینک خصوصی اشتراک:", str(service["subscription_url"])])
+            else:
+                lines.extend(["", "لینک اشتراک در اطلاعات محلی ثبت نشده است."])
+            lines.append("\nاطلاعات مصرف/انقضا ممکن است تا بررسی بعدی پنل به‌روز نشده باشد.")
+            await self.api.send_text(chat_id, "\n".join(lines), {
+                "inline_keyboard": [
+                    [{"text": "⬅️ بازگشت به سرویس‌ها", "callback_data": "customer:services"}],
+                    [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
+                ]
+            })
             return
         if data.startswith(("customer:renew_confirm:", "customer:topup_confirm:")):
             if not isinstance(uid, int):

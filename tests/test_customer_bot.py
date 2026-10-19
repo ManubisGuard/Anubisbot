@@ -92,6 +92,56 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(tickets), 1)
         self.assertEqual(tickets[0]["subject"], "اتصال برقرار نمی‌شود")
 
+    async def test_customer_service_list_uses_private_detail_screen_for_subscription_link(self):
+        self.bot.data.ensure_customer(999, first_name="Service owner")
+        self.bot.data.upsert_service(
+            service_id="svc-detail-123", telegram_id=999, product_id="prod-a",
+            panel_id="pg-a", provider_user_id="provider-123", status="active",
+            expires_at="2026-11-01T00:00:00Z", traffic_limit_bytes=10 * 1024**3,
+            traffic_used_bytes=2 * 1024**3, provider_checked_at="2026-10-20T10:00:00Z",
+        )
+        with self.bot.data._connect() as db:
+            db.execute(
+                "UPDATE customer_services SET username=?,subscription_url=?,pricing_mode=? WHERE tenant_id=? AND service_id=?",
+                ("user-a", "https://secret.invalid/sub/abc", "fixed", self.bot.data.tenant_id, "svc-detail-123"),
+            )
+        await self.bot._send_customer_services(999, 999)
+        listing = self.bot.api.send_text.await_args.args[1]
+        keyboard = self.bot.api.send_text.await_args.args[2]
+        self.assertNotIn("https://secret.invalid/sub/abc", listing)
+        self.assertTrue(any(
+            button.get("callback_data") == "customer:service_detail:svc-detail-123"
+            for row in keyboard["inline_keyboard"] for button in row
+        ))
+
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({
+            "id": "detail-cb",
+            "from": {"id": 999},
+            "message": {"chat": {"id": 999, "type": "private"}},
+            "data": "customer:service_detail:svc-detail-123",
+        })
+        detail = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("جزئیات سرویس", detail)
+        self.assertIn("user-a", detail)
+        self.assertIn("8.00 GiB", detail)
+        self.assertIn("https://secret.invalid/sub/abc", detail)
+        self.assertIn("ممکن است تا بررسی بعدی پنل", detail)
+
+    async def test_customer_cannot_open_another_users_service_detail(self):
+        self.bot.data.ensure_customer(998, first_name="Other owner")
+        self.bot.data.upsert_service(
+            service_id="svc-other-owner", telegram_id=998, status="active",
+            provider_user_id="provider-other",
+        )
+        await self.bot._handle_callback({
+            "id": "detail-cb-other",
+            "from": {"id": 999},
+            "message": {"chat": {"id": 999, "type": "private"}},
+            "data": "customer:service_detail:svc-other-owner",
+        })
+        self.assertIn("متعلق به حساب شما نیست", self.bot.api.send_text.await_args.args[1])
+
     async def test_admin_reply_is_saved_and_sent_to_ticket_owner(self):
         self.bot.data.ensure_customer(999, first_name="Customer")
         self.bot.data.create_ticket(ticket_id="ticket-xyz", telegram_id=999,
