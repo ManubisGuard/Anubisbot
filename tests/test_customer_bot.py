@@ -200,6 +200,41 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(product["pricing_mode"], "hourly")
         self.assertEqual(product["unit_price_minor"], 600)
 
+    async def test_admin_configures_card_to_card_details_and_customer_sees_them(self):
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":"/deposit-info set 1234-5678-1234-5678 | Test Holder | Test Bank"})
+        self.assertEqual(self.bot.data.get_manual_deposit_details()["card_number"], "1234567812345678")
+        await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},
+            "text":"/deposit 2500 IRR"})
+        body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("1234567812345678", body)
+        self.assertIn("/deposit-receipt", body)
+
+    async def test_customer_can_attach_receipt_photo_and_admin_can_view_it(self):
+        await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},
+            "message_id":151,"text":"/deposit 2500 IRR"})
+        payment_id=self.bot.api.send_text.await_args.args[1].split("شناسه پرداخت: ")[1].splitlines()[0]
+        await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},
+            "caption":f"/deposit-receipt {payment_id} | bank-track-151",
+            "photo":[{"file_id":"telegram-photo-file-id"}]})
+        receipt=self.bot.data.get_manual_deposit_receipt(payment_id)
+        self.assertEqual(receipt["receipt_file_id"], "telegram-photo-file-id")
+        self.bot.api.call = AsyncMock()
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":f"/deposit-receipt-view {payment_id}"})
+        self.bot.api.call.assert_awaited_with("sendPhoto", {
+            "chat_id":6883349141, "photo":"telegram-photo-file-id",
+            "caption":f"رسید پرداخت {payment_id} | کاربر 999 | پیگیری bank-track-151"})
+
+    async def test_manual_deposit_requires_customer_submitted_reference_before_admin_credit(self):
+        await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},
+            "message_id":141,"text":"/deposit 2500 IRR"})
+        payment_id=self.bot.api.send_text.await_args.args[1].split("شناسه پرداخت: ")[1].splitlines()[0]
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":f"/wallet-verify {payment_id} | 2500 | IRR | guessed-reference"})
+        self.assertEqual(self.bot.data.wallet_balance(999), 0)
+        self.assertEqual(self.bot.data.get_payment_attempt(payment_id)["status"], "pending")
+
     async def test_manual_deposit_request_and_admin_verification_credit_once(self):
         await self.bot._handle_message({
             "from":{"id":999,"first_name":"Customer"},"chat":{"id":999,"type":"private"},
@@ -209,6 +244,8 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         payment_id=request_text.split("شناسه پرداخت: ")[1].splitlines()[0]
         self.assertEqual(self.bot.data.get_payment_attempt(payment_id,999)["status"],"pending")
         self.assertEqual(self.bot.data.wallet_balance(999),0)
+        await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},
+            "text":f"/deposit-receipt {payment_id} | bank-ref-12345"})
         command={"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
                  "text":f"/wallet-verify {payment_id} | 2500 | IRR | bank-ref-12345"}
         await self.bot._handle_message(command)
@@ -231,6 +268,8 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
             "message_id":42,"text":"/deposit 2500 IRR",
         })
         payment_id=self.bot.api.send_text.await_args.args[1].split("شناسه پرداخت: ")[1].splitlines()[0]
+        await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},
+            "text":f"/deposit-receipt {payment_id} | bank-ref-mismatch"})
         await self.bot._handle_message({
             "from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
             "text":f"/wallet-verify {payment_id} | 2501 | IRR | bank-ref-mismatch",

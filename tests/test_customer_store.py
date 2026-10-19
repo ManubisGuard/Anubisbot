@@ -237,6 +237,41 @@ class CustomerDataStoreTests(unittest.TestCase):
                               (self.store.tenant_id, "payment:pay-concurrent-settle")).fetchone()[0]
         self.assertEqual(rows, 1)
 
+    def test_manual_deposit_receipt_is_tenant_scoped_and_unique(self):
+        self.store.create_payment_attempt(payment_id="manual-receipt-1", telegram_id=1001,
+            provider="manual", amount_minor=4000, currency="IRR", idempotency_key="manual-receipt-intent-1")
+        self.store.submit_manual_deposit_receipt(payment_id="manual-receipt-1", telegram_id=1001,
+            transfer_reference="tracking-0001", payer_name="Customer One")
+        self.store.submit_manual_deposit_receipt(payment_id="manual-receipt-1", telegram_id=1001,
+            transfer_reference="tracking-0001", payer_name="Customer One")
+        receipt = self.store.get_manual_deposit_receipt("manual-receipt-1")
+        self.assertEqual(receipt["transfer_reference"], "tracking-0001")
+        self.assertEqual(len(self.store.list_manual_deposit_receipts()), 1)
+        other = CustomerDataStore(str(Path(self.tmp.name) / "other-tenant.sqlite3"), tenant_id="other")
+        self.assertIsNone(other.get_manual_deposit_receipt("manual-receipt-1"))
+        with self.assertRaises(CustomerStoreError):
+            self.store.submit_manual_deposit_receipt(payment_id="manual-receipt-1", telegram_id=1001,
+                transfer_reference="tracking-0002", payer_name="Customer One")
+
+    def test_manual_deposit_rejection_is_atomic_and_does_not_credit(self):
+        self.store.create_payment_attempt(payment_id="manual-reject-1", telegram_id=1001,
+            provider="manual", amount_minor=4000, currency="IRR", idempotency_key="manual-reject-intent-1")
+        self.store.submit_manual_deposit_receipt(payment_id="manual-reject-1", telegram_id=1001,
+            transfer_reference="tracking-reject-1")
+        self.store.reject_manual_deposit_receipt(payment_id="manual-reject-1", admin_id=9001, reason="receipt_invalid")
+        self.assertEqual(self.store.get_payment_attempt("manual-reject-1")["status"], "failed")
+        self.assertEqual(self.store.wallet_balance(1001), 0)
+        self.assertEqual(self.store.get_manual_deposit_receipt("manual-reject-1")["status"], "rejected")
+        self.assertEqual([e["event_type"] for e in self.store.list_payment_attempt_events("manual-reject-1")],
+                         ["created", "failed"])
+
+    def test_manual_deposit_card_details_validate_and_persist(self):
+        self.store.set_manual_deposit_details(card_number="1234-5678-1234-5678",
+            account_holder="Test Holder", bank_name="Test Bank")
+        self.assertEqual(self.store.get_manual_deposit_details()["card_number"], "1234567812345678")
+        with self.assertRaises(CustomerStoreError):
+            self.store.set_manual_deposit_details(card_number="123", account_holder="Test Holder")
+
     def test_payment_amount_mismatch_does_not_credit_wallet(self):
         self.store.create_payment_attempt(
             payment_id="pay-2", telegram_id=1001, provider="mock", amount_minor=2500,

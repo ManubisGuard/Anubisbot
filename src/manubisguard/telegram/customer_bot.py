@@ -284,7 +284,7 @@ class CustomerBot:
             if pending_reply is not None:
                 await self.api.send_text(chat_id, pending_reply, content_admin_keyboard("customer"))
                 return
-        text = (message.get("text") or "").strip()
+        text = (message.get("text") or message.get("caption") or "").strip()
         command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
         self.data.ensure_customer(uid, user.get("username", ""), user.get("first_name", ""))
         if uid in self._pending_purchase_discount and text and not text.startswith("/"):
@@ -318,6 +318,75 @@ class CustomerBot:
                         return
         LOG.info("Customer command received: %s", command or "[non-text]")
         menu = self._customer_menu(customer_id=uid)
+        if command == "/deposit-info":
+            payload = text.partition(" ")[2].strip()
+            if is_admin and payload.startswith("set "):
+                fields = [part.strip() for part in payload[4:].split("|")]
+                try:
+                    if len(fields) != 3:
+                        raise ValueError("فرمت: /deposit-info set شماره‌کارت | نام‌صاحب‌حساب | بانک")
+                    self.data.set_manual_deposit_details(card_number=fields[0], account_holder=fields[1], bank_name=fields[2])
+                    await self.api.send_text(chat_id, "اطلاعات کارت‌به‌کارت ذخیره شد.", menu)
+                except (ValueError, CustomerStoreError) as exc:
+                    await self.api.send_text(chat_id, f"اطلاعات ذخیره نشد: {exc}", menu)
+                return
+            details = self.data.get_manual_deposit_details()
+            if not details:
+                await self.api.send_text(chat_id, "اطلاعات کارت‌به‌کارت هنوز توسط مدیر تنظیم نشده است.", menu)
+            else:
+                await self.api.send_text(chat_id, f"💳 اطلاعات واریز دستی\nبانک: {details['bank_name'] or '—'}\nشماره کارت: {details['card_number']}\nبه نام: {details['account_holder']}\n\nپس از واریز، با /deposit-receipt PAYMENT_ID | کدپیگیری رسید را ثبت کن. شارژ فقط پس از بررسی مدیر انجام می‌شود.", menu)
+            return
+        if is_admin and command == "/pending-deposits":
+            receipts = self.data.list_manual_deposit_receipts()
+            lines = ["🧾 رسیدهای کارت‌به‌کارت در انتظار بررسی:"]
+            for receipt in receipts:
+                lines.append(f"• {receipt['payment_id']} | کاربر {receipt['telegram_id']} | {receipt['amount_minor']:,} {receipt['currency']} | پیگیری {receipt['transfer_reference']} | واریزکننده {receipt['payer_name'] or '—'}")
+            lines.append("برای دیدن تصویر: /deposit-receipt-view PAYMENT_ID")
+            lines.append("برای تأیید: /wallet-verify PAYMENT_ID | مبلغ | ارز | کدپیگیری")
+            lines.append("برای رد: /wallet-reject PAYMENT_ID | دلیل")
+            await self.api.send_text(chat_id, "\n".join(lines), menu)
+            return
+        if command == "/deposit-receipt":
+            payload = text.partition(" ")[2].strip()
+            fields = [part.strip() for part in payload.split("|")]
+            try:
+                if len(fields) not in {2,3}:
+                    raise ValueError("فرمت: /deposit-receipt PAYMENT_ID | کدپیگیری | نام‌واریزکننده (اختیاری)")
+                payment_id, reference = fields[:2]
+                payer_name = fields[2] if len(fields) == 3 else ""
+                photos = message.get("photo") or []
+                receipt_file_id = str(photos[-1].get("file_id", "")) if photos else ""
+                self.data.submit_manual_deposit_receipt(payment_id=payment_id, telegram_id=uid,
+                    transfer_reference=reference, payer_name=payer_name, receipt_file_id=receipt_file_id)
+                await self.api.send_text(chat_id, "رسید ثبت شد و در صف بررسی مدیر قرار گرفت. تا زمان تأیید، موجودی کیف پول تغییر نمی‌کند.", menu)
+            except (ValueError, CustomerStoreError) as exc:
+                await self.api.send_text(chat_id, f"رسید ثبت نشد: {exc}", menu)
+            return
+        if is_admin and command == "/deposit-receipt-view":
+            payment_id = text.partition(" ")[2].strip()
+            receipt = self.data.get_manual_deposit_receipt(payment_id) if payment_id else None
+            if not receipt or not receipt.get("receipt_file_id"):
+                await self.api.send_text(chat_id, "برای این پرداخت تصویر رسید ثبت نشده است.", menu)
+            else:
+                await self.api.call("sendPhoto", {"chat_id": chat_id, "photo": receipt["receipt_file_id"],
+                    "caption": f"رسید پرداخت {payment_id} | کاربر {receipt['telegram_id']} | پیگیری {receipt['transfer_reference']}"})
+            return
+        if is_admin and command == "/wallet-reject":
+            fields = [part.strip() for part in text.partition(" ")[2].split("|")]
+            try:
+                if len(fields) != 2: raise ValueError("فرمت: /wallet-reject PAYMENT_ID | دلیل")
+                payment_id, reason = fields
+                receipt = self.data.get_manual_deposit_receipt(payment_id)
+                if not receipt: raise CustomerStoreError("رسید پیدا نشد")
+                self.data.reject_manual_deposit_receipt(payment_id=payment_id, admin_id=uid, reason=reason)
+                try:
+                    await self.api.send_text(int(receipt["telegram_id"]), f"❌ رسید واریز {payment_id} تأیید نشد. دلیل: {reason}", self._customer_menu(include_admin=False))
+                except Exception:
+                    LOG.warning("Rejected manual deposit notification failed")
+                await self.api.send_text(chat_id, "رسید رد شد؛ هیچ مبلغی به کیف پول اضافه نشد.", menu)
+            except (ValueError, CustomerStoreError) as exc:
+                await self.api.send_text(chat_id, f"رد رسید انجام نشد: {exc}", menu)
+            return
         if is_admin and command == "/wallet-verify":
             await self._admin_wallet_verify(chat_id, text, uid)
             return
@@ -621,7 +690,12 @@ class CustomerBot:
                 self.data.create_ticket(ticket_id=ticket_id, telegram_id=uid,
                     subject=f"درخواست شارژ {amount} {currency}",
                     first_message=f"درخواست شارژ دستی؛ شناسه پرداخت: {payment_id}؛ مبلغ: {amount} {currency}. پرداخت هنوز تأیید نشده است.")
-                await self.api.send_text(chat_id, f"درخواست شارژ ثبت شد.\nشناسه پرداخت: {payment_id}\nمبلغ: {amount:,} {currency}\nتیکت: {ticket_id}\n\nدرگاه خودکار هنوز وصل نیست. پس از پرداخت از روش اعلام‌شده توسط مدیر، شناسه تراکنش را با /ticket-reply {ticket_id} | TRANSACTION_REFERENCE بفرست. موجودی فقط پس از تأیید دستی مدیر اضافه می‌شود.", menu)
+                details = self.data.get_manual_deposit_details()
+                if details and currency == "IRR":
+                    instructions = f"\n\n💳 کارت‌به‌کارت\nبانک: {details['bank_name'] or '—'}\nشماره کارت: {details['card_number']}\nبه نام: {details['account_holder']}\nپس از واریز، ثبت رسید: /deposit-receipt {payment_id} | کدپیگیری"
+                else:
+                    instructions = "\n\nاطلاعات کارت‌به‌کارت برای این ارز تنظیم نشده است؛ پیش از واریز با پشتیبانی هماهنگ کن."
+                await self.api.send_text(chat_id, f"درخواست شارژ ثبت شد.\nشناسه پرداخت: {payment_id}\nمبلغ: {amount:,} {currency}\nتیکت: {ticket_id}{instructions}\n\nموجودی فقط پس از بررسی و تأیید دستی مدیر اضافه می‌شود.", menu)
             except (ValueError, CustomerStoreError) as exc:
                 await self.api.send_text(chat_id, f"درخواست شارژ ثبت نشد: {exc}", menu)
         elif command == "/resume-service":
@@ -710,6 +784,10 @@ class CustomerBot:
             amount = int(amount_raw)
             attempt = self.data.get_payment_attempt(payment_id)
             if not attempt: raise CustomerStoreError("شناسه پرداخت پیدا نشد")
+            if attempt["provider"] == "manual":
+                receipt = self.data.get_manual_deposit_receipt(payment_id)
+                if not receipt or receipt["status"] != "submitted" or receipt["transfer_reference"] != reference:
+                    raise CustomerStoreError("No matching customer-submitted receipt; review /pending-deposits first")
             ledger_id = self.data.settle_verified_wallet_deposit(payment_id=payment_id,
                 verified_amount_minor=amount, verified_currency=currency,
                 external_reference=reference, verified_by=admin_id)
@@ -1377,7 +1455,11 @@ class CustomerBot:
                 await self.api.send_text(chat_id, "✍️ مدیریت متن‌ها، دکمه‌ها و لوگو", content_admin_keyboard("customer"))
                 return
             elif section == "finance":
-                body = ("💰 مدیریت مالی\nدرخواست‌های شارژ را بررسی کن؛ /wallet-verify و /wallet-credit فقط برای مدیر مجاز هستند.\n"
+                body = ("💰 مدیریت مالی\n"
+                        "تنظیم کارت‌به‌کارت: /deposit-info set CARD | HOLDER | BANK\n"
+                        "رسیدهای منتظر بررسی: /pending-deposits؛ مشاهده تصویر: /deposit-receipt-view PAYMENT_ID\n"
+                        "تأیید: /wallet-verify PAYMENT_ID | AMOUNT | IRR | TRACKING_CODE؛ رد: /wallet-reject PAYMENT_ID | REASON\n"
+                        "شارژ دستی /wallet-credit فقط برای پرداختی است که خارج از ربات مستقل بررسی شده باشد.\n"
                         "سابقه تغییرناپذیر یک پرداخت: /payment-events PAYMENT_ID\n"
                         "کد تخفیف: /discount add CODE | PERCENT | MAX_USES | EXPIRES_EPOCH | PRODUCT_IDS_CSV، سپس /discount list یا /discount enable CODE on|off.\n"
                         "عملیات تمدید/افزایش ترافیک نیازمند بررسی: /service-operations [reconcile_required|pending|completed|refunded|all]\n"

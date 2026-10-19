@@ -134,6 +134,30 @@ class CustomerDataStore:
                 BEGIN
                     SELECT RAISE(ABORT, 'wallet ledger is append-only');
                 END;
+                CREATE TABLE IF NOT EXISTS manual_deposit_settings (
+                    tenant_id TEXT PRIMARY KEY,
+                    card_number TEXT NOT NULL,
+                    account_holder TEXT NOT NULL,
+                    bank_name TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS manual_deposit_receipts (
+                    tenant_id TEXT NOT NULL,
+                    payment_id TEXT NOT NULL,
+                    telegram_id INTEGER NOT NULL,
+                    transfer_reference TEXT NOT NULL,
+                    payer_name TEXT NOT NULL DEFAULT '',
+                    receipt_file_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'submitted' CHECK(status IN ('submitted','rejected')),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(tenant_id,payment_id),
+                    UNIQUE(tenant_id,transfer_reference),
+                    FOREIGN KEY(tenant_id,payment_id) REFERENCES payment_attempts(tenant_id,payment_id),
+                    FOREIGN KEY(tenant_id,telegram_id) REFERENCES customer_users(tenant_id,telegram_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_manual_deposit_receipts_queue
+                    ON manual_deposit_receipts(tenant_id,status,created_at);
                 CREATE TABLE IF NOT EXISTS payment_attempts (
                     tenant_id TEXT NOT NULL,
                     payment_id TEXT NOT NULL,
@@ -435,6 +459,10 @@ class CustomerDataStore:
                         db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
             db.execute("UPDATE reseller_accounts SET idempotency_key='legacy:' || account_id WHERE idempotency_key='' OR idempotency_key IS NULL")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_reseller_idempotency ON reseller_accounts(tenant_id,idempotency_key)")
+
+            receipt_columns = {row[1] for row in db.execute("PRAGMA table_info(manual_deposit_receipts)")}
+            if "receipt_file_id" not in receipt_columns:
+                db.execute("ALTER TABLE manual_deposit_receipts ADD COLUMN receipt_file_id TEXT NOT NULL DEFAULT ''")
 
     def _ensure_manual_shop_tables(self) -> None:
         with self._connect() as db:
@@ -903,6 +931,105 @@ class CustomerDataStore:
                    WHERE tenant_id=? AND order_id=?""",
                 (new_status, provider_reference[:256], self.tenant_id, order_id),
             )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def set_manual_deposit_details(self, *, card_number: str, account_holder: str, bank_name: str = '') -> None:
+        digits = ''.join(ch for ch in card_number if ch.isdigit())
+        if len(digits) != 16 or any(ch not in '0123456789 -' for ch in card_number):
+            raise CustomerStoreError("Card number must contain exactly 16 digits")
+        account_holder = account_holder.strip()
+        bank_name = bank_name.strip()
+        if not 2 <= len(account_holder) <= 100 or len(bank_name) > 100:
+            raise CustomerStoreError("Account holder or bank name is invalid")
+        with self._connect() as db:
+            db.execute("""INSERT INTO manual_deposit_settings(tenant_id,card_number,account_holder,bank_name)
+                VALUES(?,?,?,?) ON CONFLICT(tenant_id) DO UPDATE SET card_number=excluded.card_number,
+                account_holder=excluded.account_holder,bank_name=excluded.bank_name,updated_at=CURRENT_TIMESTAMP""",
+                (self.tenant_id, digits, account_holder, bank_name))
+
+    def get_manual_deposit_details(self) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute("SELECT card_number,account_holder,bank_name,updated_at FROM manual_deposit_settings WHERE tenant_id=?",
+                             (self.tenant_id,)).fetchone()
+        return dict(row) if row else None
+
+    def submit_manual_deposit_receipt(self, *, payment_id: str, telegram_id: int,
+                                      transfer_reference: str, payer_name: str = '',
+                                      receipt_file_id: str = '') -> None:
+        reference = transfer_reference.strip()
+        payer_name = payer_name.strip()
+        if not 4 <= len(reference) <= 120 or any(ch.isspace() for ch in reference):
+            raise CustomerStoreError("Transfer reference must be 4-120 characters without spaces")
+        if len(payer_name) > 100 or len(receipt_file_id) > 512:
+            raise CustomerStoreError("Payer name or receipt file reference is too long")
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            payment = db.execute("""SELECT provider,status,telegram_id FROM payment_attempts
+                WHERE tenant_id=? AND payment_id=?""", (self.tenant_id,payment_id)).fetchone()
+            if not payment or payment["telegram_id"] != telegram_id:
+                raise CustomerStoreError("Payment not found for this customer")
+            if payment["provider"] != "manual" or payment["status"] != "pending":
+                raise CustomerStoreError("Only pending manual deposits accept receipts")
+            existing = db.execute("SELECT transfer_reference,payer_name,receipt_file_id,status FROM manual_deposit_receipts WHERE tenant_id=? AND payment_id=?",
+                                  (self.tenant_id,payment_id)).fetchone()
+            if existing:
+                if (existing["transfer_reference"] == reference and existing["payer_name"] == payer_name
+                        and existing["receipt_file_id"] == receipt_file_id and existing["status"] == "submitted"):
+                    db.commit()
+                    return
+                raise CustomerStoreError("A receipt was already submitted for this payment")
+            db.execute("""INSERT INTO manual_deposit_receipts(tenant_id,payment_id,telegram_id,transfer_reference,payer_name,receipt_file_id)
+                VALUES(?,?,?,?,?,?)""", (self.tenant_id,payment_id,telegram_id,reference,payer_name,receipt_file_id))
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def list_manual_deposit_receipts(self) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute("""SELECT r.payment_id,r.telegram_id,r.transfer_reference,r.payer_name,r.receipt_file_id,r.status,r.created_at,
+                p.amount_minor,p.currency FROM manual_deposit_receipts r JOIN payment_attempts p
+                ON p.tenant_id=r.tenant_id AND p.payment_id=r.payment_id
+                WHERE r.tenant_id=? AND r.status='submitted' AND p.status='pending'
+                ORDER BY r.created_at LIMIT 100""", (self.tenant_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_manual_deposit_receipt(self, payment_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute("""SELECT payment_id,telegram_id,transfer_reference,payer_name,receipt_file_id,status,created_at
+                FROM manual_deposit_receipts WHERE tenant_id=? AND payment_id=?""",
+                (self.tenant_id,payment_id)).fetchone()
+        return dict(row) if row else None
+
+    def reject_manual_deposit_receipt(self, *, payment_id: str, admin_id: int, reason: str) -> None:
+        reason = reason.strip()
+        if not reason or len(reason) > 128:
+            raise CustomerStoreError("A short rejection reason is required")
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            payment = db.execute("SELECT status,provider FROM payment_attempts WHERE tenant_id=? AND payment_id=?",
+                                 (self.tenant_id,payment_id)).fetchone()
+            receipt = db.execute("SELECT status FROM manual_deposit_receipts WHERE tenant_id=? AND payment_id=?",
+                                 (self.tenant_id,payment_id)).fetchone()
+            if not payment or payment["provider"] != "manual" or payment["status"] != "pending" or not receipt or receipt["status"] != "submitted":
+                raise CustomerStoreError("No pending submitted manual receipt exists")
+            db.execute("UPDATE manual_deposit_receipts SET status='rejected',updated_at=CURRENT_TIMESTAMP WHERE tenant_id=? AND payment_id=? AND status='submitted'",
+                       (self.tenant_id,payment_id))
+            db.execute("UPDATE payment_attempts SET status='failed',failure_code=?,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=? AND payment_id=? AND status='pending'",
+                       (("manual_receipt_rejected:" + reason)[:128],self.tenant_id,payment_id))
+            db.execute("""INSERT INTO payment_attempt_events(tenant_id,payment_id,event_type,actor_telegram_id,
+                amount_minor,currency,failure_code) SELECT tenant_id,payment_id,'failed',?,amount_minor,currency,?
+                FROM payment_attempts WHERE tenant_id=? AND payment_id=?""",
+                (admin_id,("manual_receipt_rejected:" + reason)[:128],self.tenant_id,payment_id))
             db.commit()
         except Exception:
             db.rollback()
