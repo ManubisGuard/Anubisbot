@@ -389,6 +389,10 @@ class CustomerBot:
                 lines.append(f"مبلغ: {payload['amount_minor']} {payload['currency']}")
             if payload.get("entry_type"):
                 lines.append(f"نوع تراکنش: {payload['entry_type']}")
+            if event_key == "backup" and payload.get("destination"):
+                lines.append(f"مقصد بک‌آپ: {payload['destination']}")
+            if event_key == "backup" and payload.get("size_bytes") is not None:
+                lines.append(f"حجم بک‌آپ: {int(payload['size_bytes']):,} بایت")
             if payload.get("status"):
                 lines.append(f"وضعیت: {payload['status']}")
             if payload.get("reason_code"):
@@ -792,13 +796,20 @@ class CustomerBot:
                     next_line = "نوبت بعدی: برنامه نیاز به اصلاح دارد."
                 destination_line = (f"{policy['destination']} | chat={policy['telegram_chat_id'] or '—'}"
                     f" | topic={policy['telegram_topic_id'] or 'بدون تاپیک'}")
+                last_run_line = "آخرین اجرا: —"
+                try:
+                    if policy.get("last_run_at") is not None:
+                        last_run_line = "آخرین اجرا (UTC): " + datetime.fromtimestamp(
+                            float(policy["last_run_at"]), timezone.utc).isoformat(timespec="seconds")
+                except (TypeError, ValueError, OSError, OverflowError):
+                    last_run_line = "آخرین اجرا: داده نامعتبر"
                 await self.api.send_text(chat_id,
                     "🗄 سیاست بک‌آپ (تنظیمات ذخیره‌شده، اجرا غیرفعال)\n"
                     f"وضعیت زمان‌بند: {'فعال' if policy['enabled'] else 'غیرفعال'}\n"
                     f"زمان‌بندی: {policy['frequency']} | منطقه زمانی: {policy['timezone_name']} | ساعت: {policy['local_time']} | بازه: {policy['interval_minutes']} دقیقه\n"
                     f"مقصد: {destination_line}\nمسیر محلی: {policy['local_directory']}\n"
                     f"نگهداری: حداکثر {policy['retention_count']} نسخه / {policy['retention_days']} روز\n"
-                    f"آخرین وضعیت: {policy['last_status']}\n{next_line}\n\n"
+                    f"آخرین وضعیت: {policy['last_status']}\n{last_run_line}\n{next_line}\n\n"
                     "این زمان فقط پیش‌نمایش است؛ زمان‌بند و ارسال فایل هنوز نصب/فعال نشده‌اند.",
                     ADMIN_MENU)
                 return

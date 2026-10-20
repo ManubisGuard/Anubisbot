@@ -3326,6 +3326,45 @@ class CustomerDataStore:
             defaults.update(dict(row))
         return defaults
 
+    def record_backup_run(self, *, run_id: str, status: str, destination: str,
+                          size_bytes: int | None, reason_code: str | None,
+                          now: float | None = None) -> dict[str, Any]:
+        """Persist a redacted one-shot backup outcome and enqueue its admin event atomically."""
+        if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", run_id):
+            raise CustomerStoreError("Invalid backup run ID")
+        if status not in {"success", "failed"} or destination not in {"local", "telegram", "both"}:
+            raise CustomerStoreError("Invalid backup run status or destination")
+        if status == "success":
+            if (isinstance(size_bytes, bool) or not isinstance(size_bytes, int)
+                    or not 0 <= size_bytes <= 2**63 - 1 or reason_code is not None):
+                raise CustomerStoreError("Successful backup requires a valid size and no error code")
+        elif (size_bytes is not None or not isinstance(reason_code, str)
+              or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", reason_code)):
+            raise CustomerStoreError("Failed backup requires a fixed reason code and no size")
+        ts = time.time() if now is None else float(now)
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            cur = db.execute("""UPDATE customer_backup_policies
+                SET last_run_at=?,last_status=?,last_error_code=?
+                WHERE tenant_id=?""", (ts, status, reason_code, self.tenant_id))
+            if cur.rowcount != 1:
+                raise CustomerStoreError("Backup policy must be configured before recording a run")
+            payload = {"status": status, "destination": destination}
+            if size_bytes is not None:
+                payload["size_bytes"] = size_bytes
+            if reason_code:
+                payload["reason_code"] = reason_code
+            self._enqueue_admin_notification_in_transaction(db, event_key="backup",
+                idempotency_key=f"backup-run:{run_id}", payload=payload, now=ts)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+        return self.get_backup_policy()
+
     def update_backup_policy(self, *, frequency: str, timezone_name: str, local_time: str,
                              interval_minutes: int, destination: str, local_directory: str,
                              telegram_chat_id: int | None, telegram_topic_id: int,
@@ -3385,7 +3424,7 @@ class CustomerDataStore:
         if not isinstance(payload, dict):
             raise CustomerStoreError("Notification payload must be an object")
         safe: dict[str, Any] = {}
-        for key in ("public_order_id", "product_title", "status", "reason_code", "entry_type", "currency"):
+        for key in ("public_order_id", "product_title", "status", "reason_code", "entry_type", "currency", "destination"):
             value = payload.get(key)
             if isinstance(value, str):
                 value = value.strip()
@@ -3393,16 +3432,21 @@ class CustomerDataStore:
                     value = value.upper()
                     if len(value) != 3 or not value.isascii() or not value.isalpha():
                         continue
+                elif key == "destination":
+                    if value not in {"local", "telegram", "both"}:
+                        continue
                 else:
                     value = "".join(ch for ch in value if ch.isprintable())[:120]
                 if value:
                     safe[key] = value
-        for key in ("amount_minor", "customer_id"):
+        for key in ("amount_minor", "customer_id", "size_bytes"):
             value = payload.get(key)
             if isinstance(value, int) and not isinstance(value, bool):
                 if key == "amount_minor" and abs(value) <= 2**63 - 1:
                     safe[key] = value
                 elif key == "customer_id" and value > 0:
+                    safe[key] = value
+                elif key == "size_bytes" and 0 <= value <= 2**63 - 1:
                     safe[key] = value
         return safe
 
