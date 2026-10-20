@@ -28,6 +28,8 @@ class SanaeiAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report['operations']['create_user']['panel_permission'], 'unknown')
         self.assertEqual(report['operations']['create_user']['live_test'], 'not_tested')
         self.assertEqual(report['operations']['manage_resellers']['status'], 'unsupported')
+        capabilities = await adapter.capabilities(conn)
+        self.assertFalse(capabilities.subscription_link)
 
     async def test_token_create_payload_and_expiry_milliseconds(self):
         seen=[]
@@ -61,6 +63,48 @@ class SanaeiAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(user.used_bytes,10)
         self.assertEqual(user.data_limit_bytes,100 * 1024**3)
         self.assertEqual(calls,[('/login','POST'),('/panel/api/inbounds/list','GET')])
+
+    async def test_token_subscription_link_uses_explicit_https_url_not_share_links(self):
+        calls=[]
+        direct_link='vless://alice@edge.example:443?security=tls'
+        def handler(method,path,kwargs):
+            calls.append((method,path,kwargs.get('headers',{}).get('Authorization')))
+            return Response(200,{'success':True,'obj':{
+                'client':{'email':'alice','id':'uuid-1'},
+                'links':[direct_link],
+                'subscription_url':'https://sub.example/s/alice-token',
+            }})
+        adapter=SanaeiAdapter(secret_resolver=lambda _:'token',client_factory=lambda **kw:FakeClient(handler,kw['base_url']))
+        conn=PanelConnection(id='s',tenant_id='t',name='S',kind='sanaei',base_url='https://s.example',
+            auth_mode='access_token',secret_ref='s')
+        link=await adapter.get_subscription_url(conn,'alice')
+        self.assertEqual(link,'https://sub.example/s/alice-token')
+        self.assertEqual(calls,[('GET','/panel/api/clients/get/alice','Bearer token')])
+
+    async def test_token_subscription_link_fails_closed_when_only_direct_share_links_exist(self):
+        direct_link='vless://alice@edge.example:443?security=tls'
+        calls=[]
+        def handler(method,path,kwargs):
+            calls.append((method,path))
+            return Response(200,{'success':True,'obj':{'client':{'email':'alice','id':'uuid-1'},
+                'links':[direct_link],'subscription_url':direct_link}})
+        adapter=SanaeiAdapter(secret_resolver=lambda _:'token',
+            client_factory=lambda **kw:FakeClient(handler,kw['base_url']))
+        conn=PanelConnection(id='s',tenant_id='t',name='S',kind='sanaei',base_url='https://s.example',
+            auth_mode='access_token',secret_ref='s')
+        with self.assertRaisesRegex(PanelError,'HTTPS subscription URL'):
+            await adapter.get_subscription_url(conn,'alice')
+        self.assertEqual(calls,[('GET','/panel/api/clients/get/alice')])
+        self.assertNotIn(direct_link, str(calls))
+
+    async def test_legacy_subscription_link_fails_before_any_request(self):
+        adapter=SanaeiAdapter(secret_resolver=lambda _:'password',
+            client_factory=lambda **kw:FakeClient(lambda *args: self.fail('unexpected request'),kw['base_url']))
+        conn=PanelConnection(id='legacy',tenant_id='t',name='Legacy',kind='sanaei',
+            base_url='https://s.example',auth_mode='username_password',secret_ref='s',
+            metadata={'username':'admin'})
+        with self.assertRaisesRegex(PanelError,'not verified for legacy'):
+            await adapter.get_subscription_url(conn,'alice')
 
     async def test_token_usage_uses_documented_traffic_endpoint(self):
         calls=[]

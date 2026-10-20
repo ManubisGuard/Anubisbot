@@ -89,6 +89,21 @@ class SanaeiAdapter:
         if obj is None and result.get("success") is True: return {}
         raise PanelError("Sanaei response omitted object data")
 
+    @staticmethod
+    def _safe_subscription_url(value: Any) -> str | None:
+        if not isinstance(value, str) or len(value) > 4096 or any(ord(ch) < 32 for ch in value):
+            return None
+        candidate = value.strip()
+        try:
+            parsed = urlsplit(candidate)
+            if (parsed.scheme.lower() != "https" or not parsed.hostname
+                    or parsed.username or parsed.password):
+                return None
+            _ = parsed.port
+        except ValueError:
+            return None
+        return candidate
+
     @classmethod
     def _map(cls, obj: dict[str, Any], base_url: str) -> PanelUser:
         client = obj.get("client") if isinstance(obj.get("client"), dict) else obj
@@ -119,8 +134,11 @@ class SanaeiAdapter:
             except (TypeError, ValueError): used = 0
         if used < 0:
             raise PanelError("Sanaei returned a negative usage counter")
-        links = obj.get("links") or obj.get("subscription_url")
-        sub = links[0] if isinstance(links, list) and links else links if isinstance(links, str) else None
+        # The clients/links endpoint returns protocol share URIs, not the HTTPS
+        # subscription URL consumed by MANUBIS's service/QR contract.
+        sub_candidate = (obj.get("subscription_url") or obj.get("subscription_link")
+                         or client.get("subscription_url") or client.get("subscription_link"))
+        sub = cls._safe_subscription_url(sub_candidate)
         return PanelUser(provider_user_id=username, username=username,
             status="active" if client.get("enable", True) else "disabled",
             used_bytes=int(used) if used is not None else None,
@@ -148,10 +166,13 @@ class SanaeiAdapter:
             validation_error_type=validation_error)
 
     async def capabilities(self, connection: PanelConnection) -> PanelCapabilities:
-        mode, _ = self._credentials(connection)
+        self._credentials(connection)
+        # The documented token clients/links endpoint returns direct protocol
+        # links, not an HTTPS subscription URL. Do not claim this capability until
+        # a real subscription URL source/configuration exists.
         return PanelCapabilities(create_user=True, delete_user=True, update_user=True,
             read_usage=True, read_status=True, suspend_user=True, activate_user=True,
-            subscription_link=mode == "token", list_users=True, manage_resellers=False,
+            subscription_link=False, list_users=True, manage_resellers=False,
             health_check=True, sync=False)
 
     async def health_check(self, connection: PanelConnection) -> dict[str, Any]:
@@ -366,13 +387,9 @@ class SanaeiAdapter:
 
     async def get_subscription_url(self, connection: PanelConnection, username: str) -> str:
         mode, _ = self._credentials(connection)
-        if mode != "token": raise PanelError("Subscription-link endpoint is not verified for legacy Sanaei mode")
-        result = await self._request(connection, "GET", f"/panel/api/clients/links/{quote(username, safe='')}")
-        obj = result.get("obj", result) if isinstance(result, dict) else None
-        if isinstance(obj, str): candidates = obj.splitlines()
-        elif isinstance(obj, list): candidates = [v if isinstance(v, str) else v.get("uri") or v.get("link") or v.get("url", "") for v in obj]
-        else: candidates = []
-        for candidate in candidates:
-            if isinstance(candidate, str) and candidate.strip().startswith(("vless://", "vmess://", "trojan://", "ss://")):
-                return candidate.strip()
-        raise PanelError("Sanaei response did not contain a supported connection link")
+        if mode != "token":
+            raise PanelError("Subscription-link endpoint is not verified for legacy Sanaei mode")
+        user = await self.get_user(connection, username)
+        if not user.subscription_url:
+            raise PanelError("Sanaei API did not provide an HTTPS subscription URL")
+        return user.subscription_url
