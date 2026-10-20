@@ -257,3 +257,11 @@ Final static pass after Session 96 source/tests passed: Python compileall, `bash
 - The admin route help now accurately distinguishes connected event producers from remaining unconnected `service_test`, `bot_log` and `backup` producers. Backup policy remains configuration-only; no scheduler is enabled.
 - Focused tests: 3 passed. Complete isolated suite: **341 tests passed in 62.813 seconds (OK)**. Python compileall, Bash syntax, Mini App JavaScript syntax and `git diff --check` passed.
 - Evidence remains E2 local SQLite/unit/mock only. No live Telegram delivery, panel/payment API, operational DB, timer activation, deployment or service restart was performed.
+
+
+## Session 101 — forged admin callback alerts and final verification (2026-10-20)
+
+- Non-admin `admin:` and `content:` callback attempts are denied and queue a privacy-safe `security_alert`; callback data itself is not stored. Attempts are coalesced by user per 60-second window.
+- Complete isolated test suite: **343 tests passed in 66.829 seconds (OK, exit 0)**. Final static checks passed: Python `compileall`, Bash syntax, Mini App JavaScript syntax, and `git diff --check`.
+- Source commit `9e1012b` (`feat: alert on unauthorized admin callbacks`) is pushed to `origin/feature/discount-codes`; local and remote branch heads match. No staged files remain. Separate pre-existing README/control-bot/Factory/deploy/script/root-webapp changes remain uncommitted and untouched.
+- Evidence is E2 local SQLite/unit/mock only. No live Telegram, payment/provider API, production database, deployment, service restart, or timer activation was performed.
