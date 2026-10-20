@@ -2,7 +2,7 @@ import json
 import unittest
 from urllib.parse import urlsplit
 from manubisguard.panels.adapters.rebecca import RebeccaAdapter
-from manubisguard.panels.contracts import PanelConnection, PanelError, UserCreate
+from manubisguard.panels.contracts import PanelConnection, PanelError, UserCreate, UserUpdate
 
 class Response:
     def __init__(self, status, data=None, text=''):
@@ -64,6 +64,27 @@ class RebeccaAdapterTests(unittest.IsolatedAsyncioTestCase):
         users=await adapter.list_users(self.connection,limit=10)
         self.assertEqual(len(users),1)
         self.assertEqual(users[0].subscription_url,'https://sub.example/alice')
+
+    async def test_update_delete_and_usage_use_expected_user_endpoints(self):
+        def handler(method, path, kwargs):
+            self.calls.append((method, path, kwargs.get('headers', {}).get('Authorization'), kwargs.get('json')))
+            if method == 'PUT' and path == '/api/v2/users/user-17':
+                return Response(200, {'username':'alice','status':'disabled','data_limit':2048})
+            if method == 'GET' and path == '/api/user/alice/usage':
+                return Response(200, {'used_traffic':42})
+            return Response(204)
+        adapter=RebeccaAdapter(secret_resolver=lambda _:'fake-key',
+            client_factory=lambda **kw:FakeClient(handler,kw['base_url']))
+        updated=await adapter.update_user(self.connection,'user-17',
+            UserUpdate(status='disabled',data_limit_bytes=2048))
+        await adapter.delete_user(self.connection,'user-17')
+        usage=await adapter.get_usage(self.connection,'alice')
+        self.assertEqual(updated.status,'disabled')
+        self.assertEqual(self.calls[0][0:2],('PUT','/api/v2/users/user-17'))
+        self.assertEqual(self.calls[0][3],{'data_limit':2048,'status':'disabled'})
+        self.assertEqual(self.calls[1][0:2],('DELETE','/api/user/user-17'))
+        self.assertEqual(self.calls[2][0:2],('GET','/api/user/alice/usage'))
+        self.assertEqual(usage['used_traffic'],42)
 
     async def test_http_error_does_not_expose_body(self):
         adapter=RebeccaAdapter(secret_resolver=lambda _:'x',client_factory=lambda **kw:FakeClient(lambda *args:Response(403,text='secret internal detail'),kw['base_url']))

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from manubisguard.panels.adapters.pasarguard import PasarGuardAdapter
-from manubisguard.panels.contracts import PanelConnection, PanelError, UserCreate
+from manubisguard.panels.contracts import PanelConnection, PanelError, UserCreate, UserUpdate
 
 
 class FakeClient:
@@ -52,6 +52,17 @@ class FakeClient:
         self.created_user = user
         self.created_token = token
         return {"id": 29, "username": user.username, "status": "active"}
+
+    async def modify_user_by_id(self, *, user_id, user, token):
+        self.modified_user_id = user_id
+        self.modified_user = user
+        self.modified_token = token
+        return {"id": user_id, "username": "alice", "status": getattr(user, "status", "active"),
+                "data_limit": getattr(user, "data_limit", None), "expire": getattr(user, "expire", None)}
+
+    async def remove_user_by_id(self, *, user_id, token):
+        self.deleted_user_id = user_id
+        self.deleted_token = token
 
     async def get_user_by_username(self, *, username, token):
         return {
@@ -191,6 +202,23 @@ class PasarGuardAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created.provider_user_id, "29")
         self.assertEqual(self.clients[-1].created_user.group_ids, [2, 5])
         self.assertEqual(self.clients[-1].created_token, "test-secret")
+
+    async def test_update_and_delete_user_use_provider_id_and_explicit_fields(self):
+        fake_sdk = SimpleNamespace(UserModify=lambda **kwargs: SimpleNamespace(**kwargs))
+        with patch.dict(sys.modules, {"pasarguard": fake_sdk}):
+            updated = await self.adapter.update_user(
+                self.connection, "17",
+                UserUpdate(data_limit_bytes=4096, status="disabled"),
+            )
+            update_client = self.clients[-1]
+            await self.adapter.delete_user(self.connection, "17")
+            delete_client = self.clients[-1]
+        self.assertEqual(updated.provider_user_id, "17")
+        self.assertEqual(update_client.modified_user_id, "17")
+        self.assertEqual(update_client.modified_user.data_limit, 4096)
+        self.assertEqual(update_client.modified_user.status, "disabled")
+        self.assertEqual(delete_client.deleted_user_id, "17")
+        self.assertEqual(delete_client.deleted_token, "test-secret")
 
     async def test_list_users_is_bounded_and_maps_each_user(self):
         users = await self.adapter.list_users(self.connection, limit=5000, offset=-4)

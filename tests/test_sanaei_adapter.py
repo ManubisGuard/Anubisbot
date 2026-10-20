@@ -1,7 +1,7 @@
 import json
 import unittest
 from manubisguard.panels.adapters.sanaei import SanaeiAdapter
-from manubisguard.panels.contracts import PanelConnection, PanelError, UserCreate
+from manubisguard.panels.contracts import PanelConnection, PanelError, UserCreate, UserUpdate
 
 class Response:
     def __init__(self,status,data=None): self.status_code=status; self._data=data; self.content=json.dumps(data).encode() if data is not None else b''
@@ -78,6 +78,27 @@ class SanaeiAdapterTests(unittest.IsolatedAsyncioTestCase):
         conn=PanelConnection(id='s',tenant_id='t',name='S',kind='sanaei',base_url='https://s.example',auth_mode='access_token',secret_ref='s',metadata={'inbound_ids':[3]})
         with self.assertRaisesRegex(PanelError,'whole GiB'):
             await adapter.create_user(conn,UserCreate(username='alice',data_limit_bytes=1024**3+1,extra={'inbound_ids':[3]}))
+
+    async def test_token_update_preserves_identity_and_changes_status_and_limit(self):
+        calls=[]
+        existing={'id':'uuid-1','email':'alice','totalGB':2,'expiryTime':0,'enable':True,'up':1,'down':2}
+        def handler(method,path,kwargs):
+            calls.append((method,path,kwargs.get('json')))
+            if path == '/panel/api/clients/get/alice':
+                return Response(200,{'success':True,'obj':{'client':existing,'inboundIds':[3]}})
+            if path == '/panel/api/clients/update/alice':
+                return Response(200,{'success':True,'obj':{'client':kwargs['json'],'inboundIds':[3]}})
+            return Response(200,{'success':True,'obj':[]})
+        adapter=SanaeiAdapter(secret_resolver=lambda _:'token',client_factory=lambda **kw:FakeClient(handler,kw['base_url']))
+        conn=PanelConnection(id='s',tenant_id='t',name='S',kind='sanaei',base_url='https://s.example',
+            auth_mode='access_token',secret_ref='s')
+        updated=await adapter.update_user(conn,'alice',UserUpdate(status='disabled',data_limit_bytes=3 * 1024**3))
+        self.assertEqual(updated.username,'alice')
+        self.assertEqual(calls[0][0:2],('GET','/panel/api/clients/get/alice'))
+        self.assertEqual(calls[1][0:2],('POST','/panel/api/clients/update/alice'))
+        self.assertEqual(calls[1][2]['totalGB'],3)
+        self.assertFalse(calls[1][2]['enable'])
+        self.assertEqual(calls[1][2]['id'],'uuid-1')
 
     async def test_token_delete_uses_documented_endpoint(self):
         calls=[]

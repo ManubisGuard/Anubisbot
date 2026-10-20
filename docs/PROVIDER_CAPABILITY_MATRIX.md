@@ -1,0 +1,48 @@
+# MANUBIS Bot 2 — Provider Capability Matrix
+
+Updated: 2026-10-20. Scope: source-level audit of `src/manubisguard/panels/adapters/{pasarguard,rebecca,sanaei}.py`, the provider-neutral contract, reseller provider paths, and isolated tests. This document deliberately distinguishes local code/mocks from deployed-panel acceptance.
+
+## Evidence legend
+
+- **Implemented / E2 partial**: adapter method exists and at least one isolated mock test exercises the behavior; this does not prove the real panel version or credential accepts it.
+- **Implemented / E2 gap**: method exists, but a relevant mode/operation lacks a direct regression test.
+- **Unsupported**: adapter intentionally exposes no operation or fails closed for that mode.
+- **Live acceptance**: none recorded for any provider. `capability_report()` explicitly leaves `live_panel_verified=false`; panel permissions remain unknown.
+
+## Operation matrix
+
+| Operation | PasarGuard | Rebecca | Sanaei token API | Sanaei legacy username/password |
+|---|---|---|---|---|
+| Authenticated health/read probe | Implemented; low-impact group endpoint tested | Implemented; `/api/system` mock tested | Implemented; inbound-list probe | Implemented through login + inbound-list path; no separate health-mode test |
+| Create user | Implemented; SDK method/model compatibility tested | Implemented; requires configured `service_id`, tested | Implemented; inbound IDs required, whole-GiB limit enforced, tested | Code path exists but requires exactly one inbound; direct create test gap |
+| Read user/status | Implemented and mapping tested | Implemented and mapping exercised | Implemented and legacy mapping tested | Implemented and legacy mapping tested |
+| List users | Implemented, bounded to 200; tested | Implemented, bounded to 200; tested | Implemented, bounded to 200; direct list test gap | Implemented, aggregates/deduplicates by email; direct list test gap |
+| Update user | Implemented through SDK `modify_user_by_id`; status/limit regression tested | Implemented through `PUT /api/v2/users/{id}`; status/limit regression tested | Implemented through `POST /panel/api/clients/update/{id}`; identity/status/limit regression tested | Code path exists but requires one inbound and client UUID; direct update test gap |
+| Delete user | Implemented through SDK `remove_user_by_id`; regression tested | Implemented through `DELETE /api/user/{id}`; regression tested | Implemented through `/panel/api/clients/del/{id}`; endpoint tested | Code path exists but requires one inbound and client UUID; direct delete test gap |
+| Read usage | Cumulative counter via SDK user-by-ID response, normalized to bytes; missing counter fails closed; tested | Raw usage response returned; billing consumer recognizes documented/local `used_traffic` and nested counters; endpoint regression tested | Traffic endpoint normalized to byte counters; tested | Reads per-inbound client stats and sums matching upload/download; code exists, direct test gap |
+| Subscription link | Derived from user response; relative URL normalization tested | Derived from user response; create/list fixtures cover links, dedicated failure test gap | Dedicated links endpoint, token mode only; direct link test gap | Unsupported by explicit fail-closed error |
+| Suspend / activate | Implemented via `update_user(status=disabled|active)`; update path tested | Implemented via `update_user(status=disabled|active)`; update path tested | Implemented via `update_user(enable=false|true)`; token path tested | Same normalized statuses in code, but direct update test gap |
+| Reset usage counter | Unsupported; no adapter contract/method | Unsupported; no adapter contract/method | No dedicated reset operation; create payload's `reset` field is not a reset API | No dedicated reset operation |
+| Native reseller/admin management | Separate `PasarGuardResellerProvider`; role, owner-role and selected lifecycle behavior tested. Capability report checks SDK methods **and** required SDK models. Live permissions unknown. | Not supported by the normal user adapter. Separate native Rebecca provider is contract/scope gated and fails closed when requirements are absent; local mock tests only. | Unsupported for reseller plans; platform-managed child users only | Unsupported for reseller plans; platform-managed child users only |
+| Provider sync/bulk reconciliation | `sync=False`; no generic sync operation | `sync=False`; no generic sync operation | `sync=False`; no generic sync operation | `sync=False`; no generic sync operation |
+
+## Cross-cutting findings
+
+1. `PanelCapabilities` currently models create/delete/update, usage/status, suspend/activate, subscription link, list users, reseller management and health check. It does not define a `reset_usage` capability, although reset is a distinct provider operation in some panels. Do not advertise/reset usage until a provider-specific contract and safe tests exist.
+2. `capability_report()` is local SDK/method introspection. It cannot establish API version compatibility, credential scope, provider-side permission, endpoint availability, or successful mutation. A successful health GET is not proof that create/update/delete works.
+3. PasarGuard `get_usage()` intentionally reads the cumulative user counter through `get_user_by_id`; the SDK time-series `/usage` endpoint must not be treated as a cumulative billing counter. It rejects missing counters rather than silently billing zero.
+4. Sanaei traffic limits are whole GiB only. Token API and legacy inbounds API have different operation paths; the legacy write operations require a single inbound and UUID, and should remain unaccepted until dedicated mock and staging tests cover those branches.
+5. Rebecca user creation requires a configured service ID. Its normal adapter's reseller capability is unsupported; native reseller handling is separate and gated by OpenAPI/scope/permission contracts.
+6. Provider mutation timeout/ambiguous-result recovery must remain operation-specific. No adapter mock proves whether a remote write happened when a real connection times out.
+
+## Remaining acceptance gates
+
+- **E2 coverage gaps to close in source/tests:** Sanaei legacy create/update/delete and list behavior; Sanaei subscription-link contract; explicit adapter failure cases for update/delete; capability-report behavior when configuration validation fails. Add only tests grounded in current implementation/official provider contract, and keep legacy mode fail-closed where the contract is unknown.
+- **E3/public-contract work not done here:** confirm the deployed versions and official API/SDK contracts for each operation before relying on endpoint semantics. Do not invent version-specific behavior from mock fixtures.
+- **E4/E5/live work blocked:** per-operation staging acceptance on disposable panels, with explicit authorization and credentials supplied through the approved environment. Test create/read/update/status/usage/subscription/delete and timeout-after-write reconciliation separately. No production mutation or live panel calls are authorized by this audit.
+
+## Local evidence from this audit
+
+- Adapter + reseller-provider focused suite after adding direct update/delete/usage mock coverage: **41 tests passed in 2.952s**.
+- Full isolated suite: **367 tests passed in 62.211s (OK)**. Python compileall, Bash syntax, Mini App JavaScript syntax and `git diff --check` passed.
+- Evidence level remains E2 (isolated local mock tests); no live panel/provider acceptance is claimed.
