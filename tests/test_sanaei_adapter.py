@@ -31,6 +31,37 @@ class SanaeiAdapterTests(unittest.IsolatedAsyncioTestCase):
         capabilities = await adapter.capabilities(conn)
         self.assertFalse(capabilities.subscription_link)
 
+    async def test_token_list_users_maps_clients_and_applies_offset_limit(self):
+        calls = []
+        def handler(method, path, kwargs):
+            calls.append((method, path, kwargs.get('headers', {}).get('Authorization')))
+            return Response(200, {'success': True, 'obj': [
+                {'email': 'alice', 'id': 'uuid-a', 'totalGB': 2, 'enable': True, 'up': 10, 'down': 20},
+                {'email': 'bob', 'id': 'uuid-b', 'totalGB': 3, 'enable': False, 'up': 30, 'down': 40},
+                {'email': 'carol', 'id': 'uuid-c', 'totalGB': 4, 'enable': True, 'up': 50, 'down': 60},
+            ]})
+        adapter = SanaeiAdapter(secret_resolver=lambda _: 'token-secret',
+            client_factory=lambda **kw: FakeClient(handler, kw['base_url']))
+        conn = PanelConnection(id='s', tenant_id='t', name='Sanaei', kind='sanaei',
+            base_url='https://sanaei.example', auth_mode='access_token', secret_ref='s')
+        users = await adapter.list_users(conn, limit=1, offset=1)
+        self.assertEqual([user.username for user in users], ['bob'])
+        self.assertEqual(users[0].status, 'disabled')
+        self.assertEqual(users[0].provider_user_id, 'bob')
+        self.assertEqual(users[0].data_limit_bytes, 3 * 1024**3)
+        self.assertEqual(users[0].used_bytes, 70)
+        self.assertEqual(users[0].metadata['uuid'], 'uuid-b')
+        self.assertEqual(calls, [('GET', '/panel/api/clients/list', 'Bearer token-secret')])
+
+    async def test_token_list_users_fails_closed_on_non_list_response(self):
+        adapter = SanaeiAdapter(secret_resolver=lambda _: 'token-secret',
+            client_factory=lambda **kw: FakeClient(
+                lambda *args: Response(200, {'success': True, 'obj': {'items': []}}), kw['base_url']))
+        conn = PanelConnection(id='s', tenant_id='t', name='Sanaei', kind='sanaei',
+            base_url='https://sanaei.example', auth_mode='access_token', secret_ref='s')
+        with self.assertRaisesRegex(PanelError, 'clients list did not contain a list'):
+            await adapter.list_users(conn)
+
     async def test_token_create_payload_and_expiry_milliseconds(self):
         seen=[]
         def handler(method,path,kwargs):
