@@ -2,6 +2,8 @@ import importlib.util
 import os
 import sqlite3
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +28,15 @@ class CustomerDatabaseMaintenanceTests(unittest.TestCase):
                 INSERT INTO customer VALUES(1, 'Alice');
                 INSERT INTO orders VALUES(10, 1);
             """)
+
+    def test_cli_runs_from_source_checkout_without_pythonpath(self):
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+        completed = subprocess.run([sys.executable, str(MODULE_PATH), "--help"],
+            cwd=MODULE_PATH.parents[1], env=env, capture_output=True, text=True, timeout=5, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("backup", completed.stdout)
+        self.assertIn("restore", completed.stdout)
 
     def tearDown(self):
         self.tmp.cleanup()
