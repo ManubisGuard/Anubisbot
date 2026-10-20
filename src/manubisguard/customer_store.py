@@ -8,9 +8,12 @@ from __future__ import annotations
 import os
 import re
 import json
+import hashlib
 import sqlite3
 import uuid
 import time
+import ipaddress
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any
 
@@ -438,7 +441,7 @@ class CustomerDataStore:
                     int(row["version"])
                     for row in db.execute("SELECT version FROM schema_migrations").fetchall()
                 }
-                unknown_versions = sorted(version for version in applied if version > 10)
+                unknown_versions = sorted(version for version in applied if version > 14)
                 if unknown_versions:
                     raise CustomerStoreError(
                         "Database schema is newer than this application supports"
@@ -781,6 +784,52 @@ class CustomerDataStore:
                     db.execute("INSERT INTO schema_migrations(version,name) VALUES(10,?)",
                                ("manual_product_category_binding",))
                     applied.add(10)
+                # v11 adds an optional lifetime per-customer purchase cap for manual
+                # products; 0 preserves the existing unlimited behavior.
+                if 11 not in applied:
+                    manual_columns = {
+                        str(row["name"])
+                        for row in db.execute("PRAGMA table_info(manual_products)").fetchall()
+                    }
+                    if "max_purchases_per_customer" not in manual_columns:
+                        db.execute(
+                            "ALTER TABLE manual_products ADD COLUMN max_purchases_per_customer "
+                            "INTEGER NOT NULL DEFAULT 0 CHECK(max_purchases_per_customer >= 0)"
+                        )
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(11,?)",
+                               ("manual_product_customer_purchase_limit",))
+                    applied.add(11)
+                # v12 adds an explicit catalog sort key; legacy products keep the
+                # neutral value and deterministic created_at/product_id tie-breaks.
+                if 12 not in applied:
+                    manual_columns = {
+                        str(row["name"])
+                        for row in db.execute("PRAGMA table_info(manual_products)").fetchall()
+                    }
+                    if "sort_order" not in manual_columns:
+                        db.execute(
+                            "ALTER TABLE manual_products ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"
+                        )
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(12,?)",
+                               ("manual_product_sort_order",))
+                    applied.add(12)
+                # v13 stores editable product terms and an immutable per-order snapshot.
+                if 13 not in applied:
+                    product_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(manual_products)").fetchall()}
+                    order_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(manual_product_orders)").fetchall()}
+                    if "terms_text" not in product_columns:
+                        db.execute("ALTER TABLE manual_products ADD COLUMN terms_text TEXT NOT NULL DEFAULT ''")
+                    if "terms_snapshot" not in order_columns:
+                        db.execute("ALTER TABLE manual_product_orders ADD COLUMN terms_snapshot TEXT NOT NULL DEFAULT ''")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(13,?)", ("manual_product_terms_snapshot",))
+                    applied.add(13)
+                # v14 adds an optional public HTTPS image URL for manual product cards.
+                if 14 not in applied:
+                    product_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(manual_products)").fetchall()}
+                    if "image_url" not in product_columns:
+                        db.execute("ALTER TABLE manual_products ADD COLUMN image_url TEXT NOT NULL DEFAULT ''")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(14,?)", ("manual_product_image_url",))
+                    applied.add(14)
                 db.commit()
             except Exception:
                 db.rollback()
@@ -793,7 +842,9 @@ class CustomerDataStore:
     def put_manual_product(self, *, product_id: str, title: str, price_minor: int,
                            currency: str = "IRR", delivery_mode: str = "instant",
                            delivery_payload: str = "", description: str = "", enabled: bool = True,
-                           category_id: str = "") -> None:
+                           category_id: str = "", max_purchases_per_customer: int | None = None,
+                           sort_order: int | None = None, terms_text: str = "",
+                           image_url: str | None = None) -> None:
         self._ensure_manual_shop_tables()
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", product_id.strip()) or not title.strip():
             raise CustomerStoreError("Manual product ID and title are required; ID must use ASCII letters, digits, _ or -")
@@ -809,6 +860,39 @@ class CustomerDataStore:
             raise CustomerStoreError("Delivery mode must be instant, inventory or manual")
         if delivery_mode == "instant" and not delivery_payload.strip():
             raise CustomerStoreError("Instant text delivery requires a non-empty delivery payload")
+        if max_purchases_per_customer is not None and (
+                isinstance(max_purchases_per_customer, bool)
+                or not isinstance(max_purchases_per_customer, int)
+                or not 0 <= max_purchases_per_customer <= 2**31-1):
+            raise CustomerStoreError("Maximum purchases per customer must be a non-negative integer")
+        if not isinstance(terms_text, str) or len(terms_text) > 2500:
+            raise CustomerStoreError("Product terms must be text of at most 2500 characters")
+        if image_url is not None:
+            if not isinstance(image_url, str) or len(image_url) > 2048:
+                raise CustomerStoreError("Product image must be an HTTPS URL of at most 2048 characters")
+            image_url = image_url.strip()
+            if image_url:
+                try:
+                    parsed_image = urlsplit(image_url)
+                    hostname = (parsed_image.hostname or "").lower().rstrip(".")
+                    if (parsed_image.scheme.lower() != "https" or not hostname
+                            or parsed_image.username is not None or parsed_image.password is not None
+                            or parsed_image.fragment or hostname in {"localhost", "localhost.localdomain"}
+                            or hostname.endswith((".localhost", ".local", ".internal"))):
+                        raise ValueError
+                    try:
+                        address = ipaddress.ip_address(hostname)
+                    except ValueError:
+                        address = None
+                    if address is not None and not address.is_global:
+                        raise ValueError
+                    parsed_image.port
+                except ValueError:
+                    raise CustomerStoreError("Product image URL must use public HTTPS without credentials or fragments") from None
+        if sort_order is not None and (
+                isinstance(sort_order, bool) or not isinstance(sort_order, int)
+                or not -(2**31) <= sort_order <= 2**31-1):
+            raise CustomerStoreError("Sort order must be a signed 32-bit integer")
         with self._connect() as db:
             if category_id and not db.execute(
                 "SELECT 1 FROM customer_categories WHERE tenant_id=? AND category_id=?",
@@ -816,13 +900,21 @@ class CustomerDataStore:
             ).fetchone():
                 raise CustomerStoreError("Manual product category does not exist")
             db.execute("""INSERT INTO manual_products
-                (tenant_id,product_id,category_id,title,description,price_minor,currency,delivery_mode,delivery_payload,enabled)
-                VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(tenant_id,product_id) DO UPDATE SET
+                (tenant_id,product_id,category_id,title,description,price_minor,currency,delivery_mode,delivery_payload,enabled,
+                 max_purchases_per_customer,sort_order,terms_text,image_url)
+                VALUES(?,?,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,0),?,COALESCE(?,'' ))
+                ON CONFLICT(tenant_id,product_id) DO UPDATE SET
                 category_id=excluded.category_id,title=excluded.title,description=excluded.description,
                 price_minor=excluded.price_minor,currency=excluded.currency,delivery_mode=excluded.delivery_mode,
-                delivery_payload=excluded.delivery_payload,enabled=excluded.enabled,updated_at=CURRENT_TIMESTAMP""",
+                delivery_payload=excluded.delivery_payload,enabled=excluded.enabled,terms_text=excluded.terms_text,
+                image_url=CASE WHEN ? IS NULL THEN manual_products.image_url ELSE excluded.image_url END,
+                max_purchases_per_customer=CASE WHEN ? IS NULL THEN manual_products.max_purchases_per_customer
+                    ELSE excluded.max_purchases_per_customer END,
+                sort_order=CASE WHEN ? IS NULL THEN manual_products.sort_order ELSE excluded.sort_order END,
+                updated_at=CURRENT_TIMESTAMP""",
                 (self.tenant_id,product_id.strip(),category_id,title.strip()[:160],description[:4000],price_minor,currency,
-                 delivery_mode,delivery_payload[:12000],int(enabled)))
+                 delivery_mode,delivery_payload[:12000],int(enabled),max_purchases_per_customer,sort_order,terms_text.strip(),
+                 image_url,image_url,max_purchases_per_customer,sort_order))
 
     def add_manual_inventory_key(self, *, product_id: str, secret_payload: str) -> int:
         self._ensure_manual_shop_tables()
@@ -853,7 +945,7 @@ class CustomerDataStore:
             category_id = category_id.strip()
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", category_id):
                 raise CustomerStoreError("Invalid manual product category ID")
-        sql="SELECT product_id,category_id,title,description,price_minor,currency,delivery_mode,enabled FROM manual_products WHERE tenant_id=?"
+        sql="SELECT product_id,category_id,title,description,terms_text,image_url,price_minor,currency,delivery_mode,enabled,max_purchases_per_customer,sort_order FROM manual_products WHERE tenant_id=?"
         args: tuple[Any,...]=(self.tenant_id,)
         if enabled_only:
             sql += """ AND enabled=1 AND (category_id='' OR EXISTS (
@@ -862,7 +954,7 @@ class CustomerDataStore:
         if category_id is not None:
             sql += " AND category_id=?"
             args += (category_id,)
-        sql += " ORDER BY created_at,product_id"
+        sql += " ORDER BY sort_order,created_at,product_id"
         with self._connect() as db: return [dict(r) for r in db.execute(sql,args).fetchall()]
 
     def get_manual_product(self, product_id: str, *, enabled_only: bool = True) -> dict[str, Any] | None:
@@ -877,7 +969,8 @@ class CustomerDataStore:
             row=db.execute(sql,args).fetchone()
         return dict(row) if row else None
 
-    def buy_manual_product(self, *, telegram_id: int, product_id: str, idempotency_key: str) -> dict[str, Any]:
+    def buy_manual_product(self, *, telegram_id: int, product_id: str, idempotency_key: str,
+                           expected_terms_hash: str | None = None) -> dict[str, Any]:
         self._ensure_manual_shop_tables()
         db=self._connect()
         try:
@@ -899,9 +992,23 @@ class CustomerDataStore:
                       AND c.category_id=manual_products.category_id AND c.enabled=1))""",
                 (self.tenant_id,product_id)).fetchone()
             if not product: raise CustomerStoreError("Manual product is unavailable")
+            current_terms = str(product["terms_text"] or "").strip()
+            current_terms_hash = hashlib.sha256(current_terms.encode("utf-8")).hexdigest()[:12]
+            if (current_terms or expected_terms_hash is not None) and expected_terms_hash != current_terms_hash:
+                raise CustomerStoreError("شرایط خرید تغییر کرده یا تأیید نشده است؛ صفحه تأیید خرید را دوباره باز کنید")
             customer=db.execute("SELECT 1 FROM customer_users WHERE tenant_id=? AND telegram_id=?",
                                 (self.tenant_id,telegram_id)).fetchone()
             if not customer: raise CustomerStoreError("Customer must be registered before purchase")
+            purchase_cap = int(product["max_purchases_per_customer"] or 0)
+            if purchase_cap:
+                prior_purchases = int(db.execute(
+                    """SELECT COUNT(*) FROM manual_product_orders
+                       WHERE tenant_id=? AND telegram_id=? AND product_id=?
+                         AND status IN ('paid','fulfilled','pending_delivery')""",
+                    (self.tenant_id, telegram_id, product_id),
+                ).fetchone()[0])
+                if prior_purchases >= purchase_cap:
+                    raise CustomerStoreError("Manual product purchase limit reached")
             balance=int(db.execute("SELECT COALESCE(SUM(amount_minor),0) FROM wallet_ledger WHERE tenant_id=? AND telegram_id=? AND currency=?",
                                    (self.tenant_id,telegram_id,product["currency"])).fetchone()[0])
             if balance < int(product["price_minor"]): raise CustomerStoreError("Insufficient wallet balance")
@@ -920,10 +1027,10 @@ class CustomerDataStore:
                 if cur.rowcount != 1: raise CustomerStoreError("Inventory key was already reserved")
             db.execute("""INSERT INTO manual_product_orders
                 (tenant_id,order_id,telegram_id,product_id,amount_minor,currency,status,idempotency_key,
-                 delivery_payload,product_title_snapshot,delivery_mode_snapshot)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                 delivery_payload,product_title_snapshot,delivery_mode_snapshot,terms_snapshot)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (self.tenant_id,order_id,telegram_id,product_id,int(product["price_minor"]),product["currency"],
-                 status,idempotency_key,payload,product["title"],mode))
+                 status,idempotency_key,payload,product["title"],mode,current_terms))
             db.execute("""INSERT INTO wallet_ledger(tenant_id,telegram_id,idempotency_key,amount_minor,currency,entry_type,reference,note)
                 VALUES(?,?,?,?,?,?,?,?)""",
                 (self.tenant_id,telegram_id,"manual-product:"+order_id,-int(product["price_minor"]),product["currency"],

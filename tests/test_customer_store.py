@@ -874,7 +874,7 @@ class CustomerDataStoreTests(unittest.TestCase):
                 "SELECT version, name FROM schema_migrations ORDER BY version"
             ).fetchall()
             self.assertEqual([(row["version"], row["name"]) for row in versions],
-                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"), (10, "manual_product_category_binding")])
+                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"), (10, "manual_product_category_binding"), (11, "manual_product_customer_purchase_limit"), (12, "manual_product_sort_order"), (13, "manual_product_terms_snapshot"), (14, "manual_product_image_url")])
 
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         with reopened._connect() as db:
@@ -882,7 +882,7 @@ class CustomerDataStoreTests(unittest.TestCase):
                 "SELECT version, name FROM schema_migrations ORDER BY version"
             ).fetchall()
             self.assertEqual([(row["version"], row["name"]) for row in versions],
-                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"), (10, "manual_product_category_binding")])
+                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"), (10, "manual_product_category_binding"), (11, "manual_product_customer_purchase_limit"), (12, "manual_product_sort_order"), (13, "manual_product_terms_snapshot"), (14, "manual_product_image_url")])
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_representative_unversioned_legacy_database_preserves_business_rows(self):
@@ -941,7 +941,10 @@ class CustomerDataStoreTests(unittest.TestCase):
                  (6, "customer_ticket_notification_outbox"),
                  (7, "per_event_telegram_notification_routes"),
                  (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"),
-                 (10, "manual_product_category_binding")],
+                 (10, "manual_product_category_binding"),
+                 (11, "manual_product_customer_purchase_limit"),
+                 (12, "manual_product_sort_order"),
+                 (13, "manual_product_terms_snapshot"), (14, "manual_product_image_url")],
             )
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertIn("category_id", {
@@ -1012,8 +1015,129 @@ class CustomerDataStoreTests(unittest.TestCase):
         # A second open must not reapply or duplicate either migration.
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         with reopened._connect() as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 10)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 14)
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_v11_manual_purchase_cap_migration_preserves_legacy_products_and_reopens_idempotently(self):
+        self.store.put_manual_product(product_id="legacy-cap-item", title="Legacy cap item", price_minor=500,
+            delivery_mode="manual")
+        with self.store._connect() as db:
+            db.execute("ALTER TABLE manual_products DROP COLUMN max_purchases_per_customer")
+            db.execute("DELETE FROM schema_migrations WHERE version=11")
+
+        migrated = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        product = migrated.get_manual_product("legacy-cap-item")
+        self.assertIsNotNone(product)
+        self.assertEqual(product["max_purchases_per_customer"], 0)
+        with migrated._connect() as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version=11 "
+                "AND name='manual_product_customer_purchase_limit'"
+            ).fetchone()[0], 1)
+        reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        self.assertEqual(reopened.get_manual_product("legacy-cap-item")["max_purchases_per_customer"], 0)
+        with reopened._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 14)
+
+    def test_v12_manual_product_sort_order_migration_preserves_legacy_rows(self):
+        self.store.put_manual_product(product_id="legacy-sort-item", title="Legacy sort item", price_minor=500,
+            delivery_mode="manual")
+        with self.store._connect() as db:
+            db.execute("ALTER TABLE manual_products DROP COLUMN sort_order")
+            db.execute("DELETE FROM schema_migrations WHERE version=12")
+
+        migrated = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        product = migrated.get_manual_product("legacy-sort-item")
+        self.assertIsNotNone(product)
+        self.assertEqual(product["sort_order"], 0)
+        with migrated._connect() as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version=12 AND name='manual_product_sort_order'"
+            ).fetchone()[0], 1)
+        reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        self.assertEqual(reopened.get_manual_product("legacy-sort-item")["sort_order"], 0)
+        with reopened._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 14)
+
+    def test_manual_product_image_url_validation_and_edit_preservation(self):
+        self.store.put_manual_product(product_id="image-item", title="Image item", price_minor=500,
+            delivery_mode="manual", image_url="https://cdn.example.com/products/image.png")
+        self.assertEqual(self.store.get_manual_product("image-item")["image_url"],
+                         "https://cdn.example.com/products/image.png")
+        self.assertEqual(self.store.list_manual_products()[0]["image_url"],
+                         "https://cdn.example.com/products/image.png")
+        self.store.put_manual_product(product_id="image-item", title="Edited image item", price_minor=600,
+            delivery_mode="manual")
+        self.assertEqual(self.store.get_manual_product("image-item")["image_url"],
+                         "https://cdn.example.com/products/image.png")
+        self.store.put_manual_product(product_id="image-item", title="Edited image item", price_minor=600,
+            delivery_mode="manual", image_url="")
+        self.assertEqual(self.store.get_manual_product("image-item")["image_url"], "")
+        for bad_url in ("http://cdn.example.com/image.png", "https://127.0.0.1/image.png",
+                        "https://user:pass@cdn.example.com/image.png", "https://cdn.example.com/image.png#frag",
+                        "https://localhost/image.png", "javascript:alert(1)"):
+            with self.subTest(url=bad_url), self.assertRaisesRegex(CustomerStoreError, "image URL"):
+                self.store.put_manual_product(product_id="bad-image", title="Bad image", price_minor=500,
+                    delivery_mode="manual", image_url=bad_url)
+
+    def test_v14_manual_product_image_url_migration_preserves_legacy_products(self):
+        self.store.put_manual_product(product_id="legacy-image", title="Legacy image", price_minor=500,
+            delivery_mode="manual")
+        with self.store._connect() as db:
+            db.execute("ALTER TABLE manual_products DROP COLUMN image_url")
+            db.execute("DELETE FROM schema_migrations WHERE version=14")
+        migrated = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        self.assertEqual(migrated.get_manual_product("legacy-image")["image_url"], "")
+        with migrated._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=14 "
+                                         "AND name='manual_product_image_url'").fetchone()[0], 1)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+        reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        self.assertEqual(reopened.get_manual_product("legacy-image")["image_url"], "")
+        with reopened._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 14)
+
+    def test_manual_product_terms_are_snapshotted_and_changed_terms_require_reconfirmation(self):
+        import hashlib
+        self.store.ensure_customer(1001, first_name="Buyer")
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="terms-wallet", amount_minor=2000, entry_type="deposit")
+        self.store.put_manual_product(product_id="terms-item", title="Terms item", price_minor=500,
+            delivery_mode="instant", delivery_payload="DELIVERY", terms_text="Terms v1")
+        accepted_hash = hashlib.sha256(b"Terms v1").hexdigest()[:12]
+        first = self.store.buy_manual_product(telegram_id=1001, product_id="terms-item",
+            idempotency_key="terms-order-v1", expected_terms_hash=accepted_hash)
+        with self.store._connect() as db:
+            row = db.execute("SELECT terms_snapshot FROM manual_product_orders WHERE order_id=?", (first["order_id"],)).fetchone()
+        self.assertEqual(row["terms_snapshot"], "Terms v1")
+        self.store.put_manual_product(product_id="terms-item", title="Terms item", price_minor=500,
+            delivery_mode="instant", delivery_payload="DELIVERY", terms_text="Terms v2")
+        with self.assertRaisesRegex(CustomerStoreError, "شرایط خرید تغییر کرده"):
+            self.store.buy_manual_product(telegram_id=1001, product_id="terms-item",
+                idempotency_key="terms-order-v2-stale", expected_terms_hash=accepted_hash)
+        self.assertEqual(self.store.wallet_balance(1001, "IRR"), 1500)
+        fresh_hash = hashlib.sha256(b"Terms v2").hexdigest()[:12]
+        second = self.store.buy_manual_product(telegram_id=1001, product_id="terms-item",
+            idempotency_key="terms-order-v2-fresh", expected_terms_hash=fresh_hash)
+        with self.store._connect() as db:
+            row = db.execute("SELECT terms_snapshot FROM manual_product_orders WHERE order_id=?", (second["order_id"],)).fetchone()
+        self.assertEqual(row["terms_snapshot"], "Terms v2")
+        self.assertEqual(self.store.wallet_balance(1001, "IRR"), 1000)
+
+    def test_manual_product_sort_order_controls_catalog_and_unspecified_edit_preserves_it(self):
+        self.store.put_manual_product(product_id="sort-late", title="Late", price_minor=500,
+            delivery_mode="manual", sort_order=30)
+        self.store.put_manual_product(product_id="sort-first", title="First", price_minor=500,
+            delivery_mode="manual", sort_order=-5)
+        self.store.put_manual_product(product_id="sort-middle", title="Middle", price_minor=500,
+            delivery_mode="manual", sort_order=10)
+        self.assertEqual([p["product_id"] for p in self.store.list_manual_products()],
+                         ["sort-first", "sort-middle", "sort-late"])
+        self.store.put_manual_product(product_id="sort-middle", title="Middle edited", price_minor=600,
+            delivery_mode="manual")
+        self.assertEqual(self.store.get_manual_product("sort-middle")["sort_order"], 10)
+        with self.assertRaisesRegex(CustomerStoreError, "Sort order"):
+            self.store.put_manual_product(product_id="bad-sort", title="Bad sort", price_minor=500,
+                delivery_mode="manual", sort_order=True)
 
     def test_migration_failure_rolls_back_schema_data_and_version_row(self):
         self.store.post_wallet_entry(telegram_id=1001, idempotency_key="rollback-ledger",
@@ -1109,6 +1233,86 @@ class CustomerDataStoreTests(unittest.TestCase):
         self.assertEqual(failures, ["Manual product is out of stock; no wallet debit was made"])
         self.assertEqual(sorted((self.store.wallet_balance(1001), self.store.wallet_balance(1002))), [2300, 3000])
         self.assertEqual(self.store.manual_inventory_count("last-key"), 0)
+
+    def test_manual_product_customer_purchase_cap_blocks_second_order_without_debit_or_inventory_loss(self):
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="manual-cap-fund",
+                                     amount_minor=3000, entry_type="deposit")
+        self.store.put_manual_product(product_id="limited-item", title="Limited item", price_minor=700,
+            delivery_mode="inventory", max_purchases_per_customer=1)
+        # An unrelated metadata edit must not silently reset an existing cap.
+        self.store.put_manual_product(product_id="limited-item", title="Renamed limited item", price_minor=700,
+            delivery_mode="inventory")
+        self.assertEqual(self.store.get_manual_product("limited-item")["max_purchases_per_customer"], 1)
+        self.store.add_manual_inventory_key(product_id="limited-item", secret_payload="LIMITED-KEY-1")
+        self.store.add_manual_inventory_key(product_id="limited-item", secret_payload="LIMITED-KEY-2")
+
+        first = self.store.buy_manual_product(telegram_id=1001, product_id="limited-item",
+                                              idempotency_key="limited-first")
+        replay = self.store.buy_manual_product(telegram_id=1001, product_id="limited-item",
+                                               idempotency_key="limited-first")
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["order_id"], first["order_id"])
+        with self.assertRaisesRegex(CustomerStoreError, "purchase limit reached"):
+            self.store.buy_manual_product(telegram_id=1001, product_id="limited-item",
+                                          idempotency_key="limited-second")
+        self.assertEqual(self.store.wallet_balance(1001), 2300)
+        self.assertEqual(self.store.manual_inventory_count("limited-item"), 1)
+
+    def test_concurrent_manual_purchase_cap_allows_only_one_order_per_customer(self):
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="concurrent-cap-fund",
+                                     amount_minor=3000, entry_type="deposit")
+        self.store.put_manual_product(product_id="concurrent-cap", title="Concurrent cap", price_minor=700,
+            delivery_mode="instant", delivery_payload="DELIVERY", max_purchases_per_customer=1)
+        def buy(key: str):
+            try:
+                return self.store.buy_manual_product(telegram_id=1001, product_id="concurrent-cap",
+                                                     idempotency_key=key)
+            except CustomerStoreError as exc:
+                return str(exc)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(buy, ("concurrent-cap-a", "concurrent-cap-b")))
+        self.assertEqual(sum(isinstance(item, dict) for item in outcomes), 1)
+        self.assertEqual(sum(item == "Manual product purchase limit reached" for item in outcomes), 1)
+        self.assertEqual(self.store.wallet_balance(1001), 2300)
+        with self.store._connect() as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM manual_product_orders WHERE tenant_id=? AND telegram_id=? AND product_id=?",
+                (self.store.tenant_id, 1001, "concurrent-cap"),
+            ).fetchone()[0], 1)
+
+    def test_manual_product_purchase_cap_is_tenant_scoped(self):
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="tenant-cap-fund-alpha",
+                                     amount_minor=2000, entry_type="deposit")
+        self.store.put_manual_product(product_id="tenant-cap", title="Tenant cap", price_minor=500,
+            delivery_mode="manual", max_purchases_per_customer=1)
+        self.store.buy_manual_product(telegram_id=1001, product_id="tenant-cap",
+                                      idempotency_key="tenant-cap-alpha-order")
+
+        other = CustomerDataStore(self.path, tenant_id="bot-beta")
+        other.ensure_customer(1001, first_name="Same numeric ID, other tenant")
+        other.post_wallet_entry(telegram_id=1001, idempotency_key="tenant-cap-fund-beta",
+                                amount_minor=2000, entry_type="deposit")
+        other.put_manual_product(product_id="tenant-cap", title="Tenant cap", price_minor=500,
+            delivery_mode="manual", max_purchases_per_customer=1)
+        result = other.buy_manual_product(telegram_id=1001, product_id="tenant-cap",
+                                          idempotency_key="tenant-cap-beta-order")
+        self.assertEqual(result["status"], "pending_delivery")
+        self.assertEqual(other.wallet_balance(1001), 1500)
+        self.assertEqual(self.store.wallet_balance(1001), 1500)
+
+    def test_manual_product_purchase_cap_defaults_to_unlimited_and_validates_input(self):
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="unlimited-fund",
+                                     amount_minor=3000, entry_type="deposit")
+        self.store.put_manual_product(product_id="unlimited-item", title="Unlimited item", price_minor=500,
+            delivery_mode="instant", delivery_payload="DELIVERY")
+        for key in ("unlimited-order-1", "unlimited-order-2"):
+            self.store.buy_manual_product(telegram_id=1001, product_id="unlimited-item", idempotency_key=key)
+        self.assertEqual(self.store.wallet_balance(1001), 2000)
+        self.assertEqual(self.store.get_manual_product("unlimited-item")["max_purchases_per_customer"], 0)
+        for invalid in (-1, True, 1.5):
+            with self.assertRaisesRegex(CustomerStoreError, "non-negative integer"):
+                self.store.put_manual_product(product_id="invalid-cap", title="Invalid", price_minor=100,
+                    delivery_mode="manual", max_purchases_per_customer=invalid)
 
     def test_manual_order_idempotent_replay_returns_original_purchase_snapshot(self):
         self.store.post_wallet_entry(telegram_id=1001, idempotency_key="manual-replay-fund",

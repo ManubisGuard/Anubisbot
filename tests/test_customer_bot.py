@@ -599,6 +599,7 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
             "message":{"chat":{"id":999,"type":"private"}},"data":"customer:shop"})
         root_body = self.bot.api.send_text.await_args.args[1]
         self.assertIn("AI Gift", root_body)
+        self.assertIn("توضیحات: Manual AI product", root_body)
         keyboard=self.bot.api.send_text.await_args.args[2]
         callbacks={b.get("callback_data") for row in keyboard["inline_keyboard"] for b in row}
         self.assertIn("customer:category:ai",callbacks)
@@ -610,6 +611,82 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("AI Gift",body)
         self.assertNotIn("Basic Plan",body)
         self.assertNotIn("PRIVATE-DELIVERY",body)
+
+    async def test_manual_product_image_is_sent_as_photo_card_and_edit_preserves_it(self):
+        admin = {"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"}}
+        await self.bot._handle_message({**admin, "text":
+            "/manual-product add image-item | Image Item | 500 | IRR | manual |  | Image description |  | 0 | 0 | Terms | https://cdn.example.com/products/image.png"})
+        product = self.bot.data.get_manual_product("image-item")
+        self.assertEqual(product["image_url"], "https://cdn.example.com/products/image.png")
+        await self.bot._handle_message({**admin, "text":
+            "/manual-product edit image-item | Edited Image | 600 | IRR | manual |  | Updated description"})
+        self.assertEqual(self.bot.data.get_manual_product("image-item")["image_url"],
+                         "https://cdn.example.com/products/image.png")
+        self.bot.api.call = AsyncMock()
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"image-shop", "from":{"id":999},
+            "message":{"chat":{"id":999,"type":"private"}}, "data":"customer:shop"})
+        self.bot.api.call.assert_awaited()
+        method, payload = self.bot.api.call.await_args.args
+        self.assertEqual(method, "sendPhoto")
+        self.assertEqual(payload["photo"], "https://cdn.example.com/products/image.png")
+        self.assertIn("Edited Image", payload["caption"])
+        self.assertEqual(payload["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+                         "customer:manualbuy:image-item")
+        self.assertNotIn("delivery_payload", payload["caption"])
+        self.assertTrue(self.bot.api.send_text.await_args.args[1].startswith("🛍 فروشگاه"))
+
+    async def test_manual_product_image_send_failure_falls_back_to_text_listing(self):
+        self.bot.data.put_manual_product(product_id="image-fallback", title="Fallback image", price_minor=500,
+            delivery_mode="manual", description="Fallback description",
+            image_url="https://cdn.example.com/products/fallback.png")
+        self.bot.api.call = AsyncMock(side_effect=RuntimeError("telegram unavailable"))
+        await self.bot._handle_callback({"id":"image-fallback", "from":{"id":999},
+            "message":{"chat":{"id":999,"type":"private"}}, "data":"customer:shop"})
+        body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("Fallback image", body)
+        self.assertIn("Fallback description", body)
+        keyboard = self.bot.api.send_text.await_args.args[2]
+        callbacks = {button.get("callback_data") for row in keyboard["inline_keyboard"] for button in row}
+        self.assertIn("customer:manualbuy:image-fallback", callbacks)
+
+    async def test_manual_product_terms_are_shown_and_callback_binds_accepted_version(self):
+        import hashlib
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="terms-bot-wallet", amount_minor=1000, entry_type="deposit")
+        self.bot.data.put_manual_product(product_id="terms-bot", title="Terms bot item", price_minor=500,
+            currency="IRR", delivery_mode="instant", delivery_payload="SAFE-DELIVERY", terms_text="شرایط نسخه یک")
+        await self.bot._handle_callback({"id":"terms-show", "from":{"id":999},
+            "message":{"message_id":700,"chat":{"id":999,"type":"private"}},
+            "data":"customer:manualbuy:terms-bot"})
+        body = self.bot.api.send_text.await_args.args[1]
+        keyboard = self.bot.api.send_text.await_args.args[2]
+        self.assertIn("شرایط خرید", body)
+        self.assertIn("شرایط نسخه یک", body)
+        confirm = keyboard["inline_keyboard"][0][0]
+        self.assertEqual(confirm["text"], "می‌پذیرم و خرید")
+        self.assertIn(hashlib.sha256("شرایط نسخه یک".encode()).hexdigest()[:12], confirm["callback_data"])
+        self.bot.data.put_manual_product(product_id="terms-bot", title="Terms bot item", price_minor=500,
+            currency="IRR", delivery_mode="instant", delivery_payload="SAFE-DELIVERY", terms_text="شرایط نسخه دو")
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"terms-stale", "from":{"id":999},
+            "message":{"message_id":701,"chat":{"id":999,"type":"private"}},
+            "data":confirm["callback_data"]})
+        body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("شرایط خرید تغییر کرده", body)
+        self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 1000)
+
+    async def test_manual_product_confirmation_shows_bounded_description_not_delivery_payload(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.put_manual_product(product_id="described-item", title="Described item", price_minor=500,
+            currency="IRR", delivery_mode="instant", delivery_payload="DO-NOT-LEAK-DELIVERY",
+            description="Customer-facing description")
+        await self.bot._handle_callback({"id":"desc-confirm","from":{"id":999},
+            "message":{"message_id":41,"chat":{"id":999,"type":"private"}},
+            "data":"customer:manualbuy:described-item"})
+        body=self.bot.api.send_text.await_args.args[1]
+        self.assertIn("توضیحات: Customer-facing description", body)
+        self.assertNotIn("DO-NOT-LEAK-DELIVERY", body)
 
     async def test_advanced_admin_product_command_saves_hourly_mode(self):
         self.bot.data.register_panel_connection(panel_id="pg",label="PasarGuard",provider="pasarguard",
@@ -794,6 +871,39 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("CALLBACK-DELIVERY", replay_body)
         self.assertEqual(self.bot.data.wallet_balance(999), 2100)
 
+    async def test_manual_inventory_out_of_stock_is_visible_and_purchase_button_returns_after_restock(self):
+        self.bot.data.put_manual_product(product_id="visible-stock", title="Limited license", price_minor=500,
+            currency="IRR", delivery_mode="inventory")
+        await self.bot._handle_callback({"id":"stock-shop-empty", "from":{"id":999},
+            "message":{"chat":{"id":999,"type":"private"}}, "data":"customer:shop"})
+        body = self.bot.api.send_text.await_args.args[1]
+        keyboard = self.bot.api.send_text.await_args.args[2]
+        callbacks = {b.get("callback_data") for row in keyboard["inline_keyboard"] for b in row}
+        self.assertIn("Limited license", body)
+        self.assertIn("ناموجود", body)
+        self.assertNotIn("customer:manualbuy:visible-stock", callbacks)
+
+        self.bot.data.add_manual_inventory_key(product_id="visible-stock", secret_payload="RESTOCKED-KEY")
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"stock-shop-restocked", "from":{"id":999},
+            "message":{"chat":{"id":999,"type":"private"}}, "data":"customer:shop"})
+        body = self.bot.api.send_text.await_args.args[1]
+        keyboard = self.bot.api.send_text.await_args.args[2]
+        callbacks = {b.get("callback_data") for row in keyboard["inline_keyboard"] for b in row}
+        self.assertIn("موجود", body)
+        self.assertIn("customer:manualbuy:visible-stock", callbacks)
+
+    async def test_manual_inventory_confirmation_refuses_when_stock_is_empty(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.put_manual_product(product_id="empty-confirm", title="Empty item", price_minor=500,
+            currency="IRR", delivery_mode="inventory")
+        await self.bot._handle_callback({"id":"stock-confirm-empty", "from":{"id":999},
+            "message":{"message_id":452,"chat":{"id":999,"type":"private"}},
+            "data":"customer:manualbuy:empty-confirm"})
+        body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("ناموجود", body)
+        self.assertNotIn("تأیید خرید", body)
+
     async def test_manual_inventory_delivers_unique_key_and_out_of_stock_does_not_charge(self):
         self.bot.data.ensure_customer(999, first_name="Buyer")
         self.bot.data.post_wallet_entry(telegram_id=999,idempotency_key="inventory-fund",amount_minor=5000,entry_type="deposit")
@@ -866,7 +976,8 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="manual-edit-fund",
                                         amount_minor=5000, entry_type="deposit")
         self.bot.data.put_manual_product(product_id="editable-item", title="Original title", price_minor=1000,
-            currency="IRR", delivery_mode="instant", delivery_payload="ORIGINAL-DELIVERY", description="old description")
+            currency="IRR", delivery_mode="instant", delivery_payload="ORIGINAL-DELIVERY", description="old description",
+            max_purchases_per_customer=2)
         original = self.bot.data.buy_manual_product(telegram_id=999, product_id="editable-item",
                                                     idempotency_key="manual-edit-order-before")
         await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
@@ -875,16 +986,43 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated["title"], "Updated title")
         self.assertEqual(updated["price_minor"], 1200)
         self.assertEqual(updated["delivery_payload"], "UPDATED-DELIVERY")
+        self.assertEqual(updated["max_purchases_per_customer"], 2)
         self.assertEqual(self.bot.data.list_manual_orders(status="all")[0]["title"], "Original title")
         self.assertEqual(self.bot.data.buy_manual_product(telegram_id=999, product_id="editable-item",
             idempotency_key="manual-edit-order-before")["delivery_payload"], original["delivery_payload"])
+
+    async def test_admin_can_set_manual_product_purchase_cap(self):
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":"/manual-product add limited-command | Limited command | 1000 | IRR | manual |  | description |  | 2"})
+        product = self.bot.data.get_manual_product("limited-command")
+        self.assertEqual(product["max_purchases_per_customer"], 2)
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":"/manual-product list"})
+        self.assertIn("سقف خرید: 2", self.bot.api.send_text.await_args.args[1])
+
+    async def test_admin_can_set_manual_product_sort_order_and_edit_preserves_it(self):
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":"/manual-product add sort-late | Late | 1000 | IRR | manual |  | description |  | 0 | 30"})
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":"/manual-product add sort-first | First | 1000 | IRR | manual |  | description |  | 0 | -5"})
+        self.assertEqual([p["product_id"] for p in self.bot.data.list_manual_products()],
+                         ["sort-first", "sort-late"])
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":"/manual-product edit sort-late | Late updated | 1200 | IRR | manual |  | updated description"})
+        self.assertEqual(self.bot.data.get_manual_product("sort-late")["sort_order"], 30)
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":"/manual-product list"})
+        self.assertIn("ترتیب: 30", self.bot.api.send_text.await_args.args[1])
 
     async def test_admin_can_archive_manual_product_without_new_purchase_or_wallet_debit(self):
         self.bot.data.ensure_customer(999, first_name="Buyer")
         self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="manual-archive-fund",
                                         amount_minor=3000, entry_type="deposit")
         self.bot.data.put_manual_product(product_id="archived-item", title="Archive me", price_minor=500,
-            currency="IRR", delivery_mode="instant", delivery_payload="ARCHIVE-DELIVERY")
+            currency="IRR", delivery_mode="instant", delivery_payload="ARCHIVE-DELIVERY",
+            max_purchases_per_customer=1)
         self.bot.data.buy_manual_product(telegram_id=999, product_id="archived-item",
                                          idempotency_key="manual-archive-order-before")
         balance_after_original_order = self.bot.data.wallet_balance(999)
@@ -892,6 +1030,7 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
             "text":"/manual-product archive archived-item"})
         archived = self.bot.data.get_manual_product("archived-item", enabled_only=False)
         self.assertEqual(archived["enabled"], 0)
+        self.assertEqual(archived["max_purchases_per_customer"], 1)
         self.assertNotIn("archived-item", {item["product_id"] for item in self.bot.data.list_manual_products()})
         self.bot.api.send_text.reset_mock()
         await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
@@ -910,15 +1049,18 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.bot.data.ensure_customer(999, first_name="Buyer")
         self.bot.data.post_wallet_entry(telegram_id=999,idempotency_key="manual-fund",amount_minor=5000,entry_type="deposit")
         self.bot.data.put_manual_product(product_id="chatgpt-key",title="ChatGPT Subscription",price_minor=2500,
-            currency="IRR",delivery_mode="instant",delivery_payload="TEST-KEY-DO-NOT-USE",description="test item")
+            currency="IRR",delivery_mode="instant",delivery_payload="TEST-KEY-DO-NOT-USE",description="test item",
+            max_purchases_per_customer=1)
         await self.bot._handle_callback({"id":"manual-shop","from":{"id":999},
             "message":{"message_id":10,"chat":{"id":999,"type":"private"}},"data":"customer:shop"})
         text=self.bot.api.send_text.await_args.args[1]
         self.assertIn("ChatGPT Subscription",text)
+        self.assertIn("سقف خرید هر مشتری: 1",text)
         self.bot.api.send_text.reset_mock()
         await self.bot._handle_callback({"id":"manual-buy","from":{"id":999},
             "message":{"message_id":11,"chat":{"id":999,"type":"private"}},"data":"customer:manualbuy:chatgpt-key"})
         self.assertIn("تأیید خرید",self.bot.api.send_text.await_args.args[1])
+        self.assertIn("سقف خرید هر مشتری: 1",self.bot.api.send_text.await_args.args[1])
         self.bot.api.send_text.reset_mock()
         await self.bot._handle_callback({"id":"manual-confirm","from":{"id":999},
             "message":{"message_id":12,"chat":{"id":999,"type":"private"}},"data":"customer:manualbuy_confirm:chatgpt-key"})
@@ -1050,6 +1192,7 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.bot.data.ensure_customer(999, first_name="Buyer")
         self.bot.data.put_manual_product(product_id="inventory-copy", title="Inventory item", price_minor=500,
             currency="IRR", delivery_mode="inventory")
+        self.bot.data.add_manual_inventory_key(product_id="inventory-copy", secret_payload="INVENTORY-COPY-KEY")
         await self.bot._handle_callback({"id":"inventory-copy-callback", "from":{"id":999},
             "message":{"message_id":450,"chat":{"id":999,"type":"private"}},
             "data":"customer:manualbuy:inventory-copy"})
