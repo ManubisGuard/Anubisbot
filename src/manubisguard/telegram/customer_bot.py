@@ -868,7 +868,7 @@ class CustomerBot:
                 except (ValueError, CustomerStoreError) as exc:
                     await self.api.send_text(chat_id, f"مسیر ذخیره/حذف نشد: {exc}\nرویدادها: {', '.join(event_keys)}", ADMIN_MENU)
                 return
-            await self.api.send_text(chat_id, "📣 مسیریابی اعلان‌ها\n/notify-route list\n/notify-route add EVENT_KEY | CHAT_ID | TOPIC_ID\n/notify-route remove EVENT_KEY | CHAT_ID | TOPIC_ID\n\nTOPIC_ID را برای ارسال مستقیم 0 بگذار. رویدادهای موجود: " + ", ".join(event_keys) + "\nرویدادهای خرید، پرداخت، کیف پول و تیکت به صف پایدار متصل‌اند؛ تست سرویس، لاگ، بک‌آپ، تغییر سرویس و هشدار امنیتی هنوز نیاز به اتصال تولیدکننده دارند.", ADMIN_MENU)
+            await self.api.send_text(chat_id, "📣 مسیریابی اعلان‌ها\n/notify-route list\n/notify-route add EVENT_KEY | CHAT_ID | TOPIC_ID\n/notify-route remove EVENT_KEY | CHAT_ID | TOPIC_ID\n\nTOPIC_ID را برای ارسال مستقیم 0 بگذار. رویدادهای موجود: " + ", ".join(event_keys) + "\nصف پایدار فعلاً به خرید، پرداخت، کیف پول و تغییر سرویس متصل است؛ تیکت از مسیر outbox مستقل خود ارسال می‌شود. تولیدکننده‌های تست سرویس، لاگ ربات، بک‌آپ و هشدار امنیتی هنوز متصل نیستند.", ADMIN_MENU)
             return
         if is_admin and command == "/admin-notifications":
             raw_status = text.partition(" ")[2].strip().lower() or "all"

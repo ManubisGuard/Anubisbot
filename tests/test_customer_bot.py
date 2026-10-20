@@ -110,6 +110,13 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
             "text":"/notify-route list"})
         self.assertIn("support_ticket", self.bot.api.send_text.await_args.args[1])
         self.assertIn("-1001234567890", self.bot.api.send_text.await_args.args[1])
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":"/notify-route"})
+        help_text = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("تغییر سرویس", help_text)
+        self.assertIn("تولیدکننده‌های تست سرویس، لاگ ربات، بک‌آپ و هشدار امنیتی هنوز متصل نیستند", help_text)
+        self.assertNotIn("تغییر سرویس و هشدار امنیتی هنوز نیاز به اتصال تولیدکننده دارند", help_text)
 
     async def test_admin_can_list_and_requeue_dead_admin_notification_without_bypassing_queue(self):
         admin = {"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"}}
