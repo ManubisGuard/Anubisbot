@@ -75,6 +75,38 @@ class CustomerDatabaseMaintenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(maintenance.DatabaseMaintenanceError, "non-symlink"):
             maintenance.verify_database(link)
 
+    def test_restore_refuses_existing_destination_and_preserves_contents(self):
+        backup = self.root / "backup.sqlite3"
+        maintenance.backup_database(self.source, backup)
+        destination = self.root / "existing-restore.sqlite3"
+        destination.write_bytes(b"keep-existing-restore")
+        with self.assertRaisesRegex(maintenance.DatabaseMaintenanceError, "already exists"):
+            maintenance.restore_database(backup, destination)
+        self.assertEqual(destination.read_bytes(), b"keep-existing-restore")
+
+    def test_restore_refuses_symlink_destination_and_preserves_target(self):
+        backup = self.root / "backup.sqlite3"
+        maintenance.backup_database(self.source, backup)
+        protected = self.root / "protected.sqlite3"
+        protected.write_bytes(b"protected-data")
+        link = self.root / "restore-link.sqlite3"
+        link.symlink_to(protected)
+        with self.assertRaisesRegex(maintenance.DatabaseMaintenanceError, "already exists"):
+            maintenance.restore_database(backup, link)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(protected.read_bytes(), b"protected-data")
+
+    def test_restore_rejects_corrupted_backup_before_creating_destination(self):
+        backup = self.root / "corrupted-backup.sqlite3"
+        maintenance.backup_database(self.source, backup)
+        backup.write_bytes(b"corrupted-backup-data")
+        destination = self.root / "restore" / "restored.sqlite3"
+        destination.parent.mkdir()
+        with self.assertRaisesRegex(maintenance.DatabaseMaintenanceError, "SQLite verification failed"):
+            maintenance.restore_database(backup, destination)
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(destination.parent.iterdir()), [])
+
     def test_verification_rejects_foreign_key_violations(self):
         bad = self.root / "bad.sqlite3"
         with sqlite3.connect(bad) as db:
