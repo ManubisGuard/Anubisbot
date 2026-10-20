@@ -116,7 +116,8 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
             "text":"/notify-route"})
         help_text = self.bot.api.send_text.await_args.args[1]
         self.assertIn("تغییر سرویس", help_text)
-        self.assertIn("تولیدکننده‌های تست سرویس، لاگ ربات و بک‌آپ هنوز متصل نیستند", help_text)
+        self.assertIn("تولیدکننده‌های لاگ ربات و بک‌آپ هنوز متصل نیستند", help_text)
+        self.assertIn("بررسی خواندنی پنل", help_text)
         self.assertIn("هشدار تلاش غیرمجاز برای اجرای دستور مدیریتی", help_text)
         self.assertNotIn("هشدار امنیتی هنوز متصل نیست", help_text)
 
@@ -313,6 +314,8 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         adapter.capability_report = AsyncMock(return_value={"provider":"rebecca", "live_panel_verified":False,
             "operations":{"create_user":{"status":"unknown","adapter_method_present":True},
                           "manage_resellers":{"status":"unsupported","adapter_method_present":False}}})
+        self.bot.data.add_notification_route(event_key="service_test", chat_id=6883349141,
+            created_by=6883349141)
         await self.bot._handle_message({"from":{"id":6883349141},
             "chat":{"id":6883349141,"type":"private"},"text":"/panel-check panel-report"})
         rendered = self.bot.api.send_text.await_args.args[1]
@@ -322,6 +325,14 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("مجوز عملیات تغییردهنده", rendered)
         adapter.health_check.assert_awaited_once()
         adapter.capability_report.assert_awaited_once()
+        with self.bot.data._connect() as db:
+            notice = db.execute("SELECT event_key,payload_json FROM customer_admin_notifications ORDER BY notification_id DESC LIMIT 1").fetchone()
+        self.assertEqual(notice["event_key"], "service_test")
+        payload = json.loads(notice["payload_json"])
+        self.assertEqual(payload["status"], "healthy_read_only")
+        self.assertEqual(payload["reason_code"], "panel_check_succeeded")
+        self.assertNotIn("panel-report", notice["payload_json"])
+        self.assertNotIn("https://panel.example", notice["payload_json"])
 
     async def test_customer_menu_uses_only_valid_https_webapp_url(self):
         with patch.dict(os.environ, {"MANUBIS_CUSTOMER_WEBAPP_URL":"https://mini.example/customer/"}):

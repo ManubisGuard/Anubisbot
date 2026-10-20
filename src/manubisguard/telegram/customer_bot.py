@@ -897,7 +897,7 @@ class CustomerBot:
                 except (ValueError, CustomerStoreError) as exc:
                     await self.api.send_text(chat_id, f"مسیر ذخیره/حذف نشد: {exc}\nرویدادها: {', '.join(event_keys)}", ADMIN_MENU)
                 return
-            await self.api.send_text(chat_id, "📣 مسیریابی اعلان‌ها\n/notify-route list\n/notify-route add EVENT_KEY | CHAT_ID | TOPIC_ID\n/notify-route remove EVENT_KEY | CHAT_ID | TOPIC_ID\n\nTOPIC_ID را برای ارسال مستقیم 0 بگذار. رویدادهای موجود: " + ", ".join(event_keys) + "\nصف پایدار به خرید، پرداخت، کیف پول، تغییر سرویس و هشدار تلاش غیرمجاز برای اجرای دستور مدیریتی متصل است؛ تیکت از مسیر outbox مستقل خود ارسال می‌شود. تولیدکننده‌های تست سرویس، لاگ ربات و بک‌آپ هنوز متصل نیستند.", ADMIN_MENU)
+            await self.api.send_text(chat_id, "📣 مسیریابی اعلان‌ها\n/notify-route list\n/notify-route add EVENT_KEY | CHAT_ID | TOPIC_ID\n/notify-route remove EVENT_KEY | CHAT_ID | TOPIC_ID\n\nTOPIC_ID را برای ارسال مستقیم 0 بگذار. رویدادهای موجود: " + ", ".join(event_keys) + "\nصف پایدار به خرید، پرداخت، کیف پول، تغییر سرویس، بررسی خواندنی پنل و هشدار تلاش غیرمجاز برای اجرای دستور مدیریتی متصل است؛ تیکت از مسیر outbox مستقل خود ارسال می‌شود. تولیدکننده‌های لاگ ربات و بک‌آپ هنوز متصل نیستند.", ADMIN_MENU)
             return
         if is_admin and command == "/admin-notifications":
             raw_status = text.partition(" ")[2].strip().lower() or "all"
@@ -1323,6 +1323,16 @@ class CustomerBot:
             return
         await self.api.send_text(chat_id, f"پنل {panel_id} ذخیره شد. هنوز اتصال زنده تأیید نشده است؛ برای بررسی خواندنی از /panel-check {panel_id} استفاده کن.", self._customer_menu())
 
+    def _queue_panel_check_notification(self, *, chat_id: int, status: str, reason_code: str) -> None:
+        try:
+            self.data.enqueue_admin_notification(
+                event_key="service_test",
+                idempotency_key=f"panel-check:{uuid.uuid4().hex}",
+                payload={"status": status, "reason_code": reason_code, "customer_id": chat_id},
+            )
+        except Exception as exc:
+            LOG.warning("Panel-check notification enqueue failed (%s)", type(exc).__name__)
+
     async def _admin_panel_check(self, chat_id: int, text: str) -> None:
         parts = text.split(maxsplit=1)
         if len(parts) != 2:
@@ -1344,8 +1354,10 @@ class CustomerBot:
             capability_data = {name: bool(getattr(capabilities, name)) for name in capabilities.__dataclass_fields__}
             report_method = getattr(adapter, "capability_report", None)
             report = await report_method(connection) if callable(report_method) else None
-            self.data.record_panel_check(panel_id=connection.id,
-                status="healthy_read_only" if health.get("ok") else "failed", capabilities=capability_data)
+            check_status = "healthy_read_only" if health.get("ok") else "failed"
+            self.data.record_panel_check(panel_id=connection.id, status=check_status, capabilities=capability_data)
+            self._queue_panel_check_notification(chat_id=chat_id, status=check_status,
+                reason_code="panel_check_succeeded" if health.get("ok") else "panel_check_failed")
             summary = "اتصال خواندنی موفق بود." if health.get("ok") else f"اتصال ناموفق بود ({health.get('error_type', 'error')})."
             lines = [summary,
                 f"قابلیت‌های تعریف‌شده در آداپتر: {', '.join(k for k,v in capability_data.items() if v)}"]
@@ -1368,6 +1380,7 @@ class CustomerBot:
             await self.api.send_text(chat_id, "\n".join(lines), self._customer_menu())
         except Exception as exc:
             self.data.record_panel_check(panel_id=connection.id, status="failed", capabilities={})
+            self._queue_panel_check_notification(chat_id=chat_id, status="failed", reason_code="panel_check_error")
             await self.api.send_text(chat_id, f"بررسی پنل ناموفق بود: {type(exc).__name__}", self._customer_menu())
 
     async def _admin_panel_roles(self, chat_id: int, text: str) -> None:

@@ -93,7 +93,8 @@ def _safe_subscription_url(value: Any) -> str | None:
 class CustomerMiniAppWSGI:
     def __init__(self, store: Any, bot_token: str, *, allowed_origins: tuple[str, ...] | list[str],
                  clock: Callable[[], float] = time.time, max_age_seconds: int = 300,
-                 purchase_service_factory: Callable[..., Any] | None = None):
+                 purchase_service_factory: Callable[..., Any] | None = None,
+                 service_change_service_factory: Callable[..., Any] | None = None):
         if not bot_token:
             raise ValueError("Customer bot token is required for Telegram initData verification")
         origins = {_normalize_origin(origin) for origin in allowed_origins}
@@ -105,6 +106,7 @@ class CustomerMiniAppWSGI:
         self.clock = clock
         self.max_age_seconds = max_age_seconds
         self.purchase_service_factory = purchase_service_factory
+        self.service_change_service_factory = service_change_service_factory
 
     @staticmethod
     def _response(start_response: Callable[..., Any], status: HTTPStatus, payload: dict[str, Any]) -> list[bytes]:
@@ -201,6 +203,50 @@ class CustomerMiniAppWSGI:
             "idempotent_replay": bool(outcome.idempotent_replay),
         })
 
+    def _preview_service_change(self, environ: dict[str, Any], telegram_id: int,
+                                start_response: Callable[..., Any]) -> list[bytes]:
+        if str(environ.get("CONTENT_TYPE", "")).split(";", 1)[0].strip().lower() != "application/json":
+            return self._response(start_response, HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": "json_required"})
+        try:
+            length = int(environ.get("CONTENT_LENGTH") or "0")
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0 or length > 4096:
+            return self._response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_request_body"})
+        try:
+            body = json.loads(environ["wsgi.input"].read(length).decode("utf-8"))
+        except (KeyError, UnicodeError, ValueError):
+            return self._response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_request_body"})
+        if not isinstance(body, dict):
+            return self._response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_request_body"})
+        service_id, change_type = body.get("service_id"), body.get("change_type")
+        if not isinstance(service_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", service_id):
+            return self._response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_service_id"})
+        if change_type not in {"renewal", "traffic_topup"}:
+            return self._response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_change_type"})
+        from manubisguard.panels.registry import default_registry
+        from manubisguard.sales.service import CustomerServiceChangeService
+        resolver = self._resolve_panel_secret
+        try:
+            registry = default_registry(secret_resolver=resolver)
+            factory = self.service_change_service_factory or CustomerServiceChangeService
+            service = factory(self.store, secret_resolver=resolver, registry=registry)
+            preview = asyncio.run(service.preview(telegram_id=telegram_id, service_id=service_id,
+                change_type=change_type, now=int(self.clock())))
+        except Exception as exc:
+            from manubisguard.customer_store import CustomerStoreError
+            if isinstance(exc, CustomerStoreError):
+                return self._response(start_response, HTTPStatus.CONFLICT, {"error": "service_change_unavailable"})
+            return self._response(start_response, HTTPStatus.BAD_GATEWAY, {"error": "service_change_preview_failed"})
+        # Response is an explicit allowlist: never serialize provider models, URLs or credentials.
+        allowed = ("service_id", "change_type", "amount_minor", "currency", "quantity",
+                   "provider_status", "before_expires_at", "target_expires_at", "remaining_seconds_before",
+                   "before_traffic_limit_bytes", "target_traffic_limit_bytes", "traffic_used_bytes",
+                   "remaining_traffic_bytes_before")
+        return self._response(start_response, HTTPStatus.OK,
+            {"preview": {key: preview[key] for key in allowed if key in preview},
+             "mutates_provider": False, "reserves_wallet": False})
+
     def _create_ticket(self, environ: dict[str, Any], auth: dict[str, Any], start_response: Callable[..., Any]) -> list[bytes]:
         if str(environ.get("CONTENT_TYPE", "")).split(";", 1)[0].strip().lower() != "application/json":
             return self._response(start_response, HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": "json_required"})
@@ -242,7 +288,7 @@ class CustomerMiniAppWSGI:
         path = str(environ.get("PATH_INFO", "/"))
         if path == "/healthz" and method == "GET":
             return self._response(start_response, HTTPStatus.OK, {"ok": True})
-        if method not in {"GET", "POST"} or (method == "POST" and path not in {"/api/v1/purchase", "/api/v1/tickets"}) or (method == "GET" and path == "/api/v1/purchase"):
+        if method not in {"GET", "POST"} or (method == "POST" and path not in {"/api/v1/purchase", "/api/v1/tickets", "/api/v1/service-change-preview"}) or (method == "GET" and path in {"/api/v1/purchase", "/api/v1/service-change-preview"}):
             return self._response(start_response, HTTPStatus.METHOD_NOT_ALLOWED, {"error": "method_not_allowed"})
         origin = str(environ.get("HTTP_ORIGIN", "")).strip()
         if method == "POST" and not origin:
@@ -268,6 +314,8 @@ class CustomerMiniAppWSGI:
         telegram_id = auth["telegram_id"]
         if method == "POST" and path == "/api/v1/purchase":
             return self._purchase(environ, telegram_id, start_response)
+        if method == "POST" and path == "/api/v1/service-change-preview":
+            return self._preview_service_change(environ, telegram_id, start_response)
         if method == "POST" and path == "/api/v1/tickets":
             return self._create_ticket(environ, auth, start_response)
         if path == "/api/v1/tickets":

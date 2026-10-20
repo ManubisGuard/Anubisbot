@@ -265,3 +265,11 @@ Final static pass after Session 96 source/tests passed: Python compileall, `bash
 - Complete isolated test suite: **343 tests passed in 66.829 seconds (OK, exit 0)**. Final static checks passed: Python `compileall`, Bash syntax, Mini App JavaScript syntax, and `git diff --check`.
 - Source commit `9e1012b` (`feat: alert on unauthorized admin callbacks`) is pushed to `origin/feature/discount-codes`; local and remote branch heads match. No staged files remain. Separate pre-existing README/control-bot/Factory/deploy/script/root-webapp changes remain uncommitted and untouched.
 - Evidence is E2 local SQLite/unit/mock only. No live Telegram, payment/provider API, production database, deployment, service restart, or timer activation was performed.
+
+
+## Session 103 — panel-check notification and Mini App preview (2026-10-20)
+
+- The existing admin `/panel-check PANEL_ID` read-only capability/health workflow now queues a `service_test` notification with a random per-check idempotency key and only a status, fixed reason code and numeric actor ID. No panel URL, secret or raw exception is included. The route help now accurately lists `service_test` as connected; `bot_log` and `backup` remain unwired.
+- The customer Mini App now exposes authenticated `POST /api/v1/service-change-preview` for `renewal`/`traffic_topup` only. It invokes the read-only service-change domain preview with signed Telegram user ID, exact allowlisted HTTPS Origin and a response field allowlist; no wallet reservation/provider mutation occurs. Actual Mini App confirmation/execution is not implemented.
+- Full isolated suite after these changes: **345 tests passed in 69.450 seconds (OK)** before the final help-text-only correction; focused regression group after the correction: **4 passed**. A final full suite and static pass are being rerun before commit.
+- Evidence E2 only; no live provider API, wallet mutation, production DB, deployment/restart or gateway work.

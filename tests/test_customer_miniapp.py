@@ -107,6 +107,53 @@ class CustomerMiniAppWSGITests(unittest.TestCase):
         response = self.request("/api/v1/wallet", init_data=signed_init_data(), method="POST")
         self.assertEqual(response["status"], "405 Method Not Allowed")
         self.assertEqual(self.store.wallet_balance(123), 2500)
+        self.assertEqual(self.request("/api/v1/service-change-preview", init_data=signed_init_data())["status"], "405 Method Not Allowed")
+
+    def test_service_change_preview_is_authenticated_read_only_and_response_allowlisted(self):
+        captured = {}
+        class FakeChangeService:
+            def __init__(self, store, *, secret_resolver, registry):
+                captured["store"] = store
+                captured["resolver"] = secret_resolver
+                captured["registry"] = registry
+            async def preview(self, *, telegram_id, service_id, change_type, now):
+                captured.update(telegram_id=telegram_id, service_id=service_id, change_type=change_type, now=now)
+                return {"service_id": service_id, "change_type": change_type, "amount_minor": 1000,
+                    "currency": "IRR", "quantity": 24, "target_expires_at": "2030-01-02T00:00:00+00:00",
+                    "provider_status": "active", "subscription_url": "https://secret.example/private",
+                    "provider_token": "do-not-return"}
+        self.app.service_change_service_factory = FakeChangeService
+        before_balance = self.store.wallet_balance(123)
+        response = self.request("/api/v1/service-change-preview", init_data=signed_init_data(), method="POST",
+            body={"service_id": "svc-alice", "change_type": "renewal"})
+        self.assertEqual(response["status"], "200 OK")
+        self.assertEqual(captured["telegram_id"], 123)
+        self.assertEqual(captured["service_id"], "svc-alice")
+        self.assertEqual(captured["change_type"], "renewal")
+        self.assertEqual(captured["now"], NOW)
+        self.assertFalse(response["body"]["mutates_provider"])
+        self.assertFalse(response["body"]["reserves_wallet"])
+        rendered = json.dumps(response["body"])
+        self.assertNotIn("secret.example", rendered)
+        self.assertNotIn("provider_token", rendered)
+        self.assertNotIn("do-not-return", rendered)
+        self.assertEqual(self.store.wallet_balance(123), before_balance)
+
+    def test_service_change_preview_rejects_invalid_fields_and_sanitizes_service_errors(self):
+        bad_id = self.request("/api/v1/service-change-preview", init_data=signed_init_data(), method="POST",
+            body={"service_id": "../svc-alice", "change_type": "renewal"})
+        bad_type = self.request("/api/v1/service-change-preview", init_data=signed_init_data(), method="POST",
+            body={"service_id": "svc-alice", "change_type": "delete"})
+        self.assertEqual(bad_id["status"], "400 Bad Request")
+        self.assertEqual(bad_type["status"], "400 Bad Request")
+        class FailingChangeService:
+            def __init__(self, *args, **kwargs): pass
+            async def preview(self, **kwargs): raise RuntimeError("credential=secret-token")
+        self.app.service_change_service_factory = FailingChangeService
+        failed = self.request("/api/v1/service-change-preview", init_data=signed_init_data(), method="POST",
+            body={"service_id": "svc-alice", "change_type": "traffic_topup"})
+        self.assertEqual(failed["status"], "502 Bad Gateway")
+        self.assertEqual(failed["body"], {"error": "service_change_preview_failed"})
 
     def test_shop_hides_panel_binding_and_only_returns_enabled_products(self):
         response = self.request("/api/v1/shop", init_data=signed_init_data())
