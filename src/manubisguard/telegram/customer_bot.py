@@ -1363,7 +1363,7 @@ class CustomerBot:
         # /panel add ID | label | provider | https://url | auth_mode | env:VARIABLE | enabled | metadata_json
         payload = text.partition(" ")[2].strip()
         if not payload.startswith("add "):
-            await self.api.send_text(chat_id, "فرمت اتصال پنل:\n/panel add ID | نام | pasarguard/rebecca/sanaei | https://panel.example | api_key/username_password/access_token | env:SECRET_NAME | on/off | metadata JSON\nبرای تغییر تنظیمات، همان ID را با /panel add دوباره ثبت کن. برای توقف فروش بدون حذف تنظیمات: /panel-enable PANEL_ID off\nرمز یا API Key را در چت وارد نکن؛ فقط نام متغیر محیطی را ثبت کن.")
+            await self.api.send_text(chat_id, "فرمت اتصال پنل:\n/panel add ID | نام | pasarguard/rebecca/sanaei | https://panel.example | api_key/username_password/access_token | env:SECRET_NAME | on/off | metadata JSON\nبرای لینک اشتراک واقعی Sanaei، metadata اختیاری باید شامل origin جداگانهٔ HTTPS و subPath پنل باشد؛ مثال: {\"subscription_base_url\":\"https://sub.example:2096\",\"subscription_path\":\"sub\"}. اگر تنظیم نشده باشد، لینک اشتراک فعال نمی‌شود.\nبرای تغییر تنظیمات، همان ID را با /panel add دوباره ثبت کن. برای توقف فروش بدون حذف تنظیمات: /panel-enable PANEL_ID off\nرمز یا API Key را در چت وارد نکن؛ فقط نام متغیر محیطی را ثبت کن.")
             return
         fields = [part.strip() for part in payload[4:].split("|")]
         if len(fields) != 8:

@@ -81,6 +81,44 @@ class SanaeiAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(link,'https://sub.example/s/alice-token')
         self.assertEqual(calls,[('GET','/panel/api/clients/get/alice','Bearer token')])
 
+    async def test_configured_subscription_server_builds_https_url_from_sub_id(self):
+        calls=[]
+        def handler(method,path,kwargs):
+            calls.append((method,path))
+            return Response(200,{'success':True,'obj':{
+                'client':{'email':'alice','id':'uuid-1','subId':'secret-sub-id'},
+                'links':['vless://alice@edge.example:443'],
+            }})
+        adapter=SanaeiAdapter(secret_resolver=lambda _:'token',
+            client_factory=lambda **kw:FakeClient(handler,kw['base_url']))
+        conn=PanelConnection(id='s',tenant_id='t',name='S',kind='sanaei',base_url='https://panel.example',
+            auth_mode='access_token',secret_ref='s',
+            metadata={'subscription_base_url':'https://sub.example:2096','subscription_path':'sub'})
+        capabilities=await adapter.capabilities(conn)
+        self.assertTrue(capabilities.subscription_link)
+        link=await adapter.get_subscription_url(conn,'alice')
+        self.assertEqual(link,'https://sub.example:2096/sub/secret-sub-id')
+        self.assertEqual(calls,[('GET','/panel/api/clients/get/alice')])
+
+    async def test_configured_subscription_server_requires_client_sub_id(self):
+        adapter=SanaeiAdapter(secret_resolver=lambda _:'token',
+            client_factory=lambda **kw:FakeClient(lambda *args:Response(200,{'success':True,
+                'obj':{'client':{'email':'alice','id':'uuid-1'},'links':['vless://direct']}}),kw['base_url']))
+        conn=PanelConnection(id='s',tenant_id='t',name='S',kind='sanaei',base_url='https://panel.example',
+            auth_mode='access_token',secret_ref='s',
+            metadata={'subscription_base_url':'https://sub.example:2096','subscription_path':'sub'})
+        with self.assertRaisesRegex(PanelError,'valid subscription ID'):
+            await adapter.get_subscription_url(conn,'alice')
+
+    async def test_invalid_subscription_server_config_does_not_enable_capability(self):
+        adapter=SanaeiAdapter(secret_resolver=lambda _:'token',
+            client_factory=lambda **kw:FakeClient(lambda *args: self.fail('invalid config should not be used'),kw['base_url']))
+        conn=PanelConnection(id='s',tenant_id='t',name='S',kind='sanaei',base_url='https://panel.example',
+            auth_mode='access_token',secret_ref='s',
+            metadata={'subscription_base_url':'https://sub.example:2096/path','subscription_path':'../bad'})
+        capabilities=await adapter.capabilities(conn)
+        self.assertFalse(capabilities.subscription_link)
+
     async def test_token_subscription_link_fails_closed_when_only_direct_share_links_exist(self):
         direct_link='vless://alice@edge.example:443?security=tls'
         calls=[]
@@ -92,7 +130,7 @@ class SanaeiAdapterTests(unittest.IsolatedAsyncioTestCase):
             client_factory=lambda **kw:FakeClient(handler,kw['base_url']))
         conn=PanelConnection(id='s',tenant_id='t',name='S',kind='sanaei',base_url='https://s.example',
             auth_mode='access_token',secret_ref='s')
-        with self.assertRaisesRegex(PanelError,'HTTPS subscription URL'):
+        with self.assertRaisesRegex(PanelError,'subscription server origin/path is not configured'):
             await adapter.get_subscription_url(conn,'alice')
         self.assertEqual(calls,[('GET','/panel/api/clients/get/alice')])
         self.assertNotIn(direct_link, str(calls))

@@ -7,6 +7,7 @@ we never advertise operations that this adapter cannot verify for the selected m
 from __future__ import annotations
 from datetime import datetime, timezone
 import json
+import re
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
@@ -104,6 +105,30 @@ class SanaeiAdapter:
             return None
         return candidate
 
+    @staticmethod
+    def _subscription_server_config(connection: PanelConnection) -> tuple[str, str] | None:
+        metadata = connection.metadata if isinstance(connection.metadata, dict) else {}
+        base = metadata.get("subscription_base_url")
+        path = metadata.get("subscription_path")
+        if not isinstance(base, str) or not isinstance(path, str):
+            return None
+        if not base or len(base) > 2048 or any(ord(ch) < 32 for ch in base):
+            return None
+        try:
+            parsed = urlsplit(base.strip())
+            if (parsed.scheme.lower() != "https" or not parsed.hostname
+                    or parsed.username or parsed.password or parsed.path not in ("", "/")
+                    or parsed.query or parsed.fragment):
+                return None
+            _ = parsed.port
+        except ValueError:
+            return None
+        path = path.strip().strip("/")
+        if (not re.fullmatch(r"[A-Za-z0-9._~-]{1,128}", path)
+                or path in {".", ".."}):
+            return None
+        return f"https://{parsed.netloc}", path
+
     @classmethod
     def _map(cls, obj: dict[str, Any], base_url: str) -> PanelUser:
         client = obj.get("client") if isinstance(obj.get("client"), dict) else obj
@@ -145,7 +170,8 @@ class SanaeiAdapter:
             data_limit_bytes=total_bytes,
             expire_at=expire, subscription_url=sub,
             raw_status=str(client.get("enable", "unknown")),
-            metadata={"inbound_ids": obj.get("inboundIds", []), "uuid": client.get("id"), "sub_id": client.get("subId")})
+            metadata={"inbound_ids": obj.get("inboundIds", []), "uuid": client.get("id"),
+                      "sub_id": client.get("subId") or obj.get("subId")})
 
     async def capability_report(self, connection: PanelConnection) -> dict[str, Any]:
         """Report adapter coverage without making a panel request or claiming permission."""
@@ -166,13 +192,14 @@ class SanaeiAdapter:
             validation_error_type=validation_error)
 
     async def capabilities(self, connection: PanelConnection) -> PanelCapabilities:
-        self._credentials(connection)
-        # The documented token clients/links endpoint returns direct protocol
-        # links, not an HTTPS subscription URL. Do not claim this capability until
-        # a real subscription URL source/configuration exists.
+        mode, _ = self._credentials(connection)
+        # The clients/links endpoint returns direct protocol URIs. A real HTTPS
+        # subscription URL can only be built when its separate server origin and
+        # configured subPath are explicitly supplied in connection metadata.
+        subscription_link = mode == "token" and self._subscription_server_config(connection) is not None
         return PanelCapabilities(create_user=True, delete_user=True, update_user=True,
             read_usage=True, read_status=True, suspend_user=True, activate_user=True,
-            subscription_link=False, list_users=True, manage_resellers=False,
+            subscription_link=subscription_link, list_users=True, manage_resellers=False,
             health_check=True, sync=False)
 
     async def health_check(self, connection: PanelConnection) -> dict[str, Any]:
@@ -390,6 +417,13 @@ class SanaeiAdapter:
         if mode != "token":
             raise PanelError("Subscription-link endpoint is not verified for legacy Sanaei mode")
         user = await self.get_user(connection, username)
-        if not user.subscription_url:
-            raise PanelError("Sanaei API did not provide an HTTPS subscription URL")
-        return user.subscription_url
+        if user.subscription_url:
+            return user.subscription_url
+        config = self._subscription_server_config(connection)
+        if config is None:
+            raise PanelError("Sanaei subscription server origin/path is not configured")
+        sub_id = user.metadata.get("sub_id")
+        if not isinstance(sub_id, str) or not sub_id.strip() or len(sub_id) > 256 or any(ord(ch) < 32 for ch in sub_id):
+            raise PanelError("Sanaei client response omitted a valid subscription ID")
+        base_url, path = config
+        return f"{base_url}/{path}/{quote(sub_id.strip(), safe='')}"

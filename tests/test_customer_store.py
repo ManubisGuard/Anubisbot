@@ -638,6 +638,28 @@ class CustomerDataStoreTests(unittest.TestCase):
             self.store.put_product(product_id="bad", title="Bad", price_minor=0,
                                    pricing_mode="usage", unit_price_minor=0)
 
+    def test_sanaei_subscription_server_metadata_is_validated_and_persisted(self):
+        valid_metadata={"subscription_base_url":"https://sub.example:2096","subscription_path":"sub"}
+        self.store.register_panel_connection(panel_id="sanaei-good",label="Sanaei",provider="sanaei",
+            base_url="https://panel.example",auth_mode="access_token",secret_ref="env:SANAEI_TOKEN",
+            metadata=valid_metadata,enabled=True)
+        self.assertEqual(self.store.get_panel_connection("sanaei-good")["metadata"],valid_metadata)
+        invalid_metadata=[
+            {"subscription_base_url":"https://sub.example:2096"},
+            {"subscription_path":"sub"},
+            {"subscription_base_url":"http://sub.example:2096","subscription_path":"sub"},
+            {"subscription_base_url":"https://user:pass@sub.example:2096","subscription_path":"sub"},
+            {"subscription_base_url":"https://sub.example:2096/path","subscription_path":"sub"},
+            {"subscription_base_url":"https://sub.example:2096","subscription_path":"../bad"},
+        ]
+        for index,metadata in enumerate(invalid_metadata):
+            with self.subTest(metadata=metadata):
+                with self.assertRaisesRegex(CustomerStoreError,"Sanaei subscription"):
+                    self.store.register_panel_connection(panel_id=f"sanaei-bad-{index}",label="Sanaei",provider="sanaei",
+                        base_url="https://panel.example",auth_mode="access_token",secret_ref="env:SANAEI_TOKEN",
+                        metadata=metadata,enabled=True)
+                self.assertIsNone(self.store.get_panel_connection(f"sanaei-bad-{index}"))
+
     def test_reseller_plan_creation_and_enabled_filter(self):
         self.store.register_panel_connection(panel_id="pg", label="PG", provider="pasarguard",
                                              base_url="https://panel.example", auth_mode="api_key",

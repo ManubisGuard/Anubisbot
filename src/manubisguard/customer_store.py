@@ -1962,6 +1962,30 @@ class CustomerDataStore:
             elif isinstance(value, list):
                 for child in value: check_metadata(child)
         check_metadata(metadata or {})
+        if provider == "sanaei" and any(
+            key in (metadata or {}) for key in ("subscription_base_url", "subscription_path")
+        ):
+            panel_meta = metadata or {}
+            subscription_base = panel_meta.get("subscription_base_url")
+            subscription_path = panel_meta.get("subscription_path")
+            if not isinstance(subscription_base, str) or not isinstance(subscription_path, str):
+                raise CustomerStoreError("Sanaei subscription metadata requires subscription_base_url and subscription_path")
+            if not subscription_base or len(subscription_base) > 2048 or any(ord(ch) < 32 for ch in subscription_base):
+                raise CustomerStoreError("Sanaei subscription_base_url is invalid")
+            try:
+                subscription_parsed = urlsplit(subscription_base.strip())
+                if (subscription_parsed.scheme.lower() != "https" or not subscription_parsed.hostname
+                        or subscription_parsed.username or subscription_parsed.password
+                        or subscription_parsed.path not in ("", "/")
+                        or subscription_parsed.query or subscription_parsed.fragment):
+                    raise CustomerStoreError("Sanaei subscription_base_url must be an HTTPS origin without credentials or path")
+                _ = subscription_parsed.port
+            except ValueError:
+                raise CustomerStoreError("Sanaei subscription_base_url is invalid") from None
+            subscription_path = subscription_path.strip().strip("/")
+            if (not re.fullmatch(r"[A-Za-z0-9._~-]{1,128}", subscription_path)
+                    or subscription_path in {".", ".."}):
+                raise CustomerStoreError("Sanaei subscription_path must be one safe path segment")
         with self._connect() as db:
             db.execute(
                 """INSERT INTO panel_connections
