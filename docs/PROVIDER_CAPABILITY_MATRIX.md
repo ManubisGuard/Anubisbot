@@ -46,5 +46,5 @@ Updated: 2026-10-20. Scope: source-level audit of `src/manubisguard/panels/adapt
 ## Local evidence from this audit
 
 - Sanaei adapter suite: **22 tests passed in 0.083s**; includes token-mode update HTTP 503 failure handling. The targeted test checks that the provider error becomes `PanelError` and no successful mapped user is returned.
-- Full isolated suite: **383 tests passed in 79.851s (OK, exit 0)**. Compile/syntax/diff checks are being re-run for this slice before commit.
+- Full isolated suite: **383 tests passed in 79.851s (OK, exit 0)**. Python compileall, Bash syntax, Mini App JavaScript syntax, and `git diff --check` all passed.
 - Evidence level remains E2 (isolated local mock tests); no live panel/provider acceptance is claimed.
