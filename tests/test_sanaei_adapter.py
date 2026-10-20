@@ -259,6 +259,32 @@ class SanaeiAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(calls[1][2]['enable'])
         self.assertEqual(calls[1][2]['id'],'uuid-1')
 
+    async def test_token_update_fails_closed_when_provider_returns_http_error(self):
+        calls = []
+        existing = {'id': 'uuid-1', 'email': 'alice', 'totalGB': 2,
+                    'expiryTime': 0, 'enable': True, 'up': 1, 'down': 2}
+
+        def handler(method, path, kwargs):
+            calls.append((method, path))
+            if path == '/panel/api/clients/get/alice':
+                return Response(200, {'success': True, 'obj': {'client': existing, 'inboundIds': [3]}})
+            if path == '/panel/api/clients/update/alice':
+                return Response(503, {'success': False})
+            self.fail(f'unexpected request: {method} {path}')
+
+        adapter = SanaeiAdapter(secret_resolver=lambda _: 'token-secret',
+            client_factory=lambda **kw: FakeClient(handler, kw['base_url']))
+        conn = PanelConnection(id='s', tenant_id='t', name='Sanaei', kind='sanaei',
+            base_url='https://sanaei.example', auth_mode='access_token', secret_ref='s')
+
+        with self.assertRaisesRegex(PanelError, 'Sanaei returned HTTP 503'):
+            await adapter.update_user(conn, 'alice', UserUpdate(status='disabled'))
+
+        self.assertEqual(calls, [
+            ('GET', '/panel/api/clients/get/alice'),
+            ('POST', '/panel/api/clients/update/alice'),
+        ])
+
     async def test_legacy_create_and_list_use_single_inbound_contract(self):
         calls=[]
         listed={'id':'uuid-existing','email':'existing','totalGB':2,'expiryTime':0,'enable':True,'up':3,'down':4}
