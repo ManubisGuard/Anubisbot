@@ -825,7 +825,7 @@ class CustomerDataStore:
 
     def list_manual_products(self, *, enabled_only: bool = True) -> list[dict[str, Any]]:
         self._ensure_manual_shop_tables()
-        sql="SELECT product_id,title,description,price_minor,currency,delivery_mode FROM manual_products WHERE tenant_id=?"
+        sql="SELECT product_id,title,description,price_minor,currency,delivery_mode,enabled FROM manual_products WHERE tenant_id=?"
         args: tuple[Any,...]=(self.tenant_id,)
         if enabled_only: sql += " AND enabled=1"
         sql += " ORDER BY created_at,product_id"
@@ -913,7 +913,9 @@ class CustomerDataStore:
             raise CustomerStoreError("Unsupported manual order status")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise CustomerStoreError("Manual order limit must be between 1 and 100")
-        sql = """SELECT o.order_id,o.telegram_id,o.product_id,p.title,o.amount_minor,o.currency,o.status,o.created_at
+        sql = """SELECT o.order_id,o.telegram_id,o.product_id,
+                        COALESCE(NULLIF(o.product_title_snapshot,''),p.title,o.product_id) AS title,
+                        o.amount_minor,o.currency,o.status,o.created_at
                  FROM manual_product_orders o LEFT JOIN manual_products p
                  ON p.tenant_id=o.tenant_id AND p.product_id=o.product_id
                  WHERE o.tenant_id=?"""

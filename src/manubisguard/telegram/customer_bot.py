@@ -1027,8 +1027,57 @@ class CustomerBot:
             return
         if is_admin and command == "/manual-product":
             payload = text.partition(" ")[2].strip()
+            help_text = ("مدیریت محصول دستی:\n"
+                "/manual-product add ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح\n"
+                "/manual-product edit ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح\n"
+                "/manual-product archive ID\n/manual-product list\n"
+                "instant: متن ثابت ارسال می‌شود؛ inventory: یک کلید یکتا از موجودی تحویل می‌شود؛ "
+                "manual: سفارش در انتظار تحویل مدیر می‌ماند. برای موجودی: /manual-key add PRODUCT_ID | KEY")
+            if payload == "list":
+                products = self.data.list_manual_products(enabled_only=False)
+                lines = []
+                for item in products[:50]:
+                    status = "فعال" if item["enabled"] else "آرشیو"
+                    stock = f" — موجودی: {self.data.manual_inventory_count(item['product_id'])}" if item["delivery_mode"] == "inventory" and item["enabled"] else ""
+                    lines.append(f"• {item['product_id']} — {item['title']} — {item['price_minor']} {item['currency']} — {item['delivery_mode']} — {status}{stock}")
+                await self.api.send_text(chat_id, "\n".join(lines) if lines else "محصول دستی ثبت نشده است.", ADMIN_MENU)
+                return
+            if payload.startswith("archive "):
+                product_id = payload[8:].strip()
+                try:
+                    existing = self.data.get_manual_product(product_id, enabled_only=False)
+                    if not existing:
+                        raise ValueError("محصول دستی پیدا نشد.")
+                    if not existing["enabled"]:
+                        await self.api.send_text(chat_id, f"محصول {product_id} قبلاً آرشیو شده است.", ADMIN_MENU)
+                        return
+                    self.data.put_manual_product(product_id=product_id, title=existing["title"],
+                        price_minor=int(existing["price_minor"]), currency=existing["currency"],
+                        delivery_mode=existing["delivery_mode"], delivery_payload=existing["delivery_payload"],
+                        description=existing["description"], enabled=False)
+                except (ValueError, CustomerStoreError) as exc:
+                    await self.api.send_text(chat_id, f"آرشیو محصول انجام نشد: {exc}", ADMIN_MENU)
+                    return
+                await self.api.send_text(chat_id, f"محصول {product_id} آرشیو شد و دیگر قابل خرید نیست.", ADMIN_MENU)
+                return
+            if payload.startswith("edit "):
+                fields = [x.strip() for x in payload[5:].split("|")]
+                try:
+                    if len(fields) != 7:
+                        raise ValueError("برای ویرایش دقیقاً ۷ فیلد لازم است.")
+                    product_id, title, price_raw, currency, delivery_mode, delivery_payload, description = fields
+                    if not self.data.get_manual_product(product_id):
+                        raise ValueError("محصول فعال پیدا نشد؛ شناسه را بررسی کنید.")
+                    self.data.put_manual_product(product_id=product_id, title=title, price_minor=int(price_raw),
+                        currency=currency, delivery_mode=delivery_mode.lower(), delivery_payload=delivery_payload,
+                        description=description)
+                except (ValueError, CustomerStoreError) as exc:
+                    await self.api.send_text(chat_id, f"ویرایش محصول دستی انجام نشد: {exc}", ADMIN_MENU)
+                    return
+                await self.api.send_text(chat_id, f"محصول دستی «{title}» ویرایش شد.", ADMIN_MENU)
+                return
             if not payload.startswith("add "):
-                await self.api.send_text(chat_id, "فرمت محصول دستی:\n/manual-product add ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح\ninstant: متن ثابت ارسال می‌شود؛ inventory: یک کلید یکتا از موجودی تحویل می‌شود؛ manual: سفارش در انتظار تحویل مدیر می‌ماند. برای موجودی: /manual-key add PRODUCT_ID | KEY", ADMIN_MENU)
+                await self.api.send_text(chat_id, help_text, ADMIN_MENU)
                 return
             fields = [x.strip() for x in payload[4:].split("|")]
             try:
@@ -2088,7 +2137,8 @@ class CustomerBot:
             elif section == "products":
                 body = ("🛍 مدیریت فروشگاه\nمحصولات پنلی: /product add ...\n"
                         "محصول دستی: /manual-product add ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح\n"
-                        "فهرست محصولات: /products\n\n"
+                        "ویرایش: /manual-product edit ID | عنوان | قیمت | ارز | حالت | متن-تحویل | توضیح؛ آرشیو: /manual-product archive ID؛ فهرست: /manual-product list\n"
+                        "فهرست محصولات پنلی: /products\n\n"
                         "📦 سفارش‌های تحویل دستی: /manual-orders [pending_delivery|fulfilled|all]\n"
                         "تحویل سفارش: /manual-fulfill ORDER_ID | متن تحویل")
             elif section == "resellers":

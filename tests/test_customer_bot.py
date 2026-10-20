@@ -855,6 +855,51 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("admin:products", callbacks)
         self.assertNotIn("admin:panels", {b.get("callback_data") for row in CUSTOMER_MENU["inline_keyboard"] for b in row})
 
+    async def test_admin_can_edit_manual_product_without_rewriting_existing_order_snapshot(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="manual-edit-fund",
+                                        amount_minor=5000, entry_type="deposit")
+        self.bot.data.put_manual_product(product_id="editable-item", title="Original title", price_minor=1000,
+            currency="IRR", delivery_mode="instant", delivery_payload="ORIGINAL-DELIVERY", description="old description")
+        original = self.bot.data.buy_manual_product(telegram_id=999, product_id="editable-item",
+                                                    idempotency_key="manual-edit-order-before")
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":"/manual-product edit editable-item | Updated title | 1200 | IRR | instant | UPDATED-DELIVERY | updated description"})
+        updated = self.bot.data.get_manual_product("editable-item")
+        self.assertEqual(updated["title"], "Updated title")
+        self.assertEqual(updated["price_minor"], 1200)
+        self.assertEqual(updated["delivery_payload"], "UPDATED-DELIVERY")
+        self.assertEqual(self.bot.data.list_manual_orders(status="all")[0]["title"], "Original title")
+        self.assertEqual(self.bot.data.buy_manual_product(telegram_id=999, product_id="editable-item",
+            idempotency_key="manual-edit-order-before")["delivery_payload"], original["delivery_payload"])
+
+    async def test_admin_can_archive_manual_product_without_new_purchase_or_wallet_debit(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="manual-archive-fund",
+                                        amount_minor=3000, entry_type="deposit")
+        self.bot.data.put_manual_product(product_id="archived-item", title="Archive me", price_minor=500,
+            currency="IRR", delivery_mode="instant", delivery_payload="ARCHIVE-DELIVERY")
+        self.bot.data.buy_manual_product(telegram_id=999, product_id="archived-item",
+                                         idempotency_key="manual-archive-order-before")
+        balance_after_original_order = self.bot.data.wallet_balance(999)
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":"/manual-product archive archived-item"})
+        archived = self.bot.data.get_manual_product("archived-item", enabled_only=False)
+        self.assertEqual(archived["enabled"], 0)
+        self.assertNotIn("archived-item", {item["product_id"] for item in self.bot.data.list_manual_products()})
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":"/manual-product list"})
+        listing = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("archived-item", listing)
+        self.assertIn("آرشیو", listing)
+        self.assertNotIn("ARCHIVE-DELIVERY", listing)
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            self.bot.data.buy_manual_product(telegram_id=999, product_id="archived-item",
+                                             idempotency_key="manual-archive-order-after")
+        self.assertEqual(self.bot.data.wallet_balance(999), balance_after_original_order)
+        self.assertEqual(self.bot.data.list_manual_orders(status="all")[0]["title"], "Archive me")
+
     async def test_manual_product_is_independent_of_panel_and_delivered_after_wallet_purchase(self):
         self.bot.data.ensure_customer(999, first_name="Buyer")
         self.bot.data.post_wallet_entry(telegram_id=999,idempotency_key="manual-fund",amount_minor=5000,entry_type="deposit")
