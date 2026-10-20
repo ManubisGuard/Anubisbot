@@ -74,6 +74,51 @@ class SanaeiAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage['total_bytes'],2 * 1024**3)
         self.assertEqual(calls,[('GET','/panel/api/clients/traffic/alice')])
 
+    async def test_legacy_usage_aggregates_valid_client_stats_across_inbounds(self):
+        calls=[]
+        def handler(method,path,kwargs):
+            calls.append((method,path))
+            if path == '/login': return Response(200,{'success':True})
+            if path == '/panel/api/inbounds/list':
+                return Response(200,{'success':True,'obj':[
+                    {'id':7,'clientStats':[{'email':'alice','up':100,'down':200,'total':1000}]},
+                    {'id':8,'clientStats':[{'email':'alice','up':50,'down':75,'total':900}]},
+                    {'id':9,'clientStats':[{'email':'other','up':999,'down':999,'total':5000}]},
+                ]})
+            return Response(200,{'success':True,'obj':None})
+        adapter=SanaeiAdapter(secret_resolver=lambda _:'password',
+            client_factory=lambda **kw:FakeClient(handler,kw['base_url']))
+        conn=PanelConnection(id='legacy',tenant_id='t',name='Legacy',kind='sanaei',
+            base_url='https://s.example',auth_mode='username_password',secret_ref='s',
+            metadata={'username':'admin'})
+        usage=await adapter.get_usage(conn,'alice')
+        self.assertEqual(usage,{'username':'alice','used_bytes':425,'total_bytes':1000})
+        self.assertEqual(calls,[('POST','/login'),('GET','/panel/api/inbounds/list')])
+
+    async def test_legacy_usage_rejects_missing_counters_instead_of_billing_zero(self):
+        invalid_stats=[
+            ({'email':'alice','down':4,'total':10}, 'invalid traffic counters'),
+            ({'email':'alice','up':3,'total':10}, 'invalid traffic counters'),
+            ({'email':'alice','up':3,'down':4}, 'invalid traffic counters'),
+            ({'email':'alice','up':'not-a-number','down':4,'total':10}, 'invalid traffic counters'),
+            ({'email':'alice','up':True,'down':4,'total':10}, 'invalid traffic counters'),
+            ({'email':'alice','up':-1,'down':4,'total':10}, 'negative traffic counters'),
+        ]
+        for stat, expected_error in invalid_stats:
+            with self.subTest(stat=stat):
+                def handler(method,path,kwargs):
+                    if path == '/login': return Response(200,{'success':True})
+                    if path == '/panel/api/inbounds/list':
+                        return Response(200,{'success':True,'obj':[{'id':7,'clientStats':[stat]}]})
+                    return Response(200,{'success':True,'obj':None})
+                adapter=SanaeiAdapter(secret_resolver=lambda _:'password',
+                    client_factory=lambda **kw:FakeClient(handler,kw['base_url']))
+                conn=PanelConnection(id='legacy',tenant_id='t',name='Legacy',kind='sanaei',
+                    base_url='https://s.example',auth_mode='username_password',secret_ref='s',
+                    metadata={'username':'admin'})
+                with self.assertRaisesRegex(PanelError,expected_error):
+                    await adapter.get_usage(conn,'alice')
+
     async def test_fractional_gib_limit_fails_closed_before_provider_mutation(self):
         adapter=SanaeiAdapter(secret_resolver=lambda _:'token',client_factory=lambda **kw:FakeClient(lambda *args: self.fail('unexpected request'),kw['base_url']))
         conn=PanelConnection(id='s',tenant_id='t',name='S',kind='sanaei',base_url='https://s.example',auth_mode='access_token',secret_ref='s',metadata={'inbound_ids':[3]})

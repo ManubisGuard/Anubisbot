@@ -351,10 +351,13 @@ class SanaeiAdapter:
             if not isinstance(stats, list): continue
             for stat in stats:
                 if isinstance(stat, dict) and str(stat.get("email", "")) == username:
+                    if any(key not in stat or stat[key] is None or isinstance(stat[key], bool)
+                           for key in ("up", "down", "total")):
+                        raise PanelError("Sanaei returned invalid traffic counters")
                     try:
-                        up = int(stat.get("up", 0) or 0); down = int(stat.get("down", 0) or 0)
-                        total = int(stat.get("total", 0) or 0)
-                    except (TypeError, ValueError): raise PanelError("Sanaei returned invalid traffic counters") from None
+                        up = int(stat["up"]); down = int(stat["down"]); total = int(stat["total"])
+                    except (TypeError, ValueError, OverflowError):
+                        raise PanelError("Sanaei returned invalid traffic counters") from None
                     if min(up, down, total) < 0: raise PanelError("Sanaei returned negative traffic counters")
                     matches.append(up + down)
                     total_limit = max(total_limit, total)
