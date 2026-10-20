@@ -248,3 +248,12 @@ Final static pass after Session 96 source/tests passed: Python compileall, `bash
 - After the admin queue/requeue command was adjusted to enqueue only (not bypass the worker), the complete isolated suite `./scripts/run_isolated_tests.sh` passed **340 tests in 67.311 seconds (OK, exit 0)**.
 - The new command regression verifies admin-only queue inspection/requeue without directly invoking the sender; targeted notification tests also passed. Final Python compileall, Bash syntax, Mini App JavaScript syntax and `git diff --check` are run separately after the last edit.
 - Evidence remains E2 local SQLite/unit/mock only. No live Telegram call, staging/production database, deployment, service restart, stage, commit or push. PostgreSQL remains unimplemented and current Bot 2 remains SQLite.
+
+
+## Session 99 — redacted security-alert producer (2026-10-20)
+
+- The customer bot now blocks non-admin attempts to invoke known admin-only commands, including the mutating `/deposit-info set` form, with a generic denial before business handlers run.
+- The handler queues a tenant-scoped `security_alert` containing only `status=blocked`, the fixed `reason_code=unauthorized_admin_command`, and the numeric customer ID. It never stores the raw command, arguments, receipt references or card-like values. Repeated attempts by the same user are coalesced into one idempotent alert per 60-second window to reduce alert flooding.
+- The admin route help now accurately distinguishes connected event producers from remaining unconnected `service_test`, `bot_log` and `backup` producers. Backup policy remains configuration-only; no scheduler is enabled.
+- Focused tests: 3 passed. Complete isolated suite: **341 tests passed in 62.813 seconds (OK)**. Python compileall, Bash syntax, Mini App JavaScript syntax and `git diff --check` passed.
+- Evidence remains E2 local SQLite/unit/mock only. No live Telegram delivery, panel/payment API, operational DB, timer activation, deployment or service restart was performed.

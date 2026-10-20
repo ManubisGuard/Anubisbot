@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import time
@@ -115,8 +116,38 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
             "text":"/notify-route"})
         help_text = self.bot.api.send_text.await_args.args[1]
         self.assertIn("تغییر سرویس", help_text)
-        self.assertIn("تولیدکننده‌های تست سرویس، لاگ ربات، بک‌آپ و هشدار امنیتی هنوز متصل نیستند", help_text)
-        self.assertNotIn("تغییر سرویس و هشدار امنیتی هنوز نیاز به اتصال تولیدکننده دارند", help_text)
+        self.assertIn("تولیدکننده‌های تست سرویس، لاگ ربات و بک‌آپ هنوز متصل نیستند", help_text)
+        self.assertIn("هشدار تلاش غیرمجاز برای اجرای دستور مدیریتی", help_text)
+        self.assertNotIn("هشدار امنیتی هنوز متصل نیست", help_text)
+
+    async def test_non_admin_sensitive_commands_are_blocked_and_redacted_security_alerts_are_idempotent(self):
+        self.bot.data.add_notification_route(event_key="security_alert", chat_id=6883349141,
+            created_by=6883349141)
+        messages = [
+            {"message_id": 501, "from": {"id": 1001}, "chat": {"id": 1001, "type": "private"},
+             "text": "/wallet-credit 1001 | 500000 | IRR | private-receipt-reference"},
+            {"message_id": 502, "from": {"id": 1001}, "chat": {"id": 1001, "type": "private"},
+             "text": "/deposit-info set 4111111111111111 | Test User | Test Bank"},
+        ]
+        await self.bot._handle_message(messages[0])
+        await self.bot._handle_message(messages[0])
+        await self.bot._handle_message(messages[1])
+        self.assertEqual(self.bot.api.send_text.await_count, 3)
+        self.assertIn("فقط برای مدیر", self.bot.api.send_text.await_args_list[0].args[1])
+        with self.bot.data._connect() as db:
+            rows = db.execute("SELECT event_key,idempotency_key,payload_json FROM customer_admin_notifications ORDER BY notification_id").fetchall()
+        self.assertEqual(len(rows), 1, "repeated attempts in one minute should be coalesced")
+        for row in rows:
+            self.assertEqual(row["event_key"], "security_alert")
+            self.assertIn("unauthorized-admin-command:1001:", row["idempotency_key"])
+            payload = json.loads(row["payload_json"])
+            self.assertEqual(payload["status"], "blocked")
+            self.assertEqual(payload["reason_code"], "unauthorized_admin_command")
+            self.assertEqual(payload["customer_id"], 1001)
+            rendered = json.dumps(payload)
+            self.assertNotIn("wallet-credit", rendered)
+            self.assertNotIn("private-receipt-reference", rendered)
+            self.assertNotIn("4111111111111111", rendered)
 
     async def test_admin_can_list_and_requeue_dead_admin_notification_without_bypassing_queue(self):
         admin = {"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"}}
@@ -775,7 +806,7 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_admin_menu_is_separate_and_denied_to_customer(self):
         await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},"text":"/admin"})
-        self.assertIn("از منوی زیر استفاده کن", self.bot.api.send_text.await_args.args[1])
+        self.assertIn("فقط برای مدیر مجاز است", self.bot.api.send_text.await_args.args[1])
         self.bot.api.send_text.reset_mock()
         await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},"text":"/admin"})
         self.assertIn("پنل مدیریت", self.bot.api.send_text.await_args.args[1])

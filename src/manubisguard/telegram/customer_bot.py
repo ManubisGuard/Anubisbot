@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
-import json
+import time
 import uuid
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
@@ -95,6 +96,18 @@ ADMIN_MENU = {"inline_keyboard": [
     [{"text":"⬅️ بازگشت به منوی مشتری","callback_data":"customer:home"}],
 ]}
 BACK_MENU = {"inline_keyboard": [[{"text": "⬅️ منوی اصلی", "callback_data": "customer:home", "style": "primary"}]]}
+
+ADMIN_ONLY_COMMANDS = frozenset({
+    "/pending-deposits", "/deposit-receipt-view", "/wallet-reject", "/wallet-verify",
+    "/wallet-credit", "/payment-events", "/trust-channel", "/trust-channel-status",
+    "/panel", "/panel-enable", "/panels", "/panel-check", "/panel-roles",
+    "/discount", "/category", "/categories", "/service-operations", "/service-operation",
+    "/service-operation-check", "/service-operation-finalize", "/backup-policy", "/notify-route",
+    "/admin-notifications", "/admin-notification-retry", "/ticket-notification-retry",
+    "/manual-key", "/manual-orders", "/manual-fulfill", "/manual-notification-retry",
+    "/manual-product", "/product", "/reseller-plan", "/reseller-plans",
+    "/reseller-plan-enable", "/products", "/resellers", "/tickets", "/reply", "/admin",
+})
 
 
 def _provider_freshness_text(provider_checked_at: str | None, *, now: datetime | None = None) -> str:
@@ -450,6 +463,22 @@ class CustomerBot:
                 return
         text = (message.get("text") or message.get("caption") or "").strip()
         command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
+        deposit_info_payload = text.partition(" ")[2].strip().lower() if command == "/deposit-info" else ""
+        admin_command_attempt = command in ADMIN_ONLY_COMMANDS or (
+            command == "/deposit-info" and deposit_info_payload.startswith("set "))
+        if not is_admin and admin_command_attempt:
+            # Coalesce repeated attempts from one user within a minute to prevent alert floods.
+            alert_window = int(time.time() // 60)
+            try:
+                self.data.enqueue_admin_notification(
+                    event_key="security_alert",
+                    idempotency_key=f"unauthorized-admin-command:{uid}:{alert_window}",
+                    payload={"status": "blocked", "reason_code": "unauthorized_admin_command", "customer_id": uid},
+                )
+            except Exception as exc:
+                LOG.warning("Security alert enqueue failed (%s)", type(exc).__name__)
+            await self.api.send_text(chat_id, "این دستور فقط برای مدیر مجاز است.", self._customer_menu())
+            return
         self.data.ensure_customer(uid, user.get("username", ""), user.get("first_name", ""))
         if uid in self._pending_purchase_discount and text and not text.startswith("/"):
             await self._handle_discount_code_message(chat_id, uid, text)
@@ -868,7 +897,7 @@ class CustomerBot:
                 except (ValueError, CustomerStoreError) as exc:
                     await self.api.send_text(chat_id, f"مسیر ذخیره/حذف نشد: {exc}\nرویدادها: {', '.join(event_keys)}", ADMIN_MENU)
                 return
-            await self.api.send_text(chat_id, "📣 مسیریابی اعلان‌ها\n/notify-route list\n/notify-route add EVENT_KEY | CHAT_ID | TOPIC_ID\n/notify-route remove EVENT_KEY | CHAT_ID | TOPIC_ID\n\nTOPIC_ID را برای ارسال مستقیم 0 بگذار. رویدادهای موجود: " + ", ".join(event_keys) + "\nصف پایدار فعلاً به خرید، پرداخت، کیف پول و تغییر سرویس متصل است؛ تیکت از مسیر outbox مستقل خود ارسال می‌شود. تولیدکننده‌های تست سرویس، لاگ ربات، بک‌آپ و هشدار امنیتی هنوز متصل نیستند.", ADMIN_MENU)
+            await self.api.send_text(chat_id, "📣 مسیریابی اعلان‌ها\n/notify-route list\n/notify-route add EVENT_KEY | CHAT_ID | TOPIC_ID\n/notify-route remove EVENT_KEY | CHAT_ID | TOPIC_ID\n\nTOPIC_ID را برای ارسال مستقیم 0 بگذار. رویدادهای موجود: " + ", ".join(event_keys) + "\nصف پایدار به خرید، پرداخت، کیف پول، تغییر سرویس و هشدار تلاش غیرمجاز برای اجرای دستور مدیریتی متصل است؛ تیکت از مسیر outbox مستقل خود ارسال می‌شود. تولیدکننده‌های تست سرویس، لاگ ربات و بک‌آپ هنوز متصل نیستند.", ADMIN_MENU)
             return
         if is_admin and command == "/admin-notifications":
             raw_status = text.partition(" ")[2].strip().lower() or "all"
