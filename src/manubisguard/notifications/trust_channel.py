@@ -64,11 +64,44 @@ class SQLiteNotificationOutbox:
         c=sqlite3.connect(self.database, timeout=10, isolation_level=None); c.row_factory=sqlite3.Row; c.execute("PRAGMA foreign_keys=ON"); c.execute("PRAGMA busy_timeout=10000"); return c
     def _initialize(self):
         with self._connect() as c:
-            c.execute("""CREATE TABLE IF NOT EXISTS notification_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, bot_instance_id TEXT NOT NULL, event_type TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','sent','dead')), attempts INTEGER NOT NULL DEFAULT 0, available_at REAL NOT NULL, created_at REAL NOT NULL, sent_at REAL, claimed_at REAL, last_error_code TEXT, UNIQUE(tenant_id,bot_instance_id,idempotency_key))""")
-            columns = {str(row[1]) for row in c.execute("PRAGMA table_info(notification_outbox)").fetchall()}
-            if "claimed_at" not in columns:
-                c.execute("ALTER TABLE notification_outbox ADD COLUMN claimed_at REAL")
-            c.execute("CREATE INDEX IF NOT EXISTS ix_notification_outbox_due ON notification_outbox(status,available_at,id)")
+            c.execute("""CREATE TABLE IF NOT EXISTS notification_schema_migrations (
+                version INTEGER PRIMARY KEY CHECK(version > 0),
+                name TEXT NOT NULL,
+                applied_at REAL NOT NULL DEFAULT (unixepoch())
+            )""")
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                applied = {int(row[0]) for row in c.execute(
+                    "SELECT version FROM notification_schema_migrations"
+                ).fetchall()}
+                if any(version > 1 for version in applied):
+                    raise RuntimeError("Notification outbox schema is newer than this application supports")
+                if 1 not in applied:
+                    c.execute("""CREATE TABLE IF NOT EXISTS notification_outbox (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tenant_id TEXT NOT NULL, bot_instance_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending'
+                            CHECK(status IN ('pending','processing','sent','dead')),
+                        attempts INTEGER NOT NULL DEFAULT 0, available_at REAL NOT NULL,
+                        created_at REAL NOT NULL, sent_at REAL, claimed_at REAL,
+                        last_error_code TEXT,
+                        UNIQUE(tenant_id,bot_instance_id,idempotency_key)
+                    )""")
+                    columns = {str(row[1]) for row in c.execute(
+                        "PRAGMA table_info(notification_outbox)"
+                    ).fetchall()}
+                    if "claimed_at" not in columns:
+                        c.execute("ALTER TABLE notification_outbox ADD COLUMN claimed_at REAL")
+                    c.execute("CREATE INDEX IF NOT EXISTS ix_notification_outbox_due ON notification_outbox(status,available_at,id)")
+                    c.execute("INSERT INTO notification_schema_migrations(version,name) VALUES(1,?)",
+                              ("notification_outbox_and_due_index",))
+                c.execute("COMMIT")
+            except Exception:
+                if c.in_transaction:
+                    c.execute("ROLLBACK")
+                raise
     def enqueue(self, config: TrustChannelConfig, event: TrustEvent, payload: dict[str,Any], *, idempotency_key: str, now: float|None=None) -> int|None:
         if not config.enabled or event not in config.enabled_events: return None
         if not idempotency_key.strip() or len(idempotency_key)>200: raise ValueError("idempotency_key must be 1..200 characters")

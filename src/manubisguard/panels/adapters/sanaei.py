@@ -10,7 +10,8 @@ import json
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 
-from ..contracts import PanelCapabilities, PanelConnection, PanelError, PanelUser, UserCreate, UserUpdate
+from ..contracts import (PanelCapabilities, PanelConnection, PanelError, PanelUser, UserCreate,
+                         UserUpdate, local_capability_report)
 
 
 class SanaeiAdapter:
@@ -126,6 +127,24 @@ class SanaeiAdapter:
             expire_at=expire, subscription_url=sub,
             raw_status=str(client.get("enable", "unknown")),
             metadata={"inbound_ids": obj.get("inboundIds", []), "uuid": client.get("id"), "sub_id": client.get("subId")})
+
+    async def capability_report(self, connection: PanelConnection) -> dict[str, Any]:
+        """Report adapter coverage without making a panel request or claiming permission."""
+        validation_error = None
+        try:
+            self._credentials(connection)
+        except Exception as exc:
+            validation_error = type(exc).__name__
+        methods = {
+            "health_check": "health_check", "read_user": "get_user", "list_users": "list_users",
+            "create_user": "create_user", "update_user": "update_user", "delete_user": "delete_user",
+            "read_usage": "get_usage", "subscription_link": "get_subscription_url",
+            "suspend_user": "update_user", "activate_user": "update_user",
+            "manage_resellers": None, "reset_usage": None,
+        }
+        return local_capability_report(self.kind,
+            {name: bool(method and callable(getattr(self, method, None))) for name, method in methods.items()},
+            validation_error_type=validation_error)
 
     async def capabilities(self, connection: PanelConnection) -> PanelCapabilities:
         mode, _ = self._credentials(connection)

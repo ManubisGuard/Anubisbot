@@ -32,6 +32,16 @@ class RebeccaAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.connection=PanelConnection(id='r1',tenant_id='t1',name='Rebecca',kind='rebecca',base_url='https://rebecca.example',auth_mode='api_key',secret_ref='secret://r1',metadata={'service_id':'svc-1'})
         self.adapter=RebeccaAdapter(secret_resolver=lambda _: 'fake-key',client_factory=lambda **kw:FakeClient(handler,kw['base_url']))
 
+    async def test_capability_report_distinguishes_adapter_methods_from_live_permissions(self):
+        report = await self.adapter.capability_report(self.connection)
+        self.assertEqual(report["provider"], "rebecca")
+        self.assertFalse(report["live_panel_verified"])
+        self.assertTrue(report["operations"]["create_user"]["adapter_method_present"])
+        self.assertEqual(report["operations"]["create_user"]["status"], "unknown")
+        self.assertEqual(report["operations"]["create_user"]["panel_permission"], "unknown")
+        self.assertEqual(report["operations"]["create_user"]["live_test"], "not_tested")
+        self.assertEqual(report["operations"]["manage_resellers"]["status"], "unsupported")
+
     async def test_health_and_auth_header(self):
         result=await self.adapter.health_check(self.connection)
         self.assertTrue(result['ok'])

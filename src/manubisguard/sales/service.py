@@ -52,8 +52,13 @@ class CustomerPurchaseService:
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else int(now)
         previous = self.store.get_order_by_idempotency(idempotency_key, telegram_id)
         if previous:
-            if str(previous.get("discount_code") or "") != str(discount_code or "").strip().upper():
-                raise CustomerStoreError("Order idempotency key reused with a different discount code")
+            same_request = (
+                str(previous.get("product_id") or "") == str(product_id)
+                and str(previous.get("reseller_account_id") or "") == str(reseller_account_id or "")
+                and str(previous.get("discount_code") or "") == str(discount_code or "").strip().upper()
+            )
+            if not same_request:
+                raise CustomerStoreError("Order idempotency key reused with a different request")
             existing_service = self.store.get_customer_service(str(previous["order_id"]), telegram_id)
             if previous["status"] == "active" and existing_service:
                 return PurchaseOutcome(str(previous["order_id"]), str(previous["order_id"]), "active",
@@ -295,9 +300,11 @@ class CustomerServiceChangeService:
                 return {**op, "comparison": "target_not_persisted", "observed_value": None}
         try:
             connection = self._connection(str(op.get("panel_id") or ""))
-            # Provider-specific comparison is intentionally gated to the first acceptance target.
-            if connection.kind != "pasarguard":
-                return {**op, "comparison": "provider_not_enabled", "observed_value": None}
+            # Reconciliation is read-only and uses the normalized provider contract shared
+            # by the three explicitly supported adapters. Never infer mutation success from
+            # health checks; only compare the fresh, identity-matched user state below.
+            if connection.kind not in {"pasarguard", "rebecca", "sanaei"}:
+                return {**op, "comparison": "provider_unsupported", "observed_value": None}
             secret = self._secret_resolver(connection.secret_ref)
             if not isinstance(secret, str) or not secret:
                 return {**op, "comparison": "read_failed", "reason_code": "CredentialUnavailable", "observed_value": None}
@@ -305,7 +312,10 @@ class CustomerServiceChangeService:
             if not op.get("provider_user_id") or not op.get("username"):
                 return {**op, "comparison": "identity_missing", "observed_value": None}
             current = await adapter.get_user(connection, str(op["username"]))
-            if str(current.provider_user_id) != str(op["provider_user_id"]):
+            if (str(current.provider_user_id) != str(op["provider_user_id"])
+                    or str(current.username) != str(op["username"])):
+                # Both the stable provider ID and requested username must match. A
+                # matching ID alone is insufficient if a provider response is misrouted.
                 return {**op, "comparison": "identity_mismatch", "observed_value": None}
             if change_type == "renewal":
                 observed_dt = current.expire_at
@@ -328,9 +338,34 @@ class CustomerServiceChangeService:
                     return {**op, "comparison": "observed_unknown", "observed_value": None}
                 observed = int(current.data_limit_bytes)
                 comparison = "target_present" if observed == int(target) else "before_present" if before is not None and observed == int(before) else "different"
-            return {**op, "comparison": comparison, "observed_value": observed}
+            return {**op, "comparison": comparison, "observed_value": observed,
+                    "identity_verified": True}
         except Exception as exc:
             return {**op, "comparison": "read_failed", "reason_code": type(exc).__name__, "observed_value": None}
+
+    async def finalize_target_present(self, *, operation_id: str, actor_telegram_id: int,
+                                      reason: str) -> dict[str, Any]:
+        """Freshly inspect provider state, then atomically finalize with append-only operator audit."""
+        op = self.store.get_service_change_operation(operation_id)
+        if not op:
+            raise CustomerStoreError("Service-change operation not found")
+        # Exact replay is handled by the store only when the same actor/reason/evidence was recorded.
+        existing_events = self.store.list_service_change_events(operation_id)
+        if existing_events:
+            event = existing_events[0]
+            if int(event["actor_telegram_id"]) == int(actor_telegram_id) and event["reason"] == reason.strip():
+                return {**event, "idempotent_replay": True}
+            raise CustomerStoreError("A final decision is already recorded for this operation")
+        result = await self.inspect_reconciliation(operation_id=operation_id)
+        if result.get("comparison") != "target_present" or result.get("identity_verified") is not True:
+            raise CustomerStoreError(
+                f"Cannot finalize operation: fresh provider comparison is {result.get('comparison', 'unknown')}"
+            )
+        return self.store.resolve_service_change_target_present(
+            operation_id=operation_id, actor_telegram_id=actor_telegram_id,
+            comparison=str(result["comparison"]), observed_value=result.get("observed_value"),
+            identity_verified=result.get("identity_verified") is True, reason=reason,
+        )
 
     async def change(self, *, telegram_id: int, service_id: str, change_type: str,
                      idempotency_key: str, now: int | None = None) -> dict[str, Any]:

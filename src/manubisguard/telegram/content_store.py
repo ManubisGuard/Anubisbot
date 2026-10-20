@@ -157,15 +157,35 @@ class BotContentStore:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """CREATE TABLE IF NOT EXISTS bot_content (
-                    namespace TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY(namespace, key)
-                )"""
-            )
+            connection.execute("""CREATE TABLE IF NOT EXISTS content_schema_migrations (
+                version INTEGER PRIMARY KEY CHECK(version > 0),
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                applied = {int(row[0]) for row in connection.execute(
+                    "SELECT version FROM content_schema_migrations"
+                ).fetchall()}
+                if any(version > 1 for version in applied):
+                    raise ContentStoreError("Content database schema is newer than this application supports")
+                if 1 not in applied:
+                    # Adopt the existing lazy-created table without replacing user content.
+                    connection.execute("""CREATE TABLE IF NOT EXISTS bot_content (
+                        namespace TEXT NOT NULL,
+                        key TEXT NOT NULL,
+                        value TEXT NOT NULL,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY(namespace, key)
+                    )""")
+                    connection.execute(
+                        "INSERT INTO content_schema_migrations(version,name) VALUES(1,?)",
+                        ("bot_content_namespace_overrides",),
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
     def get(self, key: str) -> str:
         if key not in EDITABLE_KEYS:

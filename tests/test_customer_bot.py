@@ -1,13 +1,17 @@
 import os
 import tempfile
+import time
 import unittest
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
+from manubisguard.telegram import customer_bot as customer_bot_module
 from manubisguard.telegram.customer_bot import (
     CUSTOMER_MENU,
     CustomerBot,
     CustomerBotConfig,
+    _provider_freshness_text,
 )
 from manubisguard.sales.service import CustomerServiceChangeService, PurchaseOutcome
 
@@ -27,6 +31,33 @@ class CustomerBotConfigTests(unittest.TestCase):
         self.assertEqual(cfg.admin_ids, frozenset({6883349141, 12345}))
         self.assertNotIn("customer-test-token", repr(cfg))
 
+    def test_entrypoint_requires_explicit_staging_opt_in_before_loading_secrets(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(customer_bot_module.CustomerBotConfig, "from_env") as load_config:
+            with self.assertRaisesRegex(SystemExit, "explicitly set MANUBISGUARD_TEST_MODE=1"):
+                customer_bot_module.main()
+        load_config.assert_not_called()
+
+
+class ProviderFreshnessTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc)
+
+    def test_missing_or_malformed_timestamp_is_not_reported_fresh(self):
+        self.assertIn("هنوز از پنل بررسی نشده", _provider_freshness_text(None, now=self.now))
+        self.assertIn("قابل تشخیص نیست", _provider_freshness_text("not-a-date", now=self.now))
+
+    def test_recent_timestamp_is_fresh_and_naive_sqlite_timestamp_is_utc(self):
+        recent = (self.now - timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+        self.assertIn("🟢", _provider_freshness_text(recent, now=self.now))
+        sqlite_timestamp = (self.now - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+        self.assertIn("🟢", _provider_freshness_text(sqlite_timestamp, now=self.now))
+
+    def test_old_timestamp_is_warned_and_future_clock_skew_is_not_fresh(self):
+        old = (self.now - timedelta(days=2)).isoformat()
+        future = (self.now + timedelta(hours=1)).isoformat()
+        self.assertIn("🔴", _provider_freshness_text(old, now=self.now))
+        self.assertIn("ساعت ثبت بررسی", _provider_freshness_text(future, now=self.now))
+
 
 class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -39,6 +70,157 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.bot = CustomerBot(self.config)
         self.bot.api.send_text = AsyncMock()
         self.bot.api.answer_callback = AsyncMock()
+
+    async def test_admin_can_configure_backup_policy_but_cannot_enable_unimplemented_scheduler(self):
+        admin = {"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"}}
+        await self.bot._handle_message({**admin,"text":"/backup-policy schedule | daily | Europe/Berlin | 02:45 | 1440"})
+        policy = self.bot.data.get_backup_policy()
+        self.assertEqual(policy["frequency"], "daily")
+        self.assertEqual(policy["timezone_name"], "Europe/Berlin")
+        self.assertEqual(policy["local_time"], "02:45")
+        self.assertEqual(policy["enabled"], 0)
+        await self.bot._handle_message({**admin,"text":"/backup-policy destination | both | -1001234567890 | 77 | /var/lib/anubis-bot/backups"})
+        policy = self.bot.data.get_backup_policy()
+        self.assertEqual(policy["destination"], "both")
+        self.assertEqual(policy["telegram_chat_id"], -1001234567890)
+        self.assertEqual(policy["telegram_topic_id"], 77)
+        await self.bot._handle_message({**admin,"text":"/backup-policy retention | 20 | 60"})
+        policy = self.bot.data.get_backup_policy()
+        self.assertEqual((policy["retention_count"], policy["retention_days"]), (20, 60))
+        await self.bot._handle_message({**admin,"text":"/backup-policy enable"})
+        self.assertEqual(self.bot.data.get_backup_policy()["enabled"], 0)
+        self.assertIn("فعال‌سازی رد شد", self.bot.api.send_text.await_args.args[1])
+
+    async def test_non_admin_cannot_change_backup_policy(self):
+        before = self.bot.data.get_backup_policy()
+        await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},
+            "text":"/backup-policy schedule | daily | Europe/Berlin | 02:45 | 1440"})
+        self.assertEqual(self.bot.data.get_backup_policy()["frequency"], before["frequency"])
+        self.assertEqual(self.bot.data.get_backup_policy()["enabled"], 0)
+
+    async def test_admin_can_configure_and_list_notification_routes(self):
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":"/notify-route add support_ticket | -1001234567890 | 77"})
+        routes = self.bot.data.list_notification_routes("support_ticket")
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0]["chat_id"], -1001234567890)
+        self.assertEqual(routes[0]["topic_id"], 77)
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":"/notify-route list"})
+        self.assertIn("support_ticket", self.bot.api.send_text.await_args.args[1])
+        self.assertIn("-1001234567890", self.bot.api.send_text.await_args.args[1])
+
+    async def test_admin_can_list_and_requeue_dead_admin_notification_without_bypassing_queue(self):
+        admin = {"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"}}
+        self.bot.data.add_notification_route(event_key="security_alert", chat_id=1001, created_by=6883349141)
+        notification_id = self.bot.data.enqueue_admin_notification(
+            event_key="security_alert", idempotency_key="security-command-1",
+            payload={"status":"blocked","reason_code":"auth_mismatch"}, now=100)
+        delivery = self.bot.data.claim_admin_notification_deliveries(now=101)[0]
+        self.bot.data.retry_admin_notification_delivery(delivery["delivery_id"], attempt=1,
+            error_code="sendfailed", now=102, max_attempts=1)
+        await self.bot._handle_message({**admin,"text":"/admin-notifications dead"})
+        self.assertIn(f"#{notification_id}", self.bot.api.send_text.await_args.args[1])
+        self.assertIn("security_alert", self.bot.api.send_text.await_args.args[1])
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_message({**admin,"text":f"/admin-notification-retry {notification_id}"})
+        self.assertEqual(self.bot.data.list_admin_notifications(status="pending")[0]["notification_id"], notification_id)
+        self.bot.api.send_text.assert_awaited_once()
+        self.assertIn("کارگر پس‌زمینه", self.bot.api.send_text.await_args.args[1])
+        self.assertEqual(self.bot.api.send_text.await_args.args[0], 6883349141)
+
+    async def test_shared_admin_notification_worker_retries_only_failed_destination(self):
+        self.bot.data.add_notification_route(event_key="wallet", chat_id=1001, created_by=6883349141)
+        self.bot.data.add_notification_route(event_key="wallet", chat_id=-1001234567890,
+            topic_id=77, created_by=6883349141)
+        notification_id = self.bot.data.enqueue_admin_notification(
+            event_key="wallet", idempotency_key="wallet-worker-1",
+            payload={"amount_minor": 5000, "currency": "IRR", "entry_type": "deposit_verified",
+                     "customer_id": 1001, "status": "posted", "note": "must not be visible",
+                     "password": "must-not-be-visible"}, now=1_800_000_000)
+        self.bot.api.send_text.side_effect = [RuntimeError("simulated failure"), None]
+        first = await self.bot._deliver_admin_notifications(now=1_800_000_000)
+        self.assertEqual(first, {"sent": 1, "retry": 1, "dead": 0})
+        self.assertEqual(self.bot.api.send_text.await_count, 2)
+        first_args = self.bot.api.send_text.await_args_list[0]
+        self.assertEqual(first_args.args[0], 1001)
+        second_args = self.bot.api.send_text.await_args_list[1]
+        self.assertEqual(second_args.args[0], -1001234567890)
+        self.assertEqual(second_args.kwargs["message_thread_id"], 77)
+        self.assertNotIn("must not be visible", second_args.args[1])
+        self.assertNotIn("must-not-be-visible", second_args.args[1])
+        self.assertEqual(self.bot.data.list_admin_notifications()[0]["status"], "pending")
+        self.bot.api.send_text.reset_mock()
+        self.bot.api.send_text.side_effect = None
+        second = await self.bot._deliver_admin_notifications(now=1_800_000_003)
+        self.assertEqual(second, {"sent": 1, "retry": 0, "dead": 0})
+        self.bot.api.send_text.assert_awaited_once()
+        self.assertEqual(self.bot.api.send_text.await_args.args[0], 1001)
+        self.assertEqual(self.bot.data.list_admin_notifications()[0]["status"], "sent")
+        self.assertEqual(self.bot.data.list_admin_notifications()[0]["notification_id"], notification_id)
+
+    async def test_miniapp_support_ticket_outbox_delivers_ticket_to_configured_admin(self):
+        self.bot.data.ensure_customer(1001, "alice", "Alice")
+        self.bot.data.create_ticket(ticket_id="web-ticket-123", telegram_id=1001,
+            subject="مشکل خرید", first_message="سفارش در حساب نمایش داده نمی‌شود.")
+        counts = await self.bot._deliver_customer_ticket_notifications(now=1_800_000_000)
+        self.assertEqual(counts["sent"], 1)
+        self.bot.api.send_text.assert_awaited_once()
+        args = self.bot.api.send_text.await_args.args
+        self.assertEqual(args[0], 6883349141)
+        self.assertIn("web-ticket-123", args[1])
+        self.assertIn("مشکل خرید", args[1])
+        self.assertIn("سفارش در حساب نمایش داده نمی‌شود", args[1])
+        with self.bot.data._connect() as db:
+            status = db.execute("SELECT status FROM customer_ticket_notifications WHERE ticket_id='web-ticket-123'").fetchone()[0]
+        self.assertEqual(status, "sent")
+
+    async def test_admin_can_requeue_dead_support_ticket_notification(self):
+        self.bot.data.ensure_customer(1003, "cara", "Cara")
+        self.bot.data.create_ticket(ticket_id="dead-ticket-123", telegram_id=1003,
+            subject="اعلان ناموفق", first_message="این اعلان برای تست بازیابی است.")
+        item = self.bot.data.claim_customer_ticket_notifications(now=1_800_000_000)[0]
+        self.assertEqual(self.bot.data.retry_customer_ticket_notification(item["notification_id"],
+            attempt=1, error_code="testfailure", now=1_800_000_000, max_attempts=1), "dead")
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":"/ticket-notification-retry dead-ticket-123"})
+        state = self.bot.data.get_customer_ticket_notification("dead-ticket-123")
+        self.assertEqual(state["status"], "sent")
+        self.assertGreaterEqual(self.bot.api.send_text.await_count, 2)
+        self.assertIn("dead-ticket-123", self.bot.api.send_text.await_args_list[-1].args[1])
+
+    async def test_support_ticket_notification_uses_configured_group_topic_route(self):
+        self.bot.data.add_notification_route(event_key="support_ticket", chat_id=-1001234567890,
+            topic_id=77, created_by=6883349141)
+        self.bot.data.ensure_customer(1002, "bob", "Bob")
+        self.bot.data.create_ticket(ticket_id="topic-ticket-123", telegram_id=1002,
+            subject="تاپیک پشتیبانی", first_message="این پیام باید به تاپیک برسد.")
+        counts = await self.bot._deliver_customer_ticket_notifications(now=1_800_000_000)
+        self.assertEqual(counts["sent"], 1)
+        args = self.bot.api.send_text.await_args
+        self.assertEqual(args.args[0], -1001234567890)
+        self.assertIn("topic-ticket-123", args.args[1])
+        self.assertEqual(args.kwargs["message_thread_id"], 77)
+
+    async def test_my_service_operations_is_scoped_to_requesting_customer(self):
+        self.bot.data.list_service_change_operations = Mock(return_value=[{
+            "operation_id": "op-own-123", "status": "completed", "change_type": "renewal",
+            "amount_minor": 1200, "currency": "IRR", "created_at": "2030-01-01 00:00:00",
+        }])
+        await self.bot._handle_message({
+            "from": {"id": 1001},
+            "chat": {"id": 1001, "type": "private"},
+            "text": "/my-service-operations",
+        })
+        self.bot.data.list_service_change_operations.assert_called_once_with(
+            status="all", limit=10, telegram_id=1001)
+        rendered = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("op-own-123", rendered)
+        self.assertIn("تکمیل‌شده", rendered)
+        self.assertIn("\nمبلغ:", rendered)
+        self.assertNotIn("\\\\n", rendered)
 
     async def test_start_has_customer_product_features_and_colored_buttons(self):
         await self.bot._handle_message({
@@ -62,6 +244,46 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(keyboard["is_persistent"])
         self.assertEqual(CUSTOMER_MENU["inline_keyboard"][0][0]["style"], "primary")
         self.assertEqual(CUSTOMER_MENU["inline_keyboard"][1][0]["style"], "success")
+
+    async def test_panel_check_surfaces_operation_report_without_claiming_live_permissions(self):
+        from manubisguard.panels.contracts import PanelCapabilities
+        self.bot.data.register_panel_connection(panel_id="panel-report", label="Report panel",
+            provider="rebecca", base_url="https://panel.example", auth_mode="api_key",
+            secret_ref="env:TEST_PANEL_SECRET", enabled=True)
+        adapter = self.bot.registry.get("rebecca")
+        adapter.health_check = AsyncMock(return_value={"ok": True})
+        adapter.capabilities = AsyncMock(return_value=PanelCapabilities(create_user=True, health_check=True))
+        adapter.capability_report = AsyncMock(return_value={"provider":"rebecca", "live_panel_verified":False,
+            "operations":{"create_user":{"status":"unknown","adapter_method_present":True},
+                          "manage_resellers":{"status":"unsupported","adapter_method_present":False}}})
+        await self.bot._handle_message({"from":{"id":6883349141},
+            "chat":{"id":6883349141,"type":"private"},"text":"/panel-check panel-report"})
+        rendered = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("اتصال خواندنی موفق بود", rendered)
+        self.assertIn("create_user: متد محلی موجود؛ مجوز پنل نامشخص", rendered)
+        self.assertIn("manage_resellers: پشتیبانی نمی‌شود", rendered)
+        self.assertIn("مجوز عملیات تغییردهنده", rendered)
+        adapter.health_check.assert_awaited_once()
+        adapter.capability_report.assert_awaited_once()
+
+    async def test_customer_menu_uses_only_valid_https_webapp_url(self):
+        with patch.dict(os.environ, {"MANUBIS_CUSTOMER_WEBAPP_URL":"https://mini.example/customer/"}):
+            keyboard = self.bot._customer_menu()
+        button = keyboard["inline_keyboard"][0][0]
+        self.assertEqual(button["web_app"]["url"], "https://mini.example/customer/")
+        self.assertNotIn("callback_data", button)
+        with patch.dict(os.environ, {"MANUBIS_CUSTOMER_WEBAPP_URL":"http://mini.example/customer/"}):
+            fallback = self.bot._customer_menu()["inline_keyboard"][0][0]
+        self.assertEqual(fallback["callback_data"], "customer:miniapp")
+        self.assertNotIn("web_app", fallback)
+
+    async def test_miniapp_callback_explains_missing_secure_url(self):
+        with patch.dict(os.environ, {"MANUBIS_CUSTOMER_WEBAPP_URL":""}):
+            await self.bot._handle_callback({"id":"miniapp-cb", "from":{"id":6883349141},
+                "message":{"chat":{"id":6883349141,"type":"private"}}, "data":"customer:miniapp"})
+        rendered = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("MANUBIS_CUSTOMER_WEBAPP_URL", rendered)
+        self.assertIn("HTTPS", rendered)
 
     async def test_panel_page_explains_customer_boundary_and_no_live_connection(self):
         await self.bot._handle_callback({
@@ -470,6 +692,25 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("🛡 پنل مدیریت ربات", labels)
 
 
+    async def test_duplicate_manual_purchase_callback_returns_existing_delivery_without_second_charge(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="manual-callback-fund",
+                                        amount_minor=3000, entry_type="deposit")
+        self.bot.data.put_manual_product(product_id="callback-product", title="Callback product", price_minor=900,
+            currency="IRR", delivery_mode="instant", delivery_payload="CALLBACK-DELIVERY")
+        query = {"id":"manual-buy-callback", "from":{"id":999},
+            "message":{"message_id":456,"chat":{"id":999,"type":"private"}},
+            "data":"customer:manualbuy_confirm:callback-product"}
+        await self.bot._handle_callback(query)
+        first_body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("CALLBACK-DELIVERY", first_body)
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback(query)
+        replay_body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("قبلاً ثبت شده", replay_body)
+        self.assertIn("CALLBACK-DELIVERY", replay_body)
+        self.assertEqual(self.bot.data.wallet_balance(999), 2100)
+
     async def test_manual_inventory_delivers_unique_key_and_out_of_stock_does_not_charge(self):
         self.bot.data.ensure_customer(999, first_name="Buyer")
         self.bot.data.post_wallet_entry(telegram_id=999,idempotency_key="inventory-fund",amount_minor=5000,entry_type="deposit")
@@ -636,6 +877,142 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("reconcile_required:timeouterror", detail)
         self.assertIn("reconcile-user", detail)
         self.assertIn("وضعیت واقعی پنل جداگانه بررسی شود", detail)
+
+    async def test_admin_service_operation_finalize_command_is_allowlisted_and_audited(self):
+        self.bot.data.ensure_customer(6883349141, first_name="Admin")
+        self.bot.data.register_panel_connection(panel_id="reconcile-panel", label="Panel", provider="pasarguard",
+            base_url="https://panel.example", auth_mode="api_key", secret_ref="env:PANEL_RECONCILE", enabled=True)
+        self.bot.data.put_product(product_id="reconcile-product", title="Reconcile product", price_minor=500,
+            currency="IRR", duration_hours=12, traffic_bytes=1024, panel_id="reconcile-panel", group_ids=["1"])
+        self.bot.data.post_wallet_entry(telegram_id=6883349141, idempotency_key="finalize-funds", amount_minor=1000,
+            entry_type="deposit")
+        self.bot.data.create_metered_service(service_id="reconcile-service", telegram_id=6883349141,
+            product={"product_id":"reconcile-product","panel_id":"reconcile-panel","pricing_mode":"fixed",
+                     "currency":"IRR","unit_price_minor":0,"duration_hours":12,"traffic_bytes":1024,
+                     "expires_at":"2030-01-01T00:00:00+00:00"},
+            provider_user_id="provider-reconcile", username="reconcile-user", subscription_url=None, now=1000)
+        op = self.bot.data.reserve_service_change(operation_id="op-finalize-bot", telegram_id=6883349141,
+            service_id="reconcile-service", change_type="renewal", idempotency_key="finalize-bot-key", now=1000)
+        self.bot.data.persist_service_change_target(operation_id=op["operation_id"],
+            before_expires_at="2030-01-01T00:00:00+00:00", before_traffic_limit_bytes=1024,
+            target_expires_at="2030-01-01T12:00:00+00:00", target_traffic_limit_bytes=None)
+        self.bot.data.flag_service_change_reconciliation(operation_id=op["operation_id"], reason_code="timeout")
+        with patch.object(CustomerServiceChangeService, "inspect_reconciliation", new=AsyncMock(return_value={
+            **op, "comparison":"target_present", "observed_value":"2030-01-01T12:00:00+00:00",
+            "identity_verified":True,
+        })):
+            await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+                "text":"/service-operation-finalize op-finalize-bot | verified target"})
+        self.assertEqual(self.bot.data.get_service_change_operation("op-finalize-bot")["status"], "completed")
+        events = self.bot.data.list_service_change_events("op-finalize-bot")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["actor_telegram_id"], 6883349141)
+        self.assertEqual(events[0]["reason"], "verified target")
+        self.assertIn("ثبت شد", self.bot.api.send_text.await_args.args[1])
+
+    async def test_non_admin_cannot_finalize_service_operation(self):
+        self.bot.data.ensure_customer(777, first_name="Customer")
+        with patch.object(CustomerServiceChangeService, "finalize_target_present", new=AsyncMock()) as finalize:
+            await self.bot._handle_message({"from":{"id":777},"chat":{"id":777,"type":"private"},
+                "text":"/service-operation-finalize arbitrary-id | try"})
+        finalize.assert_not_awaited()
+        self.assertEqual(self.bot.data.list_service_change_events("arbitrary-id"), [])
+
+    async def test_inventory_purchase_confirmation_describes_automatic_delivery(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.put_manual_product(product_id="inventory-copy", title="Inventory item", price_minor=500,
+            currency="IRR", delivery_mode="inventory")
+        await self.bot._handle_callback({"id":"inventory-copy-callback", "from":{"id":999},
+            "message":{"message_id":450,"chat":{"id":999,"type":"private"}},
+            "data":"customer:manualbuy:inventory-copy"})
+        rendered = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("خودکار", rendered)
+        self.assertNotIn("دستی توسط پشتیبانی", rendered)
+
+    async def test_manual_delivery_notification_failure_is_recoverable_by_purchase_replay(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="manual-notify-fund",
+                                        amount_minor=3000, entry_type="deposit")
+        self.bot.data.put_manual_product(product_id="notify-recovery", title="Recovery item", price_minor=700,
+            currency="IRR", delivery_mode="manual")
+        callback = {"id":"notify-recovery-callback", "from":{"id":999},
+            "message":{"message_id":451,"chat":{"id":999,"type":"private"}},
+            "data":"customer:manualbuy_confirm:notify-recovery"}
+        await self.bot._handle_callback(callback)
+        order = self.bot.data.list_manual_orders(status="pending_delivery")[0]
+
+        async def fail_customer_delivery(chat_id, body, *args, **kwargs):
+            if chat_id == 999 and "RECOVERABLE-DELIVERY" in body:
+                raise RuntimeError("simulated Telegram send failure")
+
+        self.bot.api.send_text.side_effect = fail_customer_delivery
+        await self.bot._handle_message({"from":{"id":6883349141},
+            "chat":{"id":6883349141,"type":"private"},
+            "text":f"/manual-fulfill {order['order_id']} | RECOVERABLE-DELIVERY"})
+        persisted = self.bot.data.list_manual_orders(status="fulfilled")
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted[0]["order_id"], order["order_id"])
+        self.assertEqual(self.bot.data.wallet_balance(999), 2300)
+        admin_notice = next(call.args[1] for call in self.bot.api.send_text.await_args_list
+                            if call.args[0] == 6883349141)
+        self.assertIn("صف پایدار", admin_notice)
+        self.assertIn("دوباره تلاش", admin_notice)
+        self.assertIn(order["order_id"], admin_notice)
+
+        self.bot.api.send_text.side_effect = None
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback(callback)
+        recovered = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("RECOVERABLE-DELIVERY", recovered)
+        self.assertIn(order["order_id"], recovered)
+        self.assertEqual(self.bot.data.wallet_balance(999), 2300)
+
+    async def test_manual_delivery_outbox_retries_after_send_failure_without_redebit(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="durable-outbox-fund",
+                                        amount_minor=3000, entry_type="deposit")
+        self.bot.data.put_manual_product(product_id="durable-outbox", title="Durable outbox", price_minor=700,
+                                         delivery_mode="manual")
+        order = self.bot.data.buy_manual_product(telegram_id=999, product_id="durable-outbox",
+                                                 idempotency_key="durable-outbox-order")
+        self.bot.data.fulfill_manual_order(order_id=order["order_id"], delivery_payload="RETRY-DELIVERY-ONCE",
+                                           fulfilled_by=6883349141)
+        async def fail_once(chat_id, body, *args, **kwargs):
+            if chat_id == 999 and "RETRY-DELIVERY-ONCE" in body:
+                raise RuntimeError("simulated failure")
+        self.bot.api.send_text.side_effect = fail_once
+        now = time.time() + 10
+        await self.bot._deliver_manual_delivery_notifications(now=now)
+        self.assertEqual(self.bot.data.wallet_balance(999), 2300)
+        self.assertEqual(self.bot.data.claim_manual_delivery_notifications(now=now + 1), [])
+        self.bot.api.send_text.side_effect = None
+        self.bot.api.send_text.reset_mock()
+        await self.bot._deliver_manual_delivery_notifications(now=now + 2)
+        self.assertTrue(any(call.args[0] == 999 and "RETRY-DELIVERY-ONCE" in call.args[1]
+                            for call in self.bot.api.send_text.await_args_list))
+        self.assertEqual(self.bot.data.wallet_balance(999), 2300)
+        self.assertEqual(self.bot.data.claim_manual_delivery_notifications(now=now + 5000), [])
+
+    async def test_admin_can_requeue_dead_manual_delivery_notification(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="dead-requeue-fund",
+                                        amount_minor=3000, entry_type="deposit")
+        self.bot.data.put_manual_product(product_id="dead-requeue", title="Dead requeue", price_minor=700,
+                                         delivery_mode="manual")
+        order = self.bot.data.buy_manual_product(telegram_id=999, product_id="dead-requeue",
+                                                 idempotency_key="dead-requeue-order")
+        self.bot.data.fulfill_manual_order(order_id=order["order_id"], delivery_payload="DEAD-REQUEUE-DELIVERY",
+                                           fulfilled_by=6883349141)
+        item = self.bot.data.claim_manual_delivery_notifications(now=time.time() + 10)[0]
+        self.bot.data.retry_manual_delivery_notification(item["notification_id"], attempt=item["attempts"],
+            error_code="telegram_error", now=time.time() + 10, max_attempts=1)
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":f"/manual-notification-retry {order['order_id']}"})
+        state = self.bot.data.get_manual_delivery_notification(order["order_id"])
+        self.assertEqual(state["status"], "sent")
+        self.assertTrue(any(call.args[0] == 999 and "DEAD-REQUEUE-DELIVERY" in call.args[1]
+                            for call in self.bot.api.send_text.await_args_list))
+        self.assertEqual(self.bot.data.wallet_balance(999), 2300)
 
     async def test_admin_manual_order_list_and_fulfillment_notify_customer(self):
         self.bot.data.ensure_customer(999, first_name="Buyer")

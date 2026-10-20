@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from manubisguard.backup_policy import BackupPolicyError, validate_backup_policy
+
 
 DEFAULT_PATH = "/var/lib/anubis-bot/customer.sqlite3"
 
@@ -37,6 +39,8 @@ class CustomerDataStore:
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA busy_timeout=15000")
         db.execute("PRAGMA foreign_keys=ON")
+        # Financial/customer writes favor durability over a small fsync reduction.
+        db.execute("PRAGMA synchronous=FULL")
         return db
 
     def _enqueue_trust_event_in_transaction(self, db: sqlite3.Connection, *, event_type: str,
@@ -65,6 +69,10 @@ class CustomerDataStore:
 
     def _initialize(self) -> None:
         with self._connect() as db:
+            # WAL supports readers alongside a writer on this same host. Do not
+            # place this database on a network filesystem; see SQLite WAL docs.
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=FULL")
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS customer_users (
                     tenant_id TEXT NOT NULL,
@@ -413,85 +421,360 @@ class CustomerDataStore:
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(tenant_id, code)
             )""")
-            migrations = {
-                "panel_connections": {"metadata_json": "TEXT NOT NULL DEFAULT '{}'"},
-                "reseller_accounts": {
-                    "setup_fee_minor": "INTEGER NOT NULL DEFAULT 0",
-                    "idempotency_key": "TEXT NOT NULL DEFAULT ''",
-                    "purchased_volume_gib": "TEXT NOT NULL DEFAULT '0'",
-                    "max_users": "INTEGER NOT NULL DEFAULT 0",
-                    "provider_suspended": "INTEGER NOT NULL DEFAULT 0",
-                },
-                "customer_products": {
-                    "category_id": "TEXT NOT NULL DEFAULT ''",
-                    "pricing_mode": "TEXT NOT NULL DEFAULT 'fixed'",
-                    "unit_price_minor": "INTEGER NOT NULL DEFAULT 0",
-                    "panel_id": "TEXT NOT NULL DEFAULT ''",
-                    "group_ids_json": "TEXT NOT NULL DEFAULT '[]'",
-                },
-                "customer_orders": {"product_snapshot_json": "TEXT NOT NULL DEFAULT '{}'", "reseller_account_id": "TEXT NOT NULL DEFAULT ''", "discount_code": "TEXT NOT NULL DEFAULT ''", "discount_amount_minor": "INTEGER NOT NULL DEFAULT 0"},
-                "reseller_accounts": {
-                    "idempotency_key": "TEXT NOT NULL DEFAULT ''",
-                    "purchased_volume_gb": "TEXT NOT NULL DEFAULT '0'",
-                    "max_users": "INTEGER NOT NULL DEFAULT 0",
-                    "setup_fee_minor": "INTEGER NOT NULL DEFAULT 0",
-                    "provider_suspended": "INTEGER NOT NULL DEFAULT 0",
-                    "outstanding_debt_minor": "INTEGER NOT NULL DEFAULT 0",
-                },
-                "customer_services": {
-                    "outstanding_debt_minor": "INTEGER NOT NULL DEFAULT 0",
-                    "reseller_account_id": "TEXT NOT NULL DEFAULT ''",
-                    "username": "TEXT NOT NULL DEFAULT ''",
-                    "subscription_url": "TEXT NOT NULL DEFAULT ''",
-                    "pricing_mode": "TEXT NOT NULL DEFAULT 'fixed'",
-                    "currency": "TEXT NOT NULL DEFAULT 'IRR'",
-                    "unit_price_minor": "INTEGER NOT NULL DEFAULT 0",
-                    "billing_last_at": "INTEGER NOT NULL DEFAULT 0",
-                    "billed_traffic_bytes": "INTEGER NOT NULL DEFAULT 0",
-                    "fractional_carry": "TEXT NOT NULL DEFAULT '0'",
-                    "billing_status": "TEXT NOT NULL DEFAULT 'not_metered'",
-                },
-            }
-            for table, columns in migrations.items():
-                existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
-                for column, declaration in columns.items():
-                    if column not in existing:
-                        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
-            db.execute("UPDATE reseller_accounts SET idempotency_key='legacy:' || account_id WHERE idempotency_key='' OR idempotency_key IS NULL")
-            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_reseller_idempotency ON reseller_accounts(tenant_id,idempotency_key)")
+            # Versioned, transactional migrations cover the core customer schema,
+            # service-change audit records, and manual-shop tables. Other feature
+            # schema helpers may still require separate centralization.
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY CHECK(version > 0),
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 
-            receipt_columns = {row[1] for row in db.execute("PRAGMA table_info(manual_deposit_receipts)")}
-            if "receipt_file_id" not in receipt_columns:
-                db.execute("ALTER TABLE manual_deposit_receipts ADD COLUMN receipt_file_id TEXT NOT NULL DEFAULT ''")
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                applied = {
+                    int(row["version"])
+                    for row in db.execute("SELECT version FROM schema_migrations").fetchall()
+                }
+                unknown_versions = sorted(version for version in applied if version > 9)
+                if unknown_versions:
+                    raise CustomerStoreError(
+                        "Database schema is newer than this application supports"
+                    )
+
+                # v1 consolidates the additive migrations historically applied here.
+                # Each DDL/DML operation and the version record commit atomically.
+                if 1 not in applied:
+                    migrations = {
+                        "panel_connections": {
+                            "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+                        },
+                        "reseller_accounts": {
+                            "setup_fee_minor": "INTEGER NOT NULL DEFAULT 0",
+                            "idempotency_key": "TEXT NOT NULL DEFAULT ''",
+                            "purchased_volume_gib": "TEXT NOT NULL DEFAULT '0'",
+                            "purchased_volume_gb": "TEXT NOT NULL DEFAULT '0'",
+                            "max_users": "INTEGER NOT NULL DEFAULT 0",
+                            "provider_suspended": "INTEGER NOT NULL DEFAULT 0",
+                            "outstanding_debt_minor": "INTEGER NOT NULL DEFAULT 0",
+                        },
+                        "customer_products": {
+                            "category_id": "TEXT NOT NULL DEFAULT ''",
+                            "pricing_mode": "TEXT NOT NULL DEFAULT 'fixed'",
+                            "unit_price_minor": "INTEGER NOT NULL DEFAULT 0",
+                            "panel_id": "TEXT NOT NULL DEFAULT ''",
+                            "group_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+                        },
+                        "customer_orders": {
+                            "product_snapshot_json": "TEXT NOT NULL DEFAULT '{}'",
+                            "reseller_account_id": "TEXT NOT NULL DEFAULT ''",
+                            "discount_code": "TEXT NOT NULL DEFAULT ''",
+                            "discount_amount_minor": "INTEGER NOT NULL DEFAULT 0",
+                        },
+                        "customer_services": {
+                            "outstanding_debt_minor": "INTEGER NOT NULL DEFAULT 0",
+                            "reseller_account_id": "TEXT NOT NULL DEFAULT ''",
+                            "username": "TEXT NOT NULL DEFAULT ''",
+                            "subscription_url": "TEXT NOT NULL DEFAULT ''",
+                            "pricing_mode": "TEXT NOT NULL DEFAULT 'fixed'",
+                            "currency": "TEXT NOT NULL DEFAULT 'IRR'",
+                            "unit_price_minor": "INTEGER NOT NULL DEFAULT 0",
+                            "billing_last_at": "INTEGER NOT NULL DEFAULT 0",
+                            "billed_traffic_bytes": "INTEGER NOT NULL DEFAULT 0",
+                            "fractional_carry": "TEXT NOT NULL DEFAULT '0'",
+                            "billing_status": "TEXT NOT NULL DEFAULT 'not_metered'",
+                        },
+                    }
+                    for table, columns in migrations.items():
+                        existing = {
+                            row["name"]
+                            for row in db.execute(f"PRAGMA table_info({table})").fetchall()
+                        }
+                        for column, declaration in columns.items():
+                            if column not in existing:
+                                db.execute(
+                                    f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                                )
+                    db.execute(
+                        "UPDATE reseller_accounts SET idempotency_key='legacy:' || account_id "
+                        "WHERE idempotency_key='' OR idempotency_key IS NULL"
+                    )
+                    db.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS uq_reseller_idempotency "
+                        "ON reseller_accounts(tenant_id,idempotency_key)"
+                    )
+                    receipt_columns = {
+                        row["name"]
+                        for row in db.execute("PRAGMA table_info(manual_deposit_receipts)").fetchall()
+                    }
+                    if "receipt_file_id" not in receipt_columns:
+                        db.execute(
+                            "ALTER TABLE manual_deposit_receipts "
+                            "ADD COLUMN receipt_file_id TEXT NOT NULL DEFAULT ''"
+                        )
+                    db.execute(
+                        "INSERT INTO schema_migrations(version,name) VALUES(1,?)",
+                        ("core_additive_legacy_migrations",),
+                    )
+                    applied.add(1)
+
+                # v2 centralizes the service-change operation and append-only audit schemas.
+                if 2 not in applied:
+                    db.execute("""CREATE TABLE IF NOT EXISTS customer_service_operations (
+                        tenant_id TEXT NOT NULL, operation_id TEXT NOT NULL, telegram_id INTEGER NOT NULL,
+                        service_id TEXT NOT NULL, change_type TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+                        amount_minor INTEGER NOT NULL, currency TEXT NOT NULL, quantity INTEGER NOT NULL,
+                        status TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        before_expires_at TEXT, before_traffic_limit_bytes INTEGER,
+                        target_expires_at TEXT, target_traffic_limit_bytes INTEGER,
+                        PRIMARY KEY(tenant_id,operation_id), UNIQUE(tenant_id,idempotency_key)
+                    )""")
+                    operation_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(customer_service_operations)").fetchall()}
+                    for column, declaration in (("before_expires_at", "TEXT"),
+                                                ("before_traffic_limit_bytes", "INTEGER"),
+                                                ("target_expires_at", "TEXT"),
+                                                ("target_traffic_limit_bytes", "INTEGER")):
+                        if column not in operation_columns:
+                            db.execute(f"ALTER TABLE customer_service_operations ADD COLUMN {column} {declaration}")
+                    db.execute("""CREATE TABLE IF NOT EXISTS customer_service_operation_events (
+                        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tenant_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL CHECK(event_type='operator_finalized_target_present'),
+                        actor_telegram_id INTEGER NOT NULL, comparison TEXT NOT NULL,
+                        observed_value TEXT NOT NULL, reason TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(tenant_id,operation_id),
+                        FOREIGN KEY(tenant_id,operation_id) REFERENCES customer_service_operations(tenant_id,operation_id)
+                    )""")
+                    db.execute("""CREATE TRIGGER IF NOT EXISTS customer_service_operation_events_no_update
+                        BEFORE UPDATE ON customer_service_operation_events
+                        BEGIN SELECT RAISE(ABORT, 'service operation events are append-only'); END""")
+                    db.execute("""CREATE TRIGGER IF NOT EXISTS customer_service_operation_events_no_delete
+                        BEFORE DELETE ON customer_service_operation_events
+                        BEGIN SELECT RAISE(ABORT, 'service operation events are append-only'); END""")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(2,?)",
+                               ("service_change_operations_and_audit",))
+                # Re-assert immutable audit triggers on every open, including databases
+                # that recorded migration v2 before these triggers were introduced.
+                db.execute("""CREATE TRIGGER IF NOT EXISTS customer_service_operation_events_no_update
+                    BEFORE UPDATE ON customer_service_operation_events
+                    BEGIN SELECT RAISE(ABORT, 'service operation events are append-only'); END""")
+                db.execute("""CREATE TRIGGER IF NOT EXISTS customer_service_operation_events_no_delete
+                    BEFORE DELETE ON customer_service_operation_events
+                    BEGIN SELECT RAISE(ABORT, 'service operation events are append-only'); END""")
+                # v3 centralizes the manual-shop schema previously created lazily.
+                if 3 not in applied:
+                    db.execute("""CREATE TABLE IF NOT EXISTS manual_products (
+                        tenant_id TEXT NOT NULL, product_id TEXT NOT NULL, title TEXT NOT NULL,
+                        description TEXT NOT NULL DEFAULT '', price_minor INTEGER NOT NULL CHECK(price_minor >= 0),
+                        currency TEXT NOT NULL CHECK(length(currency)=3),
+                        delivery_mode TEXT NOT NULL CHECK(delivery_mode IN ('instant','manual','inventory')),
+                        delivery_payload TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY(tenant_id,product_id)
+                    )""")
+                    db.execute("""CREATE TABLE IF NOT EXISTS manual_product_inventory (
+                        inventory_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL,
+                        product_id TEXT NOT NULL, secret_payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'available'
+                        CHECK(status IN ('available','delivered')), order_id TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(tenant_id,product_id,secret_payload)
+                    )""")
+                    db.execute("""CREATE TABLE IF NOT EXISTS manual_product_orders (
+                        tenant_id TEXT NOT NULL, order_id TEXT NOT NULL, telegram_id INTEGER NOT NULL,
+                        product_id TEXT NOT NULL, amount_minor INTEGER NOT NULL, currency TEXT NOT NULL,
+                        status TEXT NOT NULL CHECK(status IN ('paid','fulfilled','pending_delivery','failed')),
+                        idempotency_key TEXT NOT NULL, delivery_payload TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY(tenant_id,order_id), UNIQUE(tenant_id,idempotency_key)
+                    )""")
+                    db.execute("""CREATE TABLE IF NOT EXISTS manual_product_order_events (
+                        event_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, order_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL, actor_telegram_id INTEGER NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )""")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(3,?)",
+                               ("manual_shop_tables",))
+                db.execute("""CREATE TRIGGER IF NOT EXISTS manual_product_order_events_no_update
+                    BEFORE UPDATE ON manual_product_order_events
+                    BEGIN SELECT RAISE(ABORT, 'manual product order events are append-only'); END""")
+                db.execute("""CREATE TRIGGER IF NOT EXISTS manual_product_order_events_no_delete
+                    BEFORE DELETE ON manual_product_order_events
+                    BEGIN SELECT RAISE(ABORT, 'manual product order events are append-only'); END""")
+                # v4 snapshots immutable product title and delivery mode onto each order.
+                # Old rows are backfilled from the current product when it still exists;
+                # if it does not, use the product ID and fail-safe manual delivery mode.
+                if 4 not in applied:
+                    order_columns = {
+                        str(row["name"])
+                        for row in db.execute("PRAGMA table_info(manual_product_orders)").fetchall()
+                    }
+                    for column, declaration in (
+                        ("product_title_snapshot", "TEXT NOT NULL DEFAULT ''"),
+                        ("delivery_mode_snapshot", "TEXT NOT NULL DEFAULT ''"),
+                    ):
+                        if column not in order_columns:
+                            db.execute(
+                                f"ALTER TABLE manual_product_orders ADD COLUMN {column} {declaration}"
+                            )
+                    db.execute("""UPDATE manual_product_orders
+                        SET product_title_snapshot=COALESCE(
+                            (SELECT title FROM manual_products
+                             WHERE manual_products.tenant_id=manual_product_orders.tenant_id
+                               AND manual_products.product_id=manual_product_orders.product_id),
+                            product_id)
+                        WHERE product_title_snapshot=''""")
+                    db.execute("""UPDATE manual_product_orders
+                        SET delivery_mode_snapshot=COALESCE(
+                            (SELECT delivery_mode FROM manual_products
+                             WHERE manual_products.tenant_id=manual_product_orders.tenant_id
+                               AND manual_products.product_id=manual_product_orders.product_id),
+                            'manual')
+                        WHERE delivery_mode_snapshot=''""")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(4,?)",
+                               ("manual_order_purchase_snapshot",))
+                    applied.add(4)
+                # v5 stores customer delivery notifications independently of the
+                # privacy-filtered trust-channel outbox. It references the order so
+                # delivery secrets are not duplicated in a second payload column.
+                if 5 not in applied:
+                    db.execute("""CREATE TABLE IF NOT EXISTS manual_delivery_notifications (
+                        notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tenant_id TEXT NOT NULL,
+                        order_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending'
+                            CHECK(status IN ('pending','processing','sent','dead')),
+                        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                        available_at REAL NOT NULL,
+                        created_at REAL NOT NULL,
+                        claimed_at REAL,
+                        sent_at REAL,
+                        last_error_code TEXT,
+                        UNIQUE(tenant_id,order_id),
+                        FOREIGN KEY(tenant_id,order_id)
+                            REFERENCES manual_product_orders(tenant_id,order_id)
+                    )""")
+                    db.execute("CREATE INDEX IF NOT EXISTS ix_manual_delivery_notifications_due "
+                               "ON manual_delivery_notifications(status,available_at,notification_id)")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(5,?)",
+                               ("manual_delivery_notification_outbox",))
+                    applied.add(5)
+                # v6 persists support-ticket admin notifications so Mini App tickets
+                # are delivered by the Telegram bot worker after the DB transaction.
+                if 6 not in applied:
+                    db.execute("""CREATE TABLE IF NOT EXISTS customer_ticket_notifications (
+                        notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tenant_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending'
+                            CHECK(status IN ('pending','processing','sent','dead')),
+                        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                        available_at REAL NOT NULL, created_at REAL NOT NULL,
+                        claimed_at REAL, sent_at REAL, last_error_code TEXT,
+                        UNIQUE(tenant_id,ticket_id),
+                        FOREIGN KEY(tenant_id,ticket_id)
+                            REFERENCES customer_tickets(tenant_id,ticket_id)
+                    )""")
+                    db.execute("CREATE INDEX IF NOT EXISTS ix_customer_ticket_notifications_due "
+                               "ON customer_ticket_notifications(status,available_at,notification_id)")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(6,?)",
+                               ("customer_ticket_notification_outbox",))
+                    applied.add(6)
+                # v7 defines per-event Telegram destinations, optionally pinned to a forum topic.
+                if 7 not in applied:
+                    db.execute("""CREATE TABLE IF NOT EXISTS customer_notification_routes (
+                        route_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tenant_id TEXT NOT NULL,
+                        event_key TEXT NOT NULL CHECK(event_key IN ('support_ticket','purchase','payment','service_test','bot_log','backup','wallet','service_change','security_alert')),
+                        chat_id INTEGER NOT NULL CHECK(chat_id != 0),
+                        topic_id INTEGER NOT NULL DEFAULT 0 CHECK(topic_id >= 0),
+                        created_by INTEGER NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(tenant_id,event_key,chat_id,topic_id)
+                    )""")
+                    db.execute("CREATE INDEX IF NOT EXISTS ix_customer_notification_routes_event "
+                               "ON customer_notification_routes(tenant_id,event_key,route_id)")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(7,?)",
+                               ("per_event_telegram_notification_routes",))
+                    applied.add(7)
+                # v8 stores a disabled-by-default backup policy. This migration
+                # never creates a scheduler, timer, or operational backup.
+                if 8 not in applied:
+                    db.execute("""CREATE TABLE IF NOT EXISTS customer_backup_policies (
+                        tenant_id TEXT PRIMARY KEY,
+                        enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+                        frequency TEXT NOT NULL DEFAULT 'daily' CHECK(frequency IN ('hourly','daily','interval')),
+                        timezone_name TEXT NOT NULL DEFAULT 'UTC',
+                        local_time TEXT NOT NULL DEFAULT '03:00',
+                        interval_minutes INTEGER NOT NULL DEFAULT 1440 CHECK(interval_minutes BETWEEN 15 AND 10080),
+                        destination TEXT NOT NULL DEFAULT 'local' CHECK(destination IN ('local','telegram','both')),
+                        local_directory TEXT NOT NULL DEFAULT '/var/lib/anubis-bot/backups',
+                        telegram_chat_id INTEGER,
+                        telegram_topic_id INTEGER NOT NULL DEFAULT 0 CHECK(telegram_topic_id >= 0),
+                        retention_count INTEGER NOT NULL DEFAULT 14 CHECK(retention_count BETWEEN 1 AND 1000),
+                        retention_days INTEGER NOT NULL DEFAULT 30 CHECK(retention_days BETWEEN 1 AND 3650),
+                        last_run_at REAL,
+                        last_status TEXT NOT NULL DEFAULT 'never' CHECK(last_status IN ('never','success','failed','running')),
+                        last_error_code TEXT,
+                        next_run_at REAL,
+                        updated_by INTEGER,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )""")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(8,?)",
+                               ("tenant_backup_policy_disabled_by_default",))
+                    applied.add(8)
+                # v9 introduces a shared, durable admin-event outbox. Each destination
+                # has its own delivery state so a retry never repeats successful routes.
+                if 9 not in applied:
+                    db.execute("""CREATE TABLE IF NOT EXISTS customer_admin_notifications (
+                        notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tenant_id TEXT NOT NULL,
+                        event_key TEXT NOT NULL CHECK(event_key IN
+                            ('purchase','payment','service_test','bot_log','backup','wallet','service_change','security_alert')),
+                        idempotency_key TEXT NOT NULL,
+                        payload_json TEXT NOT NULL DEFAULT '{}',
+                        status TEXT NOT NULL DEFAULT 'pending'
+                            CHECK(status IN ('pending','sent','dead')),
+                        available_at REAL NOT NULL,
+                        created_at REAL NOT NULL,
+                        sent_at REAL,
+                        last_error_code TEXT,
+                        UNIQUE(tenant_id,event_key,idempotency_key)
+                    )""")
+                    db.execute("""CREATE TABLE IF NOT EXISTS customer_admin_notification_deliveries (
+                        delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        notification_id INTEGER NOT NULL,
+                        tenant_id TEXT NOT NULL,
+                        chat_id INTEGER NOT NULL CHECK(chat_id != 0),
+                        topic_id INTEGER NOT NULL DEFAULT 0 CHECK(topic_id >= 0),
+                        status TEXT NOT NULL DEFAULT 'pending'
+                            CHECK(status IN ('pending','processing','sent','dead')),
+                        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                        available_at REAL NOT NULL,
+                        claimed_at REAL,
+                        sent_at REAL,
+                        last_error_code TEXT,
+                        UNIQUE(notification_id,chat_id,topic_id),
+                        FOREIGN KEY(notification_id) REFERENCES customer_admin_notifications(notification_id)
+                            ON DELETE CASCADE
+                    )""")
+                    db.execute("CREATE INDEX IF NOT EXISTS ix_customer_admin_notifications_due "
+                               "ON customer_admin_notifications(tenant_id,status,available_at,notification_id)")
+                    db.execute("CREATE INDEX IF NOT EXISTS ix_customer_admin_notification_deliveries_due "
+                               "ON customer_admin_notification_deliveries(tenant_id,status,available_at,delivery_id)")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(9,?)",
+                               ("durable_per_destination_admin_notification_outbox",))
+                    applied.add(9)
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
 
     def _ensure_manual_shop_tables(self) -> None:
-        with self._connect() as db:
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS manual_products (
-                    tenant_id TEXT NOT NULL, product_id TEXT NOT NULL, title TEXT NOT NULL,
-                    description TEXT NOT NULL DEFAULT '', price_minor INTEGER NOT NULL CHECK(price_minor >= 0),
-                    currency TEXT NOT NULL CHECK(length(currency)=3),
-                    delivery_mode TEXT NOT NULL CHECK(delivery_mode IN ('instant','manual','inventory')),
-                    delivery_payload TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY(tenant_id,product_id)
-                );
-                CREATE TABLE IF NOT EXISTS manual_product_inventory (
-                    inventory_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL,
-                    product_id TEXT NOT NULL, secret_payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'available'
-                    CHECK(status IN ('available','delivered')), order_id TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(tenant_id,product_id,secret_payload)
-                );
-                CREATE TABLE IF NOT EXISTS manual_product_orders (
-                    tenant_id TEXT NOT NULL, order_id TEXT NOT NULL, telegram_id INTEGER NOT NULL,
-                    product_id TEXT NOT NULL, amount_minor INTEGER NOT NULL, currency TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK(status IN ('paid','fulfilled','pending_delivery','failed')),
-                    idempotency_key TEXT NOT NULL, delivery_payload TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY(tenant_id,order_id), UNIQUE(tenant_id,idempotency_key)
-                );
-            """)
+        """Compatibility shim; manual-shop tables are installed by migration v3."""
+        return
 
     def put_manual_product(self, *, product_id: str, title: str, price_minor: int,
                            currency: str = "IRR", delivery_mode: str = "instant",
@@ -567,7 +850,12 @@ class CustomerDataStore:
             if prior:
                 if int(prior["telegram_id"]) != telegram_id or prior["product_id"] != product_id:
                     raise CustomerStoreError("Manual product idempotency key reused")
-                result=dict(prior); result["idempotent_replay"]=True; db.commit(); return result
+                result = dict(prior)
+                result["title"] = result.get("product_title_snapshot") or result["product_id"]
+                result["delivery_mode"] = result.get("delivery_mode_snapshot") or "manual"
+                result["idempotent_replay"] = True
+                db.commit()
+                return result
             product=db.execute("SELECT * FROM manual_products WHERE tenant_id=? AND product_id=? AND enabled=1",
                                (self.tenant_id,product_id)).fetchone()
             if not product: raise CustomerStoreError("Manual product is unavailable")
@@ -591,13 +879,24 @@ class CustomerDataStore:
                                (order_id,self.tenant_id,inventory_id))
                 if cur.rowcount != 1: raise CustomerStoreError("Inventory key was already reserved")
             db.execute("""INSERT INTO manual_product_orders
-                (tenant_id,order_id,telegram_id,product_id,amount_minor,currency,status,idempotency_key,delivery_payload)
-                VALUES(?,?,?,?,?,?,?,?,?)""",
-                (self.tenant_id,order_id,telegram_id,product_id,int(product["price_minor"]),product["currency"],status,idempotency_key,payload))
+                (tenant_id,order_id,telegram_id,product_id,amount_minor,currency,status,idempotency_key,
+                 delivery_payload,product_title_snapshot,delivery_mode_snapshot)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (self.tenant_id,order_id,telegram_id,product_id,int(product["price_minor"]),product["currency"],
+                 status,idempotency_key,payload,product["title"],mode))
             db.execute("""INSERT INTO wallet_ledger(tenant_id,telegram_id,idempotency_key,amount_minor,currency,entry_type,reference,note)
                 VALUES(?,?,?,?,?,?,?,?)""",
                 (self.tenant_id,telegram_id,"manual-product:"+order_id,-int(product["price_minor"]),product["currency"],
                  "purchase",order_id,"Manual digital product purchase"))
+            self._enqueue_admin_notification_in_transaction(db, event_key="purchase",
+                idempotency_key=f"manual-order:{order_id}",
+                payload={"public_order_id": order_id[:20], "product_title": str(product["title"]),
+                         "amount_minor": int(product["price_minor"]), "currency": str(product["currency"]),
+                         "status": status, "customer_id": telegram_id})
+            self._enqueue_admin_notification_in_transaction(db, event_key="wallet",
+                idempotency_key=f"manual-wallet:{order_id}",
+                payload={"amount_minor": -int(product["price_minor"]), "currency": str(product["currency"]),
+                         "entry_type": "purchase", "customer_id": telegram_id, "status": "debited"})
             result={"order_id":order_id,"product_id":product_id,"amount_minor":int(product["price_minor"]),
                     "currency":product["currency"],"status":status,"delivery_mode":mode,
                     "delivery_payload":payload,"title":product["title"],"idempotent_replay":False}
@@ -652,12 +951,12 @@ class CustomerDataStore:
                              (delivery_payload, self.tenant_id, order_id))
             if cur.rowcount != 1:
                 raise CustomerStoreError("Order fulfillment conflict; refresh the order list")
-            db.execute("""CREATE TABLE IF NOT EXISTS manual_product_order_events (
-                event_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, order_id TEXT NOT NULL,
-                event_type TEXT NOT NULL, actor_telegram_id INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )""")
             db.execute("INSERT INTO manual_product_order_events(tenant_id,order_id,event_type,actor_telegram_id) VALUES(?,?,?,?)",
                        (self.tenant_id, order_id, "fulfilled", fulfilled_by))
+            now = time.time()
+            db.execute("""INSERT OR IGNORE INTO manual_delivery_notifications
+                (tenant_id,order_id,status,attempts,available_at,created_at)
+                VALUES(?,?,'pending',0,?,?)""", (self.tenant_id, order_id, now, now))
             result = dict(row)
             result.update(status="fulfilled", delivery_payload=delivery_payload)
             db.commit()
@@ -667,6 +966,82 @@ class CustomerDataStore:
             raise
         finally:
             db.close()
+
+    def claim_manual_delivery_notifications(self, *, limit: int = 20, now: float | None = None,
+                                             lease_seconds: int = 300) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise CustomerStoreError("Notification batch limit must be between 1 and 100")
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or not 30 <= lease_seconds <= 3600:
+            raise CustomerStoreError("Notification lease must be between 30 and 3600 seconds")
+        ts = time.time() if now is None else float(now)
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""UPDATE manual_delivery_notifications
+                SET status='pending',claimed_at=NULL,available_at=?
+                WHERE tenant_id=? AND status='processing' AND claimed_at IS NOT NULL AND claimed_at<=?""",
+                (ts, self.tenant_id, ts - lease_seconds))
+            rows = db.execute("""SELECT n.notification_id,n.tenant_id,n.order_id,n.attempts,
+                    o.telegram_id,o.product_id,o.delivery_payload,o.product_title_snapshot
+                FROM manual_delivery_notifications n
+                JOIN manual_product_orders o ON o.tenant_id=n.tenant_id AND o.order_id=n.order_id
+                WHERE n.tenant_id=? AND n.status='pending' AND n.available_at<=? AND o.status='fulfilled'
+                ORDER BY n.notification_id LIMIT ?""", (self.tenant_id, ts, limit)).fetchall()
+            claimed = []
+            for row in rows:
+                cur = db.execute("UPDATE manual_delivery_notifications SET status='processing',attempts=attempts+1,claimed_at=? WHERE tenant_id=? AND notification_id=? AND status='pending'",
+                                 (ts, self.tenant_id, row["notification_id"]))
+                if cur.rowcount != 1:
+                    continue
+                item = dict(row)
+                item["attempts"] = int(row["attempts"]) + 1
+                claimed.append(item)
+            db.commit()
+            return claimed
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def mark_manual_delivery_notification_sent(self, notification_id: int, *, now: float | None = None) -> None:
+        ts = time.time() if now is None else float(now)
+        with self._connect() as db:
+            cur = db.execute("UPDATE manual_delivery_notifications SET status='sent',sent_at=?,claimed_at=NULL,last_error_code=NULL WHERE tenant_id=? AND notification_id=? AND status='processing'",
+                             (ts, self.tenant_id, notification_id))
+            if cur.rowcount != 1:
+                raise CustomerStoreError("Delivery notification is not in processing state")
+
+    def retry_manual_delivery_notification(self, notification_id: int, *, attempt: int,
+                                           error_code: str, now: float | None = None,
+                                           max_attempts: int = 8) -> str:
+        if not error_code or len(error_code) > 80 or any(ch.isspace() for ch in error_code):
+            raise CustomerStoreError("Notification error code must be short and non-sensitive")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise CustomerStoreError("Invalid notification attempt")
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+            raise CustomerStoreError("Invalid maximum notification attempts")
+        ts = time.time() if now is None else float(now)
+        status = "dead" if attempt >= max_attempts else "pending"
+        next_at = ts if status == "dead" else ts + min(3600, 2 ** min(attempt, 10))
+        with self._connect() as db:
+            cur = db.execute("UPDATE manual_delivery_notifications SET status=?,available_at=?,claimed_at=NULL,last_error_code=? WHERE tenant_id=? AND notification_id=? AND status='processing'",
+                             (status, next_at, error_code, self.tenant_id, notification_id))
+            if cur.rowcount != 1:
+                raise CustomerStoreError("Delivery notification is not in processing state")
+        return status
+
+    def get_manual_delivery_notification(self, order_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute("SELECT notification_id,tenant_id,order_id,status,attempts,available_at,created_at,claimed_at,sent_at,last_error_code FROM manual_delivery_notifications WHERE tenant_id=? AND order_id=?",
+                             (self.tenant_id, order_id)).fetchone()
+        return dict(row) if row else None
+
+    def retry_manual_delivery_notification_now(self, order_id: str) -> bool:
+        with self._connect() as db:
+            cur = db.execute("UPDATE manual_delivery_notifications SET status='pending',attempts=0,available_at=?,claimed_at=NULL,last_error_code=NULL WHERE tenant_id=? AND order_id=? AND status='dead'",
+                             (time.time(), self.tenant_id, order_id))
+            return cur.rowcount == 1
 
     def ensure_customer(self, telegram_id: int, username: str = "", first_name: str = "") -> None:
         if not isinstance(telegram_id, int) or telegram_id <= 0:
@@ -730,6 +1105,37 @@ class CustomerDataStore:
         if not row: return None
         result = dict(row)
         result["product_snapshot"] = json.loads(result.get("product_snapshot_json") or "{}")
+        return result
+
+    def list_customer_orders(self, telegram_id: int, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Return a minimal, tenant- and customer-scoped order history without internal references."""
+        if isinstance(telegram_id, bool) or not isinstance(telegram_id, int) or telegram_id <= 0:
+            raise CustomerStoreError("Invalid customer ID")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise CustomerStoreError("Invalid order history limit")
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT o.order_id,o.product_id,o.amount_minor,o.currency,o.status,o.created_at,o.updated_at,
+                          o.discount_code,o.discount_amount_minor,o.product_snapshot_json,p.title AS current_title
+                   FROM customer_orders o LEFT JOIN customer_products p
+                     ON p.tenant_id=o.tenant_id AND p.product_id=o.product_id
+                   WHERE o.tenant_id=? AND o.telegram_id=?
+                   ORDER BY o.created_at DESC,o.order_id DESC LIMIT ?""",
+                (self.tenant_id, telegram_id, limit),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                snapshot = json.loads(item.pop("product_snapshot_json") or "{}")
+            except (TypeError, ValueError):
+                snapshot = {}
+            item["title"] = str(snapshot.get("title") or item.get("current_title") or item["product_id"])
+            item.pop("current_title", None)
+            item["amount_minor"] = int(item["amount_minor"])
+            item["discount_amount_minor"] = int(item.get("discount_amount_minor") or 0)
+            item["discount_code"] = str(item.get("discount_code") or "")
+            result.append(item)
         return result
 
     def list_products(self, panel_id: str | None = None, category_id: str | None = None) -> list[dict[str, Any]]:
@@ -1152,6 +1558,14 @@ class CustomerDataStore:
                 (tenant_id,payment_id,event_type,actor_telegram_id,amount_minor,currency,external_reference)
                 VALUES(?,?,'verified',?,?,?,?)""",
                 (self.tenant_id, payment_id, verified_by, verified_amount_minor, verified_currency, external_reference[:256]))
+            self._enqueue_admin_notification_in_transaction(db, event_key="payment",
+                idempotency_key=f"payment:{payment_id}",
+                payload={"public_order_id": payment_id[:20], "amount_minor": verified_amount_minor,
+                         "currency": verified_currency, "status": "verified", "customer_id": int(row["telegram_id"])})
+            self._enqueue_admin_notification_in_transaction(db, event_key="wallet",
+                idempotency_key=f"payment-wallet:{payment_id}",
+                payload={"amount_minor": verified_amount_minor, "currency": verified_currency,
+                         "entry_type": "deposit_verified", "customer_id": int(row["telegram_id"]), "status": "credited"})
             db.commit()
             return ledger_id
         except Exception:
@@ -1238,6 +1652,23 @@ class CustomerDataStore:
             ).fetchall()
         return {str(row["currency"]): int(row["balance"]) for row in rows if int(row["balance"]) != 0}
 
+    def list_wallet_transactions(self, telegram_id: int, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Return customer-safe wallet history; never expose notes, references or idempotency keys."""
+        if isinstance(telegram_id, bool) or not isinstance(telegram_id, int) or telegram_id <= 0:
+            raise CustomerStoreError("Invalid customer ID")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise CustomerStoreError("Invalid wallet history limit")
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT ledger_id,amount_minor,currency,entry_type,created_at
+                   FROM wallet_ledger WHERE tenant_id=? AND telegram_id=?
+                   ORDER BY ledger_id DESC LIMIT ?""",
+                (self.tenant_id, telegram_id, limit),
+            ).fetchall()
+        return [{ "entry_id": int(row["ledger_id"]), "amount_minor": int(row["amount_minor"]),
+                  "currency": str(row["currency"]), "entry_type": str(row["entry_type"]),
+                  "created_at": str(row["created_at"]) } for row in rows]
+
     def outstanding_debts(self, telegram_id: int) -> dict[str, int]:
         with self._connect() as db:
             service_rows = db.execute(
@@ -1307,6 +1738,10 @@ class CustomerDataStore:
                     idempotency_key=f"wallet-credit:{reference or idempotency_key}",
                     payload={"public_order_id": (reference or idempotency_key)[:20],
                              "amount_minor": amount_minor, "currency": currency})
+            self._enqueue_admin_notification_in_transaction(db, event_key="wallet",
+                idempotency_key=f"wallet:{idempotency_key}",
+                payload={"amount_minor": amount_minor, "currency": currency, "entry_type": entry_type,
+                         "customer_id": telegram_id, "status": "posted"})
             db.commit()
             return ledger_id
         except Exception:
@@ -1734,6 +2169,16 @@ class CustomerDataStore:
                      "Reseller plan covered configuration" if reseller_account_id else "Customer product purchase reservation"),
                 )
             db.execute("UPDATE customer_orders SET status='provisioning',updated_at=CURRENT_TIMESTAMP WHERE tenant_id=? AND order_id=?", (self.tenant_id, order_id))
+            self._enqueue_admin_notification_in_transaction(db, event_key="purchase",
+                idempotency_key=f"order:{order_id}",
+                payload={"public_order_id": order_id[:20], "product_title": str(product["title"]),
+                         "amount_minor": charge, "currency": currency, "status": "provisioning",
+                         "customer_id": telegram_id})
+            if charge > 0:
+                self._enqueue_admin_notification_in_transaction(db, event_key="wallet",
+                    idempotency_key=f"order-wallet:{order_id}",
+                    payload={"amount_minor": -charge, "currency": currency, "entry_type": "purchase",
+                             "customer_id": telegram_id, "status": "debited"})
             db.commit()
             result = dict(product)
             result.update({"order_id": order_id, "telegram_id": telegram_id, "amount_minor": charge,
@@ -1769,6 +2214,17 @@ class CustomerDataStore:
                 db.execute("UPDATE discount_codes SET used_count=CASE WHEN used_count>0 THEN used_count-1 ELSE 0 END,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=? AND code=?",
                            (self.tenant_id, order["discount_code"]))
             db.execute("UPDATE customer_orders SET status='refunded',updated_at=CURRENT_TIMESTAMP WHERE tenant_id=? AND order_id=?", (self.tenant_id, order_id))
+            self._enqueue_admin_notification_in_transaction(db, event_key="payment",
+                idempotency_key=f"refund:{order_id}",
+                payload={"public_order_id": order_id[:20], "amount_minor": int(order["amount_minor"]),
+                         "currency": str(order["currency"]), "status": "refunded",
+                         "customer_id": int(order["telegram_id"]), "reason_code": reason_code[:80]})
+            if int(order["amount_minor"]) > 0:
+                self._enqueue_admin_notification_in_transaction(db, event_key="wallet",
+                    idempotency_key=f"refund-wallet:{order_id}",
+                    payload={"amount_minor": int(order["amount_minor"]), "currency": str(order["currency"]),
+                             "entry_type": "refund", "customer_id": int(order["telegram_id"]),
+                             "status": "credited"})
             db.commit()
         except Exception:
             db.rollback(); raise
@@ -1852,26 +2308,6 @@ class CustomerDataStore:
         db = self._connect()
         try:
             db.execute("BEGIN IMMEDIATE")
-            db.execute("""CREATE TABLE IF NOT EXISTS customer_service_operations (
-                tenant_id TEXT NOT NULL, operation_id TEXT NOT NULL, telegram_id INTEGER NOT NULL,
-                service_id TEXT NOT NULL, change_type TEXT NOT NULL, idempotency_key TEXT NOT NULL,
-                amount_minor INTEGER NOT NULL, currency TEXT NOT NULL, quantity INTEGER NOT NULL,
-                status TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                before_expires_at TEXT, before_traffic_limit_bytes INTEGER,
-                target_expires_at TEXT, target_traffic_limit_bytes INTEGER,
-                PRIMARY KEY(tenant_id,operation_id), UNIQUE(tenant_id,idempotency_key)
-            )""")
-            # Additive migration for databases created by earlier versions.
-            operation_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(customer_service_operations)").fetchall()}
-            for column, definition in (
-                ("before_expires_at", "TEXT"),
-                ("before_traffic_limit_bytes", "INTEGER"),
-                ("target_expires_at", "TEXT"),
-                ("target_traffic_limit_bytes", "INTEGER"),
-            ):
-                if column not in operation_columns:
-                    db.execute(f"ALTER TABLE customer_service_operations ADD COLUMN {column} {definition}")
             previous = db.execute("SELECT * FROM customer_service_operations WHERE tenant_id=? AND idempotency_key=?",
                                   (self.tenant_id, idempotency_key)).fetchone()
             if previous:
@@ -1891,6 +2327,18 @@ class CustomerDataStore:
                                  (self.tenant_id, service_id, telegram_id)).fetchone()
             if not service:
                 raise CustomerStoreError("Service not found for this customer")
+            unresolved = db.execute(
+                """SELECT operation_id, status FROM customer_service_operations
+                   WHERE tenant_id=? AND service_id=? AND telegram_id=?
+                     AND (status='pending' OR status LIKE 'reconcile_required:%')
+                   ORDER BY created_at DESC LIMIT 1""",
+                (self.tenant_id, service_id, telegram_id),
+            ).fetchone()
+            if unresolved:
+                raise CustomerStoreError(
+                    f"Service already has an unresolved change ({unresolved['operation_id']}); "
+                    "check its status or ask support before starting another change"
+                )
             if service["status"] not in {"active", "limited", "expired"}:
                 raise CustomerStoreError("Service is not eligible for renewal or traffic top-up")
             product = db.execute("SELECT * FROM customer_products WHERE tenant_id=? AND product_id=? AND enabled=1",
@@ -1915,6 +2363,15 @@ class CustomerDataStore:
                 (tenant_id,operation_id,telegram_id,service_id,change_type,idempotency_key,amount_minor,currency,quantity,status)
                 VALUES(?,?,?,?,?,?,?,?,?,'pending')""",
                 (self.tenant_id, operation_id, telegram_id, service_id, change_type, idempotency_key, amount, currency, quantity))
+            self._enqueue_admin_notification_in_transaction(db, event_key="service_change",
+                idempotency_key=f"service-change-start:{operation_id}",
+                payload={"public_order_id": operation_id[:20], "amount_minor": amount, "currency": currency,
+                         "status": "pending", "customer_id": telegram_id, "reason_code": change_type})
+            if amount > 0:
+                self._enqueue_admin_notification_in_transaction(db, event_key="wallet",
+                    idempotency_key=f"service-change-wallet:{operation_id}",
+                    payload={"amount_minor": -amount, "currency": currency, "entry_type": "service_change",
+                             "customer_id": telegram_id, "status": "debited"})
             db.commit()
             return {"operation_id": operation_id, "telegram_id": telegram_id, "service_id": service_id,
                     "change_type": change_type, "amount_minor": amount, "currency": currency,
@@ -1985,6 +2442,11 @@ class CustomerDataStore:
                 raise CustomerStoreError("Customer service disappeared before finalization")
             db.execute("UPDATE customer_service_operations SET status='completed',updated_at=CURRENT_TIMESTAMP WHERE tenant_id=? AND operation_id=?",
                        (self.tenant_id, operation_id))
+            self._enqueue_admin_notification_in_transaction(db, event_key="service_change",
+                idempotency_key=f"service-change-complete:{operation_id}",
+                payload={"public_order_id": operation_id[:20], "amount_minor": int(op["amount_minor"]),
+                         "currency": str(op["currency"]), "status": "completed",
+                         "customer_id": int(op["telegram_id"]), "reason_code": str(op["change_type"])})
             db.commit()
         except Exception:
             db.rollback()
@@ -2012,12 +2474,108 @@ class CustomerDataStore:
                             int(op["amount_minor"]), op["currency"], operation_id, reason_code[:100]))
             db.execute("UPDATE customer_service_operations SET status='refunded',updated_at=CURRENT_TIMESTAMP WHERE tenant_id=? AND operation_id=?",
                        (self.tenant_id, operation_id))
+            self._enqueue_admin_notification_in_transaction(db, event_key="service_change",
+                idempotency_key=f"service-change-refund:{operation_id}",
+                payload={"public_order_id": operation_id[:20], "amount_minor": int(op["amount_minor"]),
+                         "currency": str(op["currency"]), "status": "refunded",
+                         "customer_id": int(op["telegram_id"]), "reason_code": reason_code[:80]})
+            if int(op["amount_minor"]) > 0:
+                self._enqueue_admin_notification_in_transaction(db, event_key="wallet",
+                    idempotency_key=f"service-change-refund-wallet:{operation_id}",
+                    payload={"amount_minor": int(op["amount_minor"]), "currency": str(op["currency"]),
+                             "entry_type": "refund", "customer_id": int(op["telegram_id"]),
+                             "status": "credited"})
             db.commit()
         except Exception:
             db.rollback()
             raise
         finally:
             db.close()
+
+    def resolve_service_change_target_present(self, *, operation_id: str, actor_telegram_id: int,
+                                              comparison: str, observed_value: Any,
+                                              identity_verified: bool, reason: str) -> dict[str, Any]:
+        """Finalize only from a fresh identity-matched target read; record immutable operator evidence."""
+        reason = reason.strip()
+        if not 1 <= len(reason) <= 500:
+            raise CustomerStoreError("A decision reason of 1..500 characters is required")
+        if comparison != "target_present" or identity_verified is not True:
+            raise CustomerStoreError("Only a fresh identity-verified target_present result can be finalized")
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            op = db.execute("SELECT * FROM customer_service_operations WHERE tenant_id=? AND operation_id=?",
+                            (self.tenant_id, operation_id)).fetchone()
+            if not op:
+                raise CustomerStoreError("Service-change operation not found")
+            prior = db.execute("SELECT * FROM customer_service_operation_events WHERE tenant_id=? AND operation_id=?",
+                               (self.tenant_id, operation_id)).fetchone()
+            if prior:
+                if (int(prior["actor_telegram_id"]) == int(actor_telegram_id)
+                    and prior["reason"] == reason
+                    and prior["observed_value"] == str(observed_value)):
+                    db.commit()
+                    return {**dict(prior), "idempotent_replay": True}
+                raise CustomerStoreError("A final decision is already recorded for this operation")
+            if op["status"] != "pending" and not str(op["status"]).startswith("reconcile_required:"):
+                raise CustomerStoreError("Operation is not eligible for reconciliation finalization")
+            if op["change_type"] == "renewal":
+                from datetime import datetime, timezone
+                target = op["target_expires_at"]
+                if not target:
+                    raise CustomerStoreError("Stored target expiry is missing")
+                def norm(value: str) -> str:
+                    dt = datetime.fromisoformat(value)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+                try:
+                    matches = norm(str(observed_value)) == norm(str(target))
+                except (TypeError, ValueError):
+                    matches = False
+                if not matches:
+                    raise CustomerStoreError("Observed expiry does not match the persisted target")
+                service_update = ("UPDATE customer_services SET expires_at=?,status='active',updated_at=CURRENT_TIMESTAMP "
+                                  "WHERE tenant_id=? AND service_id=? AND telegram_id=?")
+                update_args = (target, self.tenant_id, op["service_id"], op["telegram_id"])
+            else:
+                target = op["target_traffic_limit_bytes"]
+                try:
+                    matches = target is not None and int(observed_value) == int(target)
+                except (TypeError, ValueError):
+                    matches = False
+                if not matches:
+                    raise CustomerStoreError("Observed traffic limit does not match the persisted target")
+                service_update = ("UPDATE customer_services SET traffic_limit_bytes=?,status='active',updated_at=CURRENT_TIMESTAMP "
+                                  "WHERE tenant_id=? AND service_id=? AND telegram_id=?")
+                update_args = (int(target), self.tenant_id, op["service_id"], op["telegram_id"])
+            cur = db.execute(service_update, update_args)
+            if cur.rowcount != 1:
+                raise CustomerStoreError("Customer service disappeared before reconciliation finalization")
+            db.execute("""INSERT INTO customer_service_operation_events
+                (tenant_id,operation_id,event_type,actor_telegram_id,comparison,observed_value,reason)
+                VALUES(?,?,'operator_finalized_target_present',?,'target_present',?,?)""",
+                (self.tenant_id, operation_id, int(actor_telegram_id), str(observed_value), reason))
+            db.execute("""UPDATE customer_service_operations SET status='completed',updated_at=CURRENT_TIMESTAMP
+                WHERE tenant_id=? AND operation_id=?""", (self.tenant_id, operation_id))
+            db.commit()
+            return {"operation_id": operation_id, "event_type": "operator_finalized_target_present",
+                    "actor_telegram_id": int(actor_telegram_id), "comparison": comparison,
+                    "observed_value": str(observed_value), "reason": reason, "idempotent_replay": False}
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def list_service_change_events(self, operation_id: str) -> list[dict[str, Any]]:
+        """Read tenant-scoped immutable final-decision events."""
+        with self._connect() as db:
+            rows = db.execute("""SELECT event_id,operation_id,event_type,actor_telegram_id,comparison,
+                observed_value,reason,created_at FROM customer_service_operation_events
+                WHERE tenant_id=? AND operation_id=? ORDER BY event_id""",
+                (self.tenant_id, operation_id)).fetchall()
+        return [dict(row) for row in rows]
 
     def flag_service_change_reconciliation(self, *, operation_id: str, reason_code: str) -> None:
         with self._connect() as db:
@@ -2027,20 +2585,13 @@ class CustomerDataStore:
             if cur.rowcount != 1:
                 raise CustomerStoreError("Service-change operation is not pending")
 
-    def list_service_change_operations(self, *, status: str = "reconcile_required", limit: int = 30) -> list[dict[str, Any]]:
+    def list_service_change_operations(self, *, status: str = "reconcile_required", limit: int = 30,
+                                       telegram_id: int | None = None) -> list[dict[str, Any]]:
         """List tenant-scoped service changes without exposing panel credentials or subscription URLs."""
         if status not in {"pending", "reconcile_required", "completed", "refunded", "all"}:
             raise CustomerStoreError("Unsupported service-operation status filter")
         limit = max(1, min(int(limit), 100))
         with self._connect() as db:
-            exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='customer_service_operations'").fetchone()
-            if not exists:
-                return []
-            columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(customer_service_operations)").fetchall()}
-            for column, definition in (("before_expires_at", "TEXT"), ("before_traffic_limit_bytes", "INTEGER"),
-                                       ("target_expires_at", "TEXT"), ("target_traffic_limit_bytes", "INTEGER")):
-                if column not in columns:
-                    db.execute(f"ALTER TABLE customer_service_operations ADD COLUMN {column} {definition}")
             query = """SELECT o.operation_id,o.telegram_id,o.service_id,o.change_type,o.amount_minor,
                 o.currency,o.quantity,o.status,o.created_at,o.updated_at,o.before_expires_at,
                 o.before_traffic_limit_bytes,o.target_expires_at,o.target_traffic_limit_bytes,s.username,s.product_id,
@@ -2048,6 +2599,9 @@ class CustomerDataStore:
                 LEFT JOIN customer_services s ON s.tenant_id=o.tenant_id AND s.service_id=o.service_id
                 WHERE o.tenant_id=?"""
             params: list[Any] = [self.tenant_id]
+            if telegram_id is not None:
+                query += " AND o.telegram_id=?"
+                params.append(int(telegram_id))
             if status == "reconcile_required":
                 query += " AND o.status LIKE 'reconcile_required:%'"
             elif status != "all":
@@ -2060,14 +2614,6 @@ class CustomerDataStore:
     def get_service_change_operation(self, operation_id: str) -> dict[str, Any] | None:
         """Return a single tenant-scoped operation summary for admin review."""
         with self._connect() as db:
-            exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='customer_service_operations'").fetchone()
-            if not exists:
-                return None
-            columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(customer_service_operations)").fetchall()}
-            for column, definition in (("before_expires_at", "TEXT"), ("before_traffic_limit_bytes", "INTEGER"),
-                                       ("target_expires_at", "TEXT"), ("target_traffic_limit_bytes", "INTEGER")):
-                if column not in columns:
-                    db.execute(f"ALTER TABLE customer_service_operations ADD COLUMN {column} {definition}")
             row = db.execute("""SELECT o.operation_id,o.telegram_id,o.service_id,o.change_type,
                 o.idempotency_key,o.amount_minor,o.currency,o.quantity,o.status,o.created_at,o.updated_at,
                 o.before_expires_at,o.before_traffic_limit_bytes,o.target_expires_at,o.target_traffic_limit_bytes,
@@ -2667,11 +3213,459 @@ class CustomerDataStore:
                        (self.tenant_id, ticket_id, telegram_id, subject[:256]))
             db.execute("INSERT INTO customer_ticket_messages(tenant_id,ticket_id,sender_type,body) VALUES(?,?, 'customer', ?)",
                        (self.tenant_id, ticket_id, first_message[:4000]))
+            now = time.time()
+            db.execute("""INSERT OR IGNORE INTO customer_ticket_notifications
+                (tenant_id,ticket_id,status,attempts,available_at,created_at)
+                VALUES(?,?,'pending',0,?,?)""", (self.tenant_id, ticket_id, now, now))
             db.commit()
         except Exception:
             db.rollback(); raise
         finally:
             db.close()
+
+    def claim_customer_ticket_notifications(self, *, limit: int = 20, now: float | None = None,
+                                            lease_seconds: int = 300) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise CustomerStoreError("Ticket notification batch limit must be between 1 and 100")
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or not 30 <= lease_seconds <= 3600:
+            raise CustomerStoreError("Ticket notification lease must be between 30 and 3600 seconds")
+        ts = time.time() if now is None else float(now)
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""UPDATE customer_ticket_notifications SET status='pending',claimed_at=NULL,available_at=?
+                WHERE tenant_id=? AND status='processing' AND claimed_at IS NOT NULL AND claimed_at<=?""",
+                (ts, self.tenant_id, ts - lease_seconds))
+            rows = db.execute("""SELECT n.notification_id,n.ticket_id,n.attempts,t.telegram_id,t.subject,t.status AS ticket_status,
+                    t.created_at,u.username,u.first_name,m.body
+                FROM customer_ticket_notifications n
+                JOIN customer_tickets t ON t.tenant_id=n.tenant_id AND t.ticket_id=n.ticket_id
+                LEFT JOIN customer_users u ON u.tenant_id=t.tenant_id AND u.telegram_id=t.telegram_id
+                LEFT JOIN customer_ticket_messages m ON m.message_id=(SELECT MIN(m2.message_id) FROM customer_ticket_messages m2
+                    WHERE m2.tenant_id=t.tenant_id AND m2.ticket_id=t.ticket_id)
+                WHERE n.tenant_id=? AND n.status='pending' AND n.available_at<=?
+                ORDER BY n.notification_id LIMIT ?""", (self.tenant_id, ts, limit)).fetchall()
+            claimed = []
+            for row in rows:
+                cur = db.execute("""UPDATE customer_ticket_notifications SET status='processing',attempts=attempts+1,claimed_at=?
+                    WHERE tenant_id=? AND notification_id=? AND status='pending'""",
+                    (ts, self.tenant_id, row["notification_id"]))
+                if cur.rowcount == 1:
+                    item = dict(row); item["attempts"] = int(row["attempts"]) + 1; claimed.append(item)
+            db.commit(); return claimed
+        except Exception:
+            db.rollback(); raise
+        finally:
+            db.close()
+
+    def mark_customer_ticket_notification_sent(self, notification_id: int, *, now: float | None = None) -> None:
+        ts = time.time() if now is None else float(now)
+        with self._connect() as db:
+            cur = db.execute("""UPDATE customer_ticket_notifications SET status='sent',sent_at=?,claimed_at=NULL,last_error_code=NULL
+                WHERE tenant_id=? AND notification_id=? AND status='processing'""", (ts, self.tenant_id, notification_id))
+            if cur.rowcount != 1:
+                raise CustomerStoreError("Ticket notification is not in processing state")
+
+    def retry_customer_ticket_notification(self, notification_id: int, *, attempt: int, error_code: str,
+                                           now: float | None = None, max_attempts: int = 8) -> str:
+        if not error_code or len(error_code) > 80 or any(ch.isspace() for ch in error_code):
+            raise CustomerStoreError("Ticket notification error code must be short and non-sensitive")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise CustomerStoreError("Invalid ticket notification attempt")
+        ts = time.time() if now is None else float(now)
+        status = "dead" if attempt >= max_attempts else "pending"
+        available = ts if status == "dead" else ts + min(3600, 2 ** min(attempt, 10))
+        with self._connect() as db:
+            cur = db.execute("""UPDATE customer_ticket_notifications SET status=?,available_at=?,claimed_at=NULL,last_error_code=?
+                WHERE tenant_id=? AND notification_id=? AND status='processing'""",
+                (status, available, error_code, self.tenant_id, notification_id))
+            if cur.rowcount != 1:
+                raise CustomerStoreError("Ticket notification is not in processing state")
+        return status
+
+    def get_customer_ticket_notification(self, ticket_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute("""SELECT notification_id,ticket_id,status,attempts,available_at,created_at,
+                claimed_at,sent_at,last_error_code FROM customer_ticket_notifications
+                WHERE tenant_id=? AND ticket_id=?""", (self.tenant_id, ticket_id)).fetchone()
+        return dict(row) if row else None
+
+    def retry_customer_ticket_notification_now(self, ticket_id: str) -> bool:
+        with self._connect() as db:
+            cur = db.execute("""UPDATE customer_ticket_notifications SET status='pending',attempts=0,
+                available_at=?,claimed_at=NULL,last_error_code=NULL
+                WHERE tenant_id=? AND ticket_id=? AND status='dead'""",
+                (time.time(), self.tenant_id, ticket_id))
+            return cur.rowcount == 1
+
+    def get_backup_policy(self) -> dict[str, Any]:
+        defaults: dict[str, Any] = {
+            "tenant_id": self.tenant_id, "enabled": 0, "frequency": "daily",
+            "timezone_name": "UTC", "local_time": "03:00", "interval_minutes": 1440,
+            "destination": "local", "local_directory": "/var/lib/anubis-bot/backups",
+            "telegram_chat_id": None, "telegram_topic_id": 0, "retention_count": 14,
+            "retention_days": 30, "last_run_at": None, "last_status": "never",
+            "last_error_code": None, "next_run_at": None, "updated_by": None,
+            "updated_at": None,
+        }
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM customer_backup_policies WHERE tenant_id=?",
+                             (self.tenant_id,)).fetchone()
+        if row:
+            defaults.update(dict(row))
+        return defaults
+
+    def update_backup_policy(self, *, frequency: str, timezone_name: str, local_time: str,
+                             interval_minutes: int, destination: str, local_directory: str,
+                             telegram_chat_id: int | None, telegram_topic_id: int,
+                             retention_count: int, retention_days: int,
+                             updated_by: int) -> dict[str, Any]:
+        if isinstance(updated_by, bool) or not isinstance(updated_by, int) or updated_by <= 0:
+            raise CustomerStoreError("Invalid administrator ID")
+        try:
+            policy = validate_backup_policy(
+                frequency=frequency, timezone_name=timezone_name, local_time=local_time,
+                interval_minutes=interval_minutes, destination=destination,
+                local_directory=local_directory, telegram_chat_id=telegram_chat_id,
+                telegram_topic_id=telegram_topic_id, retention_count=retention_count,
+                retention_days=retention_days,
+            )
+        except BackupPolicyError as exc:
+            raise CustomerStoreError(str(exc)) from None
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute("""INSERT INTO customer_backup_policies
+                    (tenant_id,enabled,frequency,timezone_name,local_time,interval_minutes,
+                     destination,local_directory,telegram_chat_id,telegram_topic_id,
+                     retention_count,retention_days,last_status,updated_by,updated_at)
+                    VALUES(?,0,?,?,?,?,?,?,?,?,?,?,'never',?,CURRENT_TIMESTAMP)
+                    ON CONFLICT(tenant_id) DO UPDATE SET
+                     enabled=0,frequency=excluded.frequency,timezone_name=excluded.timezone_name,
+                     local_time=excluded.local_time,interval_minutes=excluded.interval_minutes,
+                     destination=excluded.destination,local_directory=excluded.local_directory,
+                     telegram_chat_id=excluded.telegram_chat_id,telegram_topic_id=excluded.telegram_topic_id,
+                     retention_count=excluded.retention_count,retention_days=excluded.retention_days,
+                     next_run_at=NULL,updated_by=excluded.updated_by,updated_at=CURRENT_TIMESTAMP""",
+                    (self.tenant_id, policy["frequency"], policy["timezone_name"], policy["local_time"],
+                     policy["interval_minutes"], policy["destination"], policy["local_directory"],
+                     policy["telegram_chat_id"], policy["telegram_topic_id"], policy["retention_count"],
+                     policy["retention_days"], updated_by))
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+        return self.get_backup_policy()
+
+    NOTIFICATION_EVENT_KEYS = frozenset({
+        "support_ticket", "purchase", "payment", "service_test", "bot_log", "backup",
+        "wallet", "service_change", "security_alert",
+    })
+
+    ADMIN_NOTIFICATION_EVENT_KEYS = frozenset({
+        "purchase", "payment", "service_test", "bot_log", "backup",
+        "wallet", "service_change", "security_alert",
+    })
+
+    def _admin_notification_payload(self, event_key: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Allowlist low-risk fields only; never persist arbitrary event payloads."""
+        if event_key not in self.ADMIN_NOTIFICATION_EVENT_KEYS:
+            raise CustomerStoreError("Unsupported admin notification event")
+        if not isinstance(payload, dict):
+            raise CustomerStoreError("Notification payload must be an object")
+        safe: dict[str, Any] = {}
+        for key in ("public_order_id", "product_title", "status", "reason_code", "entry_type", "currency"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                value = value.strip()
+                if key == "currency":
+                    value = value.upper()
+                    if len(value) != 3 or not value.isascii() or not value.isalpha():
+                        continue
+                else:
+                    value = "".join(ch for ch in value if ch.isprintable())[:120]
+                if value:
+                    safe[key] = value
+        for key in ("amount_minor", "customer_id"):
+            value = payload.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                if key == "amount_minor" and abs(value) <= 2**63 - 1:
+                    safe[key] = value
+                elif key == "customer_id" and value > 0:
+                    safe[key] = value
+        return safe
+
+    def _snapshot_admin_notification_routes(self, db: sqlite3.Connection, notification_id: int,
+                                            event_key: str, *, now: float) -> int:
+        routes = db.execute(
+            "SELECT chat_id,topic_id FROM customer_notification_routes WHERE tenant_id=? AND event_key=? ORDER BY route_id",
+            (self.tenant_id, event_key),
+        ).fetchall()
+        for route in routes:
+            db.execute("""INSERT OR IGNORE INTO customer_admin_notification_deliveries
+                (notification_id,tenant_id,chat_id,topic_id,status,attempts,available_at)
+                VALUES(?,?,?,?,'pending',0,?)""",
+                (notification_id, self.tenant_id, int(route["chat_id"]), int(route["topic_id"]), now))
+        return len(routes)
+
+    def _enqueue_admin_notification_in_transaction(self, db: sqlite3.Connection, *, event_key: str,
+                                                    idempotency_key: str, payload: dict[str, Any],
+                                                    now: float | None = None) -> int:
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip() or len(idempotency_key) > 200:
+            raise CustomerStoreError("Admin notification idempotency key is invalid")
+        safe = self._admin_notification_payload(event_key, payload)
+        ts = time.time() if now is None else float(now)
+        encoded = json.dumps(safe, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        cur = db.execute("""INSERT OR IGNORE INTO customer_admin_notifications
+            (tenant_id,event_key,idempotency_key,payload_json,status,available_at,created_at)
+            VALUES(?,?,?,?,'pending',?,?)""",
+            (self.tenant_id, event_key, idempotency_key, encoded, ts, ts))
+        row = db.execute("""SELECT notification_id,payload_json FROM customer_admin_notifications
+            WHERE tenant_id=? AND event_key=? AND idempotency_key=?""",
+            (self.tenant_id, event_key, idempotency_key)).fetchone()
+        if row is None:
+            raise CustomerStoreError("Admin notification could not be persisted")
+        notification_id = int(row["notification_id"])
+        if cur.rowcount == 1:
+            self._snapshot_admin_notification_routes(db, notification_id, event_key, now=ts)
+        elif str(row["payload_json"]) != encoded:
+            # Same event key may be replayed only with the original safe payload.
+            raise CustomerStoreError("Admin notification idempotency key reused with different payload")
+        return notification_id
+
+    def enqueue_admin_notification(self, *, event_key: str, idempotency_key: str,
+                                   payload: dict[str, Any], now: float | None = None) -> int:
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            notification_id = self._enqueue_admin_notification_in_transaction(
+                db, event_key=event_key, idempotency_key=idempotency_key, payload=payload, now=now)
+            db.commit()
+            return notification_id
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def claim_admin_notification_deliveries(self, *, limit: int = 20, now: float | None = None,
+                                            lease_seconds: int = 300,
+                                            fallback_admin_ids: tuple[int, ...] | list[int] = ()) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise CustomerStoreError("Admin notification batch limit must be between 1 and 100")
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or not 30 <= lease_seconds <= 3600:
+            raise CustomerStoreError("Admin notification lease must be between 30 and 3600 seconds")
+        fallback = sorted({int(value) for value in fallback_admin_ids
+                           if isinstance(value, int) and not isinstance(value, bool) and value > 0})
+        ts = time.time() if now is None else float(now)
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""UPDATE customer_admin_notification_deliveries
+                SET status='pending',claimed_at=NULL,available_at=?
+                WHERE tenant_id=? AND status='processing' AND claimed_at IS NOT NULL AND claimed_at<=?""",
+                (ts, self.tenant_id, ts - lease_seconds))
+            empty = db.execute("""SELECT n.notification_id,n.event_key FROM customer_admin_notifications n
+                LEFT JOIN customer_admin_notification_deliveries d ON d.notification_id=n.notification_id
+                WHERE n.tenant_id=? AND n.status='pending' AND n.available_at<=?
+                GROUP BY n.notification_id HAVING COUNT(d.delivery_id)=0 ORDER BY n.notification_id LIMIT ?""",
+                (self.tenant_id, ts, limit)).fetchall()
+            for row in empty:
+                count = self._snapshot_admin_notification_routes(
+                    db, int(row["notification_id"]), str(row["event_key"]), now=ts)
+                if count == 0:
+                    for admin_id in fallback:
+                        db.execute("""INSERT OR IGNORE INTO customer_admin_notification_deliveries
+                            (notification_id,tenant_id,chat_id,topic_id,status,attempts,available_at)
+                            VALUES(?,?,?,0,'pending',0,?)""",
+                            (int(row["notification_id"]), self.tenant_id, admin_id, ts))
+                remaining = db.execute("SELECT COUNT(*) FROM customer_admin_notification_deliveries WHERE notification_id=?",
+                                       (int(row["notification_id"]),)).fetchone()[0]
+                if not remaining:
+                    db.execute("UPDATE customer_admin_notifications SET status='dead',last_error_code='no_destination' WHERE notification_id=?",
+                               (int(row["notification_id"]),))
+            rows = db.execute("""SELECT d.delivery_id,d.notification_id,d.chat_id,d.topic_id,d.attempts,
+                    n.event_key,n.payload_json
+                FROM customer_admin_notification_deliveries d
+                JOIN customer_admin_notifications n ON n.notification_id=d.notification_id
+                WHERE d.tenant_id=? AND d.status='pending' AND d.available_at<=? AND n.status='pending'
+                ORDER BY d.delivery_id LIMIT ?""", (self.tenant_id, ts, limit)).fetchall()
+            claimed = []
+            for row in rows:
+                cur = db.execute("""UPDATE customer_admin_notification_deliveries
+                    SET status='processing',attempts=attempts+1,claimed_at=?
+                    WHERE tenant_id=? AND delivery_id=? AND status='pending'""",
+                    (ts, self.tenant_id, int(row["delivery_id"])))
+                if cur.rowcount == 1:
+                    item = dict(row)
+                    item["attempts"] = int(row["attempts"]) + 1
+                    try:
+                        item["payload"] = json.loads(item.pop("payload_json") or "{}")
+                    except (TypeError, ValueError):
+                        item["payload"] = {}
+                    claimed.append(item)
+            db.commit()
+            return claimed
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _refresh_admin_notification_status(self, db: sqlite3.Connection, notification_id: int,
+                                           *, now: float) -> str:
+        rows = db.execute("SELECT status FROM customer_admin_notification_deliveries WHERE notification_id=?",
+                          (notification_id,)).fetchall()
+        statuses = [str(row["status"]) for row in rows]
+        if statuses and all(status == "sent" for status in statuses):
+            status, sent_at, error = "sent", now, None
+        elif any(status in {"pending", "processing"} for status in statuses):
+            status, sent_at, error = "pending", None, None
+        else:
+            status, sent_at, error = "dead", None, "delivery_failed"
+        db.execute("""UPDATE customer_admin_notifications SET status=?,sent_at=?,last_error_code=?
+            WHERE tenant_id=? AND notification_id=?""",
+            (status, sent_at, error, self.tenant_id, notification_id))
+        return status
+
+    def mark_admin_notification_delivery_sent(self, delivery_id: int, *, now: float | None = None) -> str:
+        ts = time.time() if now is None else float(now)
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT notification_id FROM customer_admin_notification_deliveries
+                WHERE tenant_id=? AND delivery_id=? AND status='processing'""",
+                (self.tenant_id, delivery_id)).fetchone()
+            if not row:
+                raise CustomerStoreError("Admin notification delivery is not processing")
+            db.execute("""UPDATE customer_admin_notification_deliveries SET status='sent',sent_at=?,
+                claimed_at=NULL,last_error_code=NULL WHERE tenant_id=? AND delivery_id=?""",
+                (ts, self.tenant_id, delivery_id))
+            status = self._refresh_admin_notification_status(db, int(row["notification_id"]), now=ts)
+            db.commit()
+            return status
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def retry_admin_notification_delivery(self, delivery_id: int, *, attempt: int, error_code: str,
+                                          now: float | None = None, max_attempts: int = 8) -> str:
+        if not error_code or len(error_code) > 80 or any(ch.isspace() for ch in error_code):
+            raise CustomerStoreError("Admin notification error code must be short and non-sensitive")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise CustomerStoreError("Invalid admin notification attempt")
+        ts = time.time() if now is None else float(now)
+        status = "dead" if attempt >= max_attempts else "pending"
+        available = ts if status == "dead" else ts + min(3600, 2 ** min(attempt, 10))
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT notification_id FROM customer_admin_notification_deliveries
+                WHERE tenant_id=? AND delivery_id=? AND status='processing'""",
+                (self.tenant_id, delivery_id)).fetchone()
+            if not row:
+                raise CustomerStoreError("Admin notification delivery is not processing")
+            db.execute("""UPDATE customer_admin_notification_deliveries SET status=?,available_at=?,
+                claimed_at=NULL,last_error_code=? WHERE tenant_id=? AND delivery_id=?""",
+                (status, available, error_code, self.tenant_id, delivery_id))
+            parent_status = self._refresh_admin_notification_status(db, int(row["notification_id"]), now=ts)
+            db.commit()
+            return parent_status
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def list_admin_notifications(self, *, status: str = "all", limit: int = 50) -> list[dict[str, Any]]:
+        if status not in {"all", "pending", "sent", "dead"}:
+            raise CustomerStoreError("Unsupported admin notification status")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise CustomerStoreError("Admin notification limit must be between 1 and 200")
+        sql = """SELECT n.notification_id,n.event_key,n.status,COALESCE(MAX(d.attempts),0) AS attempts,n.created_at,n.sent_at,n.last_error_code,
+                    COUNT(d.delivery_id) AS destination_count,
+                    SUM(CASE WHEN d.status='sent' THEN 1 ELSE 0 END) AS sent_destinations,
+                    SUM(CASE WHEN d.status='dead' THEN 1 ELSE 0 END) AS dead_destinations
+                 FROM customer_admin_notifications n LEFT JOIN customer_admin_notification_deliveries d
+                 ON d.notification_id=n.notification_id WHERE n.tenant_id=?"""
+        args: tuple[Any, ...] = (self.tenant_id,)
+        if status != "all":
+            sql += " AND n.status=?"
+            args += (status,)
+        sql += " GROUP BY n.notification_id ORDER BY n.notification_id DESC LIMIT ?"
+        args += (limit,)
+        with self._connect() as db:
+            return [dict(row) for row in db.execute(sql, args).fetchall()]
+
+    def retry_admin_notification_now(self, notification_id: int, *, now: float | None = None) -> bool:
+        ts = time.time() if now is None else float(now)
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT notification_id FROM customer_admin_notifications
+                WHERE tenant_id=? AND notification_id=? AND status='dead'""",
+                (self.tenant_id, notification_id)).fetchone()
+            if not row:
+                db.commit()
+                return False
+            db.execute("""UPDATE customer_admin_notification_deliveries SET status='pending',attempts=0,
+                available_at=?,claimed_at=NULL,last_error_code=NULL
+                WHERE tenant_id=? AND notification_id=? AND status='dead'""",
+                (ts, self.tenant_id, notification_id))
+            db.execute("""UPDATE customer_admin_notifications SET status='pending',available_at=?,
+                sent_at=NULL,last_error_code=NULL WHERE tenant_id=? AND notification_id=?""",
+                (ts, self.tenant_id, notification_id))
+            db.commit()
+            return True
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def add_notification_route(self, *, event_key: str, chat_id: int, topic_id: int = 0,
+                               created_by: int) -> dict[str, Any]:
+        if event_key not in self.NOTIFICATION_EVENT_KEYS:
+            raise CustomerStoreError("Unsupported notification event")
+        if isinstance(chat_id, bool) or not isinstance(chat_id, int) or chat_id == 0:
+            raise CustomerStoreError("Telegram chat ID must be a non-zero integer")
+        if isinstance(topic_id, bool) or not isinstance(topic_id, int) or topic_id < 0:
+            raise CustomerStoreError("Topic ID must be a non-negative integer")
+        if isinstance(created_by, bool) or not isinstance(created_by, int) or created_by <= 0:
+            raise CustomerStoreError("Invalid administrator ID")
+        with self._connect() as db:
+            db.execute("""INSERT OR IGNORE INTO customer_notification_routes
+                (tenant_id,event_key,chat_id,topic_id,created_by) VALUES(?,?,?,?,?)""",
+                (self.tenant_id,event_key,chat_id,topic_id,created_by))
+            row = db.execute("""SELECT route_id,event_key,chat_id,topic_id,created_by,created_at
+                FROM customer_notification_routes WHERE tenant_id=? AND event_key=? AND chat_id=? AND topic_id=?""",
+                (self.tenant_id,event_key,chat_id,topic_id)).fetchone()
+        return dict(row)
+
+    def remove_notification_route(self, *, event_key: str, chat_id: int, topic_id: int = 0) -> bool:
+        if event_key not in self.NOTIFICATION_EVENT_KEYS:
+            raise CustomerStoreError("Unsupported notification event")
+        with self._connect() as db:
+            cur = db.execute("""DELETE FROM customer_notification_routes
+                WHERE tenant_id=? AND event_key=? AND chat_id=? AND topic_id=?""",
+                (self.tenant_id,event_key,chat_id,topic_id))
+            return cur.rowcount == 1
+
+    def list_notification_routes(self, event_key: str | None = None) -> list[dict[str, Any]]:
+        if event_key is not None and event_key not in self.NOTIFICATION_EVENT_KEYS:
+            raise CustomerStoreError("Unsupported notification event")
+        with self._connect() as db:
+            if event_key is None:
+                rows = db.execute("""SELECT route_id,event_key,chat_id,topic_id,created_by,created_at
+                    FROM customer_notification_routes WHERE tenant_id=? ORDER BY event_key,route_id""",
+                    (self.tenant_id,)).fetchall()
+            else:
+                rows = db.execute("""SELECT route_id,event_key,chat_id,topic_id,created_by,created_at
+                    FROM customer_notification_routes WHERE tenant_id=? AND event_key=? ORDER BY route_id""",
+                    (self.tenant_id,event_key)).fetchall()
+        return [dict(row) for row in rows]
 
     def list_all_tickets(self, limit: int = 50) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 200))

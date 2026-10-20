@@ -40,6 +40,14 @@ class CustomerPurchaseServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service['subscription_url'],'https://sub.example/abc')
         self.assertEqual(self.adapter.last_user.group_ids,(1,))
 
+    async def test_purchase_idempotency_key_cannot_be_reused_for_another_product(self):
+        first = await self.service.buy_from_wallet(telegram_id=123, product_id='basic', idempotency_key='same-key', now=1000)
+        with self.assertRaisesRegex(Exception, 'different request'):
+            await self.service.buy_from_wallet(telegram_id=123, product_id='another-product', idempotency_key='same-key', now=1000)
+        self.assertEqual(self.adapter.calls, 1)
+        self.assertEqual(self.store.wallet_balance(123), 2500)
+        self.assertEqual(self.store.get_order_by_idempotency('same-key', 123)['order_id'], first.order_id)
+
     async def test_hourly_product_is_created_without_provider_expiry_or_data_cap(self):
         self.store.put_product(product_id='hour',title='Hourly',price_minor=0,pricing_mode='hourly',unit_price_minor=60,panel_id='p1',duration_hours=0,traffic_bytes=0,group_ids=['1'])
         result=await self.service.buy_from_wallet(telegram_id=123,product_id='hour',idempotency_key='buy-hour',now=1000)
@@ -151,7 +159,7 @@ class CustomerPurchaseServiceTests(unittest.IsolatedAsyncioTestCase):
         self.store.put_discount_code(code='SAVE20',percentage=20)
         await self.service.buy_from_wallet(telegram_id=123,product_id='basic',
             idempotency_key='buy-idem-discount',discount_code='SAVE10',now=1000)
-        with self.assertRaisesRegex(Exception,'different discount code'):
+        with self.assertRaisesRegex(Exception,'different request'):
             await self.service.buy_from_wallet(telegram_id=123,product_id='basic',
                 idempotency_key='buy-idem-discount',discount_code='SAVE20',now=1000)
         self.assertEqual(self.adapter.calls,1)

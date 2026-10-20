@@ -40,6 +40,33 @@ class PanelCapabilities:
     sync: bool = False
 
 
+def local_capability_report(provider: str, operations: dict[str, bool], *,
+                            validation_error_type: str | None = None) -> dict[str, Any]:
+    """Describe local adapter method surface without implying provider permission.
+
+    A method implemented in this repository is not evidence that the deployed panel
+    version accepts the endpoint or that the configured credential is authorized.
+    """
+    report_operations: dict[str, dict[str, Any]] = {}
+    for name, method_present in operations.items():
+        report_operations[name] = {
+            "status": "unknown" if method_present else "unsupported",
+            "adapter_method_present": bool(method_present),
+            "panel_permission": "unknown" if method_present else "not_applicable",
+            "live_test": "not_tested" if method_present else "not_applicable",
+        }
+    report: dict[str, Any] = {
+        "provider": provider,
+        "evidence_level": "local_adapter_surface_only",
+        "live_panel_verified": False,
+        "connection_validation": "failed" if validation_error_type else "passed",
+        "operations": report_operations,
+    }
+    if validation_error_type:
+        report["error_type"] = validation_error_type
+    return report
+
+
 @dataclass(frozen=True, slots=True)
 class UserCreate:
     username: str

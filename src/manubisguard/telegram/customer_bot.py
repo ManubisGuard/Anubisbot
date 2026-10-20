@@ -11,6 +11,7 @@ from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from manubisguard.telegram.control_bot import TelegramAPIError, TelegramBotAPI
 from manubisguard.telegram.content_admin import (
@@ -21,6 +22,7 @@ from manubisguard.telegram.subscription_qr import (
     SubscriptionQRError, make_subscription_qr_png, validate_subscription_url,
 )
 from manubisguard.customer_store import CustomerDataStore, CustomerStoreError
+from manubisguard.backup_policy import next_scheduled_run
 from manubisguard.panels.registry import default_registry
 from manubisguard.sales.service import CustomerPurchaseService, CustomerServiceChangeService, PurchaseNeedsReconciliation
 from manubisguard.sales.billing_worker import CustomerBillingWorker
@@ -31,6 +33,19 @@ from manubisguard.resellers.service import PurchaseError, ResellerPurchaseServic
 from manubisguard.notifications.trust_channel import (SQLiteNotificationOutbox, TrustChannelDeliveryWorker, TrustEvent)
 
 LOG = logging.getLogger("manubisguard.telegram.customer_bot")
+
+
+def _customer_webapp_url() -> str | None:
+    value = os.environ.get("MANUBIS_CUSTOMER_WEBAPP_URL", "").strip()
+    if not value or len(value) > 2048 or any(ord(ch) < 32 for ch in value):
+        return None
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+            return None
+    except ValueError:
+        return None
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +95,36 @@ ADMIN_MENU = {"inline_keyboard": [
     [{"text":"⬅️ بازگشت به منوی مشتری","callback_data":"customer:home"}],
 ]}
 BACK_MENU = {"inline_keyboard": [[{"text": "⬅️ منوی اصلی", "callback_data": "customer:home", "style": "primary"}]]}
+
+
+def _provider_freshness_text(provider_checked_at: str | None, *, now: datetime | None = None) -> str:
+    """Describe snapshot age without treating a missing or malformed timestamp as fresh."""
+    if not provider_checked_at:
+        return "⚪ تازگی اطلاعات: هنوز از پنل بررسی نشده است."
+    raw = str(provider_checked_at).strip()
+    try:
+        checked = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if checked.tzinfo is None:
+            # SQLite CURRENT_TIMESTAMP values are UTC timestamps without an offset.
+            checked = checked.replace(tzinfo=timezone.utc)
+        checked = checked.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return "⚪ تازگی اطلاعات: زمان آخرین بررسی قابل تشخیص نیست؛ از پنل به‌روزرسانی کنید."
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    age_seconds = (current.astimezone(timezone.utc) - checked).total_seconds()
+    if age_seconds < -300:
+        return "⚠️ تازگی اطلاعات: ساعت ثبت بررسی با ساعت فعلی سازگار نیست؛ دوباره از پنل بررسی کنید."
+    if age_seconds < 0:
+        age_seconds = 0
+    if age_seconds <= 15 * 60:
+        return "🟢 تازگی اطلاعات: بررسی پنل در ۱۵ دقیقه اخیر ثبت شده است."
+    if age_seconds <= 24 * 60 * 60:
+        age_minutes = max(1, int(age_seconds // 60))
+        return f"🟡 تازگی اطلاعات: حدود {age_minutes} دقیقه از بررسی پنل گذشته است."
+    age_hours = int(age_seconds // 3600)
+    return f"🔴 تازگی اطلاعات: حدود {age_hours} ساعت از بررسی پنل گذشته؛ داده‌ها قدیمی‌اند."
 
 PAGES = {
     "shop": ("🛍 فروشگاه و خرید سرویس", "محصولات فعال از کاتالوگ مدیر نمایش داده می‌شوند. خریدهای کیف پولی پس از تأیید اتصال پنل ثبت می‌شوند."),
@@ -208,7 +253,13 @@ class CustomerBot:
             if style:
                 item["style"] = style
             rows.append([item])
-        add("menu_miniapp_enabled", "menu_miniapp", "customer:miniapp", "primary")
+        if _enabled(self.content, "menu_miniapp_enabled"):
+            miniapp_label = content_value(self.content, "menu_miniapp", "📱 ورود به مینی‌اپلیکیشن")
+            miniapp_url = _customer_webapp_url()
+            if miniapp_url:
+                rows.append([{"text": miniapp_label, "web_app": {"url": miniapp_url}, "style": "primary"}])
+            else:
+                rows.append([{"text": miniapp_label, "callback_data": "customer:miniapp", "style": "primary"}])
         customer_row: list[dict[str, Any]] = []
         if _enabled(self.content, "menu_trials_enabled"):
             customer_row.append({"text": content_value(self.content, "menu_trials", "🧪 تست سرویس‌ها"),
@@ -273,6 +324,116 @@ class CustomerBot:
         uid = user.get("id")
         return isinstance(uid, int) and uid in self.config.admin_ids and chat.get("type") == "private" and chat.get("id") == uid
 
+    async def _deliver_manual_delivery_notifications(self, *, now: float | None = None,
+                                                       limit: int = 20) -> dict[str, int]:
+        """Drain the durable customer-delivery queue; retries are at-least-once."""
+        counts = {"sent": 0, "retry": 0, "dead": 0}
+        for item in self.data.claim_manual_delivery_notifications(limit=limit, now=now):
+            try:
+                target = int(item["telegram_id"])
+                title = str(item.get("product_title_snapshot") or item["product_id"])
+                body = (f"✅ سفارش دیجیتال شما تحویل شد.\nمحصول: {title}\n"
+                        f"شناسه سفارش: {item['order_id']}\n\nاطلاعات تحویل:\n{item['delivery_payload']}")
+                await self.api.send_text(target, body,
+                    self._customer_menu(customer_id=target, include_admin=False))
+                self.data.mark_manual_delivery_notification_sent(item["notification_id"], now=now)
+                counts["sent"] += 1
+            except Exception as exc:
+                code = type(exc).__name__.lower()
+                try:
+                    status = self.data.retry_manual_delivery_notification(
+                        item["notification_id"], attempt=int(item["attempts"]),
+                        error_code=code, now=now, max_attempts=8)
+                    counts["dead" if status == "dead" else "retry"] += 1
+                except Exception as state_exc:
+                    LOG.error("Manual delivery notification state update failed for order %s (%s)",
+                              item["order_id"], type(state_exc).__name__)
+                LOG.warning("Manual delivery notification failed for order %s (%s)",
+                            item["order_id"], type(exc).__name__)
+        return counts
+
+    async def _deliver_admin_notifications(self, *, now: float | None = None, limit: int = 20) -> dict[str, int]:
+        """Deliver shared admin events one destination at a time; successful routes are never retried."""
+        counts = {"sent": 0, "retry": 0, "dead": 0}
+        items = self.data.claim_admin_notification_deliveries(
+            limit=limit, now=now, fallback_admin_ids=tuple(self.config.admin_ids))
+        labels = {
+            "purchase": "خرید جدید", "payment": "وضعیت پرداخت", "service_test": "تست سرویس",
+            "bot_log": "گزارش ربات", "backup": "وضعیت بک‌آپ", "wallet": "تغییر کیف پول",
+            "service_change": "تغییر سرویس", "security_alert": "هشدار امنیتی",
+        }
+        for item in items:
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            event_key = str(item["event_key"])
+            lines = [f"📣 {labels.get(event_key, 'اعلان مدیریتی')}", f"رویداد: {event_key}"]
+            if payload.get("public_order_id"):
+                lines.append(f"شناسه: {payload['public_order_id']}")
+            if payload.get("product_title"):
+                lines.append(f"محصول: {payload['product_title']}")
+            if payload.get("customer_id"):
+                lines.append(f"شناسه کاربر: {payload['customer_id']}")
+            if payload.get("amount_minor") is not None and payload.get("currency"):
+                lines.append(f"مبلغ: {payload['amount_minor']} {payload['currency']}")
+            if payload.get("entry_type"):
+                lines.append(f"نوع تراکنش: {payload['entry_type']}")
+            if payload.get("status"):
+                lines.append(f"وضعیت: {payload['status']}")
+            if payload.get("reason_code"):
+                lines.append(f"کد علت: {payload['reason_code']}")
+            target = int(item["chat_id"])
+            topic_id = int(item["topic_id"]) or None
+            try:
+                keyboard = ADMIN_MENU if target in self.config.admin_ids and topic_id is None else None
+                await self.api.send_text(target, "\n".join(lines), keyboard, message_thread_id=topic_id)
+                self.data.mark_admin_notification_delivery_sent(int(item["delivery_id"]), now=now)
+                counts["sent"] += 1
+            except Exception as exc:
+                code = type(exc).__name__.lower()
+                try:
+                    status = self.data.retry_admin_notification_delivery(
+                        int(item["delivery_id"]), attempt=int(item["attempts"]),
+                        error_code=code, now=now, max_attempts=8)
+                    counts["dead" if status == "dead" else "retry"] += 1
+                except Exception as state_exc:
+                    LOG.error("Admin notification state update failed (%s)", type(state_exc).__name__)
+                LOG.warning("Admin notification delivery failed for event %s (%s)",
+                            event_key, type(exc).__name__)
+        return counts
+
+    async def _deliver_customer_ticket_notifications(self, *, now: float | None = None, limit: int = 20) -> dict[str, int]:
+        """Deliver durable Mini App and Telegram support tickets to configured bot admins."""
+        counts = {"sent": 0, "retry": 0, "dead": 0, "no_admin": 0}
+        for item in self.data.claim_customer_ticket_notifications(limit=limit, now=now):
+            try:
+                routes = self.data.list_notification_routes("support_ticket")
+                targets = [(int(route["chat_id"]), int(route["topic_id"]) or None) for route in routes]
+                if not targets:
+                    targets = [(admin_id, None) for admin_id in sorted(self.config.admin_ids)]
+                if not targets:
+                    counts["no_admin"] += 1
+                    self.data.retry_customer_ticket_notification(item["notification_id"], attempt=item["attempts"],
+                        error_code="admin_destination_missing", now=now)
+                    continue
+                username = ("@" + str(item["username"])) if item.get("username") else "بدون نام کاربری"
+                body = (f"🎫 تیکت پشتیبانی جدید\nشناسه: {item['ticket_id']}\nعنوان: {item['subject']}\n"
+                        f"کاربر: {item['telegram_id']} ({username})\nوضعیت: {item['ticket_status']}\n\n"
+                        f"{str(item.get('body') or '')[:3000]}\n\nپاسخ در گفت‌وگوی خصوصی ربات: /reply {item['ticket_id']} | متن پاسخ")
+                for target_chat, topic_id in targets:
+                    keyboard = ADMIN_MENU if target_chat in self.config.admin_ids and topic_id is None else None
+                    await self.api.send_text(target_chat, body, keyboard, message_thread_id=topic_id)
+                self.data.mark_customer_ticket_notification_sent(item["notification_id"], now=now)
+                counts["sent"] += 1
+            except Exception as exc:
+                code = type(exc).__name__.lower()
+                try:
+                    status = self.data.retry_customer_ticket_notification(item["notification_id"],
+                        attempt=int(item["attempts"]), error_code=code, now=now, max_attempts=8)
+                    counts["dead" if status == "dead" else "retry"] += 1
+                except Exception as state_exc:
+                    LOG.error("Support ticket notification state update failed (%s)", type(state_exc).__name__)
+                LOG.warning("Support ticket notification failed for %s (%s)", item.get("ticket_id"), type(exc).__name__)
+        return counts
+
     async def _handle_message(self, message: dict[str, Any]) -> None:
         chat = message.get("chat") or {}
         user = message.get("from") or {}
@@ -321,6 +482,33 @@ class CustomerBot:
                         return
         LOG.info("Customer command received: %s", command or "[non-text]")
         menu = self._customer_menu(customer_id=uid)
+        if command == "/my-service-operations":
+            try:
+                operations = self.data.list_service_change_operations(status="all", limit=10, telegram_id=int(uid))
+                lines = ["🧾 پیگیری تمدید و افزایش حجم سرویس‌ها"]
+                status_labels = {
+                    "pending": "در حال بررسی؛ تا تعیین تکلیف دوباره تلاش نکنید",
+                    "completed": "تکمیل‌شده",
+                    "refunded": "بازپرداخت‌شده",
+                }
+                for op in operations:
+                    raw_status = str(op["status"])
+                    if raw_status.startswith("reconcile_required:"):
+                        status_label = "نیازمند بررسی پشتیبانی؛ دوباره تلاش نکنید"
+                    else:
+                        status_label = status_labels.get(raw_status, "نامشخص")
+                    kind = "تمدید" if op["change_type"] == "renewal" else "افزایش حجم"
+                    lines.append(
+                        f"\n• شناسه: {op['operation_id']}\nنوع: {kind} | وضعیت: {status_label}\n"
+                        f"مبلغ: {int(op['amount_minor']):,} {op['currency']} | ثبت: {op['created_at']}"
+                    )
+                if not operations:
+                    lines.append("هنوز عملیات تمدید یا افزایش حجمی برای حساب شما ثبت نشده است.")
+                lines.append("\nاین بخش فقط وضعیت ثبت‌شده را نشان می‌دهد و عملیات پنل یا پرداخت را تکرار نمی‌کند.")
+                await self.api.send_text(chat_id, "\n".join(lines), menu)
+            except CustomerStoreError:
+                await self.api.send_text(chat_id, "فعلاً امکان خواندن وضعیت عملیات وجود ندارد؛ بعداً دوباره بررسی کنید.", menu)
+            return
         if command == "/deposit-info":
             payload = text.partition(" ")[2].strip()
             if is_admin and payload.startswith("set "):
@@ -515,7 +703,7 @@ class CustomerBot:
                     "before_present": "پنل هنوز مقدار قبل از تغییر را نشان می‌دهد.",
                     "different": "مقدار پنل با مقدار قبل و هدف ذخیره‌شده متفاوت است.",
                     "target_not_persisted": "مقدار هدف پیش از درخواست پنل ذخیره نشده؛ مقایسه امن ممکن نیست.",
-                    "provider_not_enabled": "مقایسه خواندنی فعلاً فقط برای PasarGuard فعال است.",
+                    "provider_unsupported": "مقایسه خواندنی برای این نوع پنل پیاده‌سازی نشده است.",
                     "identity_missing": "شناسه کاربر پنل در رکورد موجود نیست.",
                     "identity_mismatch": "شناسه کاربر برگشتی پنل با رکورد محلی تطبیق ندارد.",
                     "observed_unknown": "پنل مقدار قابل مقایسه برنگرداند.",
@@ -539,6 +727,192 @@ class CustomerBot:
                 await self.api.send_text(chat_id, "\n".join(lines), ADMIN_MENU)
             except CustomerStoreError as exc:
                 await self.api.send_text(chat_id, f"بررسی انجام نشد: {exc}", ADMIN_MENU)
+            return
+        if is_admin and command == "/service-operation-finalize":
+            fields = text.partition(" ")[2].split("|", 1)
+            if len(fields) != 2 or not fields[0].strip() or not fields[1].strip():
+                await self.api.send_text(chat_id,
+                    "فرمت: /service-operation-finalize OPERATION_ID | دلیل تصمیم", ADMIN_MENU)
+                return
+            operation_id, reason = fields[0].strip(), fields[1].strip()
+            try:
+                checker = CustomerServiceChangeService(
+                    self.data, secret_resolver=self._resolve_panel_secret, registry=self.registry)
+                result = await checker.finalize_target_present(
+                    operation_id=operation_id, actor_telegram_id=int(uid), reason=reason)
+                replay = " (درخواست تکراریِ بی‌اثر)" if result.get("idempotent_replay") else ""
+                await self.api.send_text(chat_id,
+                    f"ثبت شد{replay}: عملیات {operation_id} نهایی شد؛ مقایسه تازه و تطبیق هویت پنل هر دو target_present بودند. "
+                    f"مدیر: {uid}. دلیل: {reason}. وجه مسترد یا عملیات پنل تکرار نشد.",
+                    ADMIN_MENU)
+            except CustomerStoreError as exc:
+                await self.api.send_text(chat_id, f"نهایی‌سازی انجام نشد؛ عملیات و رزرو وجه حفظ شدند: {exc}", ADMIN_MENU)
+            return
+        if is_admin and command == "/backup-policy":
+            payload = text.partition(" ")[2].strip()
+            parts = payload.split(maxsplit=1)
+            action = parts[0].lower() if parts else "show"
+            policy = self.data.get_backup_policy()
+            if action == "show":
+                try:
+                    preview = next_scheduled_run(now=datetime.now(timezone.utc),
+                        frequency=policy["frequency"], timezone_name=policy["timezone_name"],
+                        local_time=policy["local_time"], interval_minutes=int(policy["interval_minutes"]))
+                    next_line = f"نوبت بعدی طبق برنامه: {preview.isoformat()} (UTC)"
+                except (ValueError, TypeError):
+                    next_line = "نوبت بعدی: برنامه نیاز به اصلاح دارد."
+                destination_line = (f"{policy['destination']} | chat={policy['telegram_chat_id'] or '—'}"
+                    f" | topic={policy['telegram_topic_id'] or 'بدون تاپیک'}")
+                await self.api.send_text(chat_id,
+                    "🗄 سیاست بک‌آپ (تنظیمات ذخیره‌شده، اجرا غیرفعال)\n"
+                    f"وضعیت زمان‌بند: {'فعال' if policy['enabled'] else 'غیرفعال'}\n"
+                    f"زمان‌بندی: {policy['frequency']} | منطقه زمانی: {policy['timezone_name']} | ساعت: {policy['local_time']} | بازه: {policy['interval_minutes']} دقیقه\n"
+                    f"مقصد: {destination_line}\nمسیر محلی: {policy['local_directory']}\n"
+                    f"نگهداری: حداکثر {policy['retention_count']} نسخه / {policy['retention_days']} روز\n"
+                    f"آخرین وضعیت: {policy['last_status']}\n{next_line}\n\n"
+                    "این زمان فقط پیش‌نمایش است؛ زمان‌بند و ارسال فایل هنوز نصب/فعال نشده‌اند.",
+                    ADMIN_MENU)
+                return
+            if action == "help":
+                await self.api.send_text(chat_id,
+                    "🗄 تنظیم سیاست بک‌آپ (بدون اجرای خودکار)\n"
+                    "/backup-policy show\n"
+                    "/backup-policy schedule | hourly/daily/interval | Europe/Berlin | 03:00 | 1440\n"
+                    "/backup-policy destination | local/telegram/both | CHAT_ID-or-0 | TOPIC_ID | /absolute/path\n"
+                    "/backup-policy retention | MAX_BACKUPS | MAX_AGE_DAYS\n"
+                    "برای مقصد محلی، CHAT_ID و TOPIC_ID را 0 بگذار. زمان‌بند هنوز نصب نشده و enable عمداً رد می‌شود.", ADMIN_MENU)
+                return
+            if action == "enable":
+                await self.api.send_text(chat_id,
+                    "فعال‌سازی رد شد: زمان‌بند بک‌آپ هنوز پیاده‌سازی و آزمون عملیاتی نشده است. "
+                    "تنظیمات ذخیره می‌شوند اما اجرای خودکار همچنان غیرفعال می‌ماند.", ADMIN_MENU)
+                return
+            try:
+                if action == "schedule":
+                    fields = [item.strip() for item in (parts[1] if len(parts) > 1 else "").strip().lstrip("|").strip().split("|")]
+                    if len(fields) != 4:
+                        raise ValueError("فرمت: /backup-policy schedule | hourly/daily/interval | Europe/Berlin | 03:00 | interval_minutes")
+                    frequency, timezone_name, local_time, interval_raw = fields
+                    policy = self.data.update_backup_policy(frequency=frequency, timezone_name=timezone_name,
+                        local_time=local_time, interval_minutes=int(interval_raw),
+                        destination=policy["destination"], local_directory=policy["local_directory"],
+                        telegram_chat_id=policy["telegram_chat_id"], telegram_topic_id=int(policy["telegram_topic_id"]),
+                        retention_count=int(policy["retention_count"]), retention_days=int(policy["retention_days"]),
+                        updated_by=uid)
+                elif action == "destination":
+                    fields = [item.strip() for item in (parts[1] if len(parts) > 1 else "").strip().lstrip("|").strip().split("|")]
+                    if len(fields) != 4:
+                        raise ValueError("فرمت: /backup-policy destination | local/telegram/both | CHAT_ID-or-0 | TOPIC_ID | /absolute/backup/path")
+                    destination, raw_chat, raw_topic, local_directory = fields
+                    chat_id_value = int(raw_chat)
+                    policy = self.data.update_backup_policy(frequency=policy["frequency"],
+                        timezone_name=policy["timezone_name"], local_time=policy["local_time"],
+                        interval_minutes=int(policy["interval_minutes"]), destination=destination,
+                        local_directory=local_directory, telegram_chat_id=(chat_id_value or None),
+                        telegram_topic_id=int(raw_topic), retention_count=int(policy["retention_count"]),
+                        retention_days=int(policy["retention_days"]), updated_by=uid)
+                elif action == "retention":
+                    fields = [item.strip() for item in (parts[1] if len(parts) > 1 else "").strip().lstrip("|").strip().split("|")]
+                    if len(fields) != 2:
+                        raise ValueError("فرمت: /backup-policy retention | MAX_BACKUPS | MAX_AGE_DAYS")
+                    policy = self.data.update_backup_policy(frequency=policy["frequency"],
+                        timezone_name=policy["timezone_name"], local_time=policy["local_time"],
+                        interval_minutes=int(policy["interval_minutes"]), destination=policy["destination"],
+                        local_directory=policy["local_directory"], telegram_chat_id=policy["telegram_chat_id"],
+                        telegram_topic_id=int(policy["telegram_topic_id"]), retention_count=int(fields[0]),
+                        retention_days=int(fields[1]), updated_by=uid)
+                elif action == "disable":
+                    policy = self.data.update_backup_policy(frequency=policy["frequency"],
+                        timezone_name=policy["timezone_name"], local_time=policy["local_time"],
+                        interval_minutes=int(policy["interval_minutes"]), destination=policy["destination"],
+                        local_directory=policy["local_directory"], telegram_chat_id=policy["telegram_chat_id"],
+                        telegram_topic_id=int(policy["telegram_topic_id"]), retention_count=int(policy["retention_count"]),
+                        retention_days=int(policy["retention_days"]), updated_by=uid)
+                else:
+                    raise ValueError("فرمان نامعتبر است.")
+                await self.api.send_text(chat_id,
+                    "تنظیمات بک‌آپ ذخیره شد؛ اجرای خودکار همچنان غیرفعال است.\n"
+                    f"برنامه: {policy['frequency']} / {policy['timezone_name']} {policy['local_time']}\n"
+                    f"مقصد: {policy['destination']}؛ نگهداری: {policy['retention_count']} نسخه / {policy['retention_days']} روز\n"
+                    "برای مشاهده: /backup-policy show", ADMIN_MENU)
+            except (ValueError, CustomerStoreError) as exc:
+                await self.api.send_text(chat_id, f"تنظیمات ذخیره نشد: {exc}\nبرای راهنما: /backup-policy help", ADMIN_MENU)
+            return
+        if is_admin and command == "/notify-route":
+            payload = text.partition(" ")[2].strip()
+            parts = payload.split(maxsplit=1)
+            action = parts[0].lower() if parts else "help"
+            event_keys = sorted(self.data.NOTIFICATION_EVENT_KEYS)
+            if action == "list":
+                routes = self.data.list_notification_routes()
+                body = ["📣 مسیرهای اعلان ربات:"]
+                body.extend(f"• {r['event_key']} → chat_id={r['chat_id']}, topic_id={r['topic_id'] or 'بدون تاپیک'}" for r in routes)
+                if not routes: body.append("هنوز مسیری ثبت نشده؛ اعلان تیکت‌ها فعلاً به ادمین‌های MANUBISGUARD_CUSTOMER_ADMIN_IDS می‌رود.")
+                body.append("رویدادها: " + ", ".join(event_keys))
+                await self.api.send_text(chat_id, "\n".join(body), ADMIN_MENU)
+                return
+            if action in {"add", "remove"}:
+                fields = [part.strip() for part in (parts[1] if len(parts) > 1 else "").split("|")]
+                try:
+                    if len(fields) != 3: raise ValueError("فرمت: /notify-route add|remove EVENT_KEY | CHAT_ID | TOPIC_ID (برای بدون تاپیک 0)")
+                    event_key, raw_chat, raw_topic = fields
+                    if not re.fullmatch(r"[a-z_]{3,32}", event_key): raise ValueError("شناسه رویداد معتبر نیست.")
+                    chat_target, topic_target = int(raw_chat), int(raw_topic)
+                    if action == "add":
+                        route = self.data.add_notification_route(event_key=event_key, chat_id=chat_target,
+                            topic_id=topic_target, created_by=uid)
+                        await self.api.send_text(chat_id, f"مسیر ذخیره شد: {route['event_key']} → chat_id={route['chat_id']}, topic_id={route['topic_id'] or 'بدون تاپیک'}. برای گروه، ربات باید اجازه ارسال پیام داشته باشد.", ADMIN_MENU)
+                    else:
+                        removed = self.data.remove_notification_route(event_key=event_key, chat_id=chat_target, topic_id=topic_target)
+                        await self.api.send_text(chat_id, "مسیر حذف شد." if removed else "چنین مسیری پیدا نشد.", ADMIN_MENU)
+                except (ValueError, CustomerStoreError) as exc:
+                    await self.api.send_text(chat_id, f"مسیر ذخیره/حذف نشد: {exc}\nرویدادها: {', '.join(event_keys)}", ADMIN_MENU)
+                return
+            await self.api.send_text(chat_id, "📣 مسیریابی اعلان‌ها\n/notify-route list\n/notify-route add EVENT_KEY | CHAT_ID | TOPIC_ID\n/notify-route remove EVENT_KEY | CHAT_ID | TOPIC_ID\n\nTOPIC_ID را برای ارسال مستقیم 0 بگذار. رویدادهای موجود: " + ", ".join(event_keys) + "\nرویدادهای خرید، پرداخت، کیف پول و تیکت به صف پایدار متصل‌اند؛ تست سرویس، لاگ، بک‌آپ، تغییر سرویس و هشدار امنیتی هنوز نیاز به اتصال تولیدکننده دارند.", ADMIN_MENU)
+            return
+        if is_admin and command == "/admin-notifications":
+            raw_status = text.partition(" ")[2].strip().lower() or "all"
+            if raw_status not in {"all", "pending", "dead", "sent"}:
+                await self.api.send_text(chat_id, "فرمت: /admin-notifications [all|pending|dead|sent]", ADMIN_MENU)
+                return
+            rows = self.data.list_admin_notifications(status=raw_status, limit=30)
+            lines = [f"📣 صف اعلان‌های مدیریتی ({raw_status})"]
+            for row in rows:
+                lines.append(
+                    f"#{row['notification_id']} {row['event_key']} — {row['status']} — "
+                    f"مقصد: {row['sent_destinations'] or 0}/{row['destination_count'] or 0}"
+                    + (f" — خطا: {row['last_error_code']}" if row.get("last_error_code") else ""))
+            if not rows:
+                lines.append("اعلانی برای نمایش وجود ندارد.")
+            lines.append("برای تلاش مجدد: /admin-notification-retry ID")
+            await self.api.send_text(chat_id, "\n".join(lines), ADMIN_MENU)
+            return
+        if is_admin and command == "/admin-notification-retry":
+            parts = text.split(maxsplit=1)
+            try:
+                if len(parts) != 2 or not parts[1].strip().isdigit():
+                    raise ValueError("فرمت: /admin-notification-retry ID")
+                notification_id = int(parts[1].strip())
+                if not self.data.retry_admin_notification_now(notification_id):
+                    raise ValueError("اعلان متوقف‌شده‌ای با این شناسه پیدا نشد.")
+                await self.api.send_text(chat_id,
+                    f"اعلان #{notification_id} به صف تلاش مجدد برگشت. کارگر پس‌زمینه آن را با رعایت صف و محدودیت ارسال بررسی می‌کند.",
+                    ADMIN_MENU)
+            except (ValueError, CustomerStoreError) as exc:
+                await self.api.send_text(chat_id, str(exc), ADMIN_MENU)
+            return
+        if is_admin and command == "/ticket-notification-retry":
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2:
+                await self.api.send_text(chat_id, "فرمت: /ticket-notification-retry TICKET_ID", ADMIN_MENU)
+                return
+            ticket_id = parts[1].strip()
+            if self.data.retry_customer_ticket_notification_now(ticket_id):
+                counts = await self._deliver_customer_ticket_notifications(limit=20)
+                state = self.data.get_customer_ticket_notification(ticket_id)
+                await self.api.send_text(chat_id, f"وضعیت اعلان تیکت {ticket_id}: {state['status'] if state else 'نامشخص'}؛ ارسال‌شده: {counts['sent']}، تلاش مجدد: {counts['retry']}، متوقف: {counts['dead']}.", ADMIN_MENU)
+            else:
+                await self.api.send_text(chat_id, "اعلان متوقف‌شده‌ای برای این تیکت پیدا نشد؛ فقط اعلان dead قابل راه‌اندازی مجدد است.", ADMIN_MENU)
             return
         if is_admin and command == "/manual-key":
             fields = [x.strip() for x in text.partition(" ")[2].split("|")]
@@ -566,6 +940,7 @@ class CustomerBot:
                 if not orders:
                     lines.append("سفارشی با این وضعیت پیدا نشد.")
                 lines.append("\nبرای تحویل: /manual-fulfill ORDER_ID | متن تحویل")
+                lines.append("برای اعلان dead: /manual-notification-retry ORDER_ID")
                 lines.append("وضعیت‌های مجاز: pending_delivery, fulfilled, all")
                 await self.api.send_text(chat_id, "\n".join(lines), ADMIN_MENU)
             except CustomerStoreError as exc:
@@ -584,22 +959,31 @@ class CustomerBot:
             except CustomerStoreError as exc:
                 await self.api.send_text(chat_id, f"تحویل ثبت نشد: {exc}", ADMIN_MENU)
                 return
-            target = int(order["telegram_id"])
-            try:
-                await self.api.send_text(
-                    target,
-                    f"✅ سفارش دیجیتال شما تحویل شد.\nمحصول: {order['product_id']}\n"
-                    f"شناسه سفارش: {order['order_id']}\n\nاطلاعات تحویل:\n{order['delivery_payload']}",
-                    self._customer_menu(customer_id=target, include_admin=False),
-                )
-            except Exception:
-                LOG.warning("Manual order was fulfilled but customer notification failed")
+            await self._deliver_manual_delivery_notifications(limit=20)
+            notification = self.data.get_manual_delivery_notification(order["order_id"])
+            admin_result = f"تحویل سفارش {order['order_id']} ثبت شد؛ وضعیت fulfilled است."
+            if notification and notification["status"] in {"pending", "processing"}:
+                admin_result += " پیام مشتری در صف پایدار قرار دارد و به‌صورت خودکار دوباره تلاش می‌شود."
+            elif notification and notification["status"] == "dead":
+                admin_result += " ارسال خودکار پس از چند تلاش ناموفق متوقف شد؛ برای تلاش مجدد از /manual-notification-retry ORDER_ID استفاده کن."
             await self.api.send_text(
                 chat_id,
-                f"تحویل سفارش {order['order_id']} ثبت شد؛ وضعیت fulfilled است. "
-                "اگر ارسال پیام به مشتری ناموفق بود، سفارش را از فهرست بررسی کن.",
+                admin_result,
                 ADMIN_MENU,
             )
+            return
+        if is_admin and command == "/manual-notification-retry":
+            parts = text.split()
+            if len(parts) != 2:
+                await self.api.send_text(chat_id, "فرمت: /manual-notification-retry ORDER_ID", ADMIN_MENU)
+                return
+            if self.data.retry_manual_delivery_notification_now(parts[1]):
+                counts = await self._deliver_manual_delivery_notifications(limit=20)
+                state = self.data.get_manual_delivery_notification(parts[1])
+                status = state["status"] if state else "unknown"
+                await self.api.send_text(chat_id, f"وضعیت اعلان سفارش {parts[1]}: {status} (ارسال‌شده: {counts['sent']}، تلاش مجدد: {counts['retry']}، متوقف: {counts['dead']})", ADMIN_MENU)
+            else:
+                await self.api.send_text(chat_id, "اعلان متوقف‌شده‌ای با این شناسه پیدا نشد؛ فقط اعلان dead قابل راه‌اندازی مجدد است.", ADMIN_MENU)
             return
         if is_admin and command == "/manual-product":
             payload = text.partition(" ")[2].strip()
@@ -929,10 +1313,30 @@ class CustomerBot:
             health = await adapter.health_check(connection)
             capabilities = await adapter.capabilities(connection)
             capability_data = {name: bool(getattr(capabilities, name)) for name in capabilities.__dataclass_fields__}
+            report_method = getattr(adapter, "capability_report", None)
+            report = await report_method(connection) if callable(report_method) else None
             self.data.record_panel_check(panel_id=connection.id,
                 status="healthy_read_only" if health.get("ok") else "failed", capabilities=capability_data)
             summary = "اتصال خواندنی موفق بود." if health.get("ok") else f"اتصال ناموفق بود ({health.get('error_type', 'error')})."
-            await self.api.send_text(chat_id, f"{summary}\nقابلیت‌های تعریف‌شده در آداپتر: {', '.join(k for k,v in capability_data.items() if v)}\nاین تست هیچ کاربر/نمایندگی نمی‌سازد و مجوز عملیات تغییردهنده را اثبات نمی‌کند.", self._customer_menu())
+            lines = [summary,
+                f"قابلیت‌های تعریف‌شده در آداپتر: {', '.join(k for k,v in capability_data.items() if v)}"]
+            if report and isinstance(report.get("operations"), dict):
+                lines.append("وضعیت عملیات (محلی؛ مجوز واقعی پنل جداگانه تأیید نشده):")
+                for operation, detail in report["operations"].items():
+                    status = detail.get("status", "unknown")
+                    if status == "unknown" and detail.get("adapter_method_present"):
+                        status_text = "متد محلی موجود؛ مجوز پنل نامشخص"
+                    elif status == "sdk_surface_present":
+                        status_text = "سطح SDK موجود؛ مجوز پنل نامشخص"
+                    elif status == "sdk_surface_missing":
+                        status_text = "سطح SDK ناکافی"
+                    elif status == "unsupported":
+                        status_text = "پشتیبانی نمی‌شود"
+                    else:
+                        status_text = status
+                    lines.append(f"• {operation}: {status_text}")
+            lines.append("این بررسی فقط خواندنی است؛ مجوز عملیات تغییردهنده یا سازگاری نسخهٔ نصب‌شده را اثبات نمی‌کند.")
+            await self.api.send_text(chat_id, "\n".join(lines), self._customer_menu())
         except Exception as exc:
             self.data.record_panel_check(panel_id=connection.id, status="failed", capabilities={})
             await self.api.send_text(chat_id, f"بررسی پنل ناموفق بود: {type(exc).__name__}", self._customer_menu())
@@ -1393,6 +1797,11 @@ class CustomerBot:
         chat_id = chat.get("id")
         if not isinstance(chat_id, int):
             return
+        if data == "customer:miniapp":
+            await self.api.send_text(chat_id,
+                "مینی‌اپ مشتری هنوز به دامنهٔ HTTPS متصل نشده است. پس از راه‌اندازی بک‌اند و رابط مشتری، مقدار امن MANUBIS_CUSTOMER_WEBAPP_URL را تنظیم کن؛ درگاه پرداخت در این مرحله لازم نیست.",
+                BACK_MENU)
+            return
         if data.startswith(("customer:service_detail:", "customer:service_refresh:", "customer:service_qr:")):
             if not isinstance(uid, int):
                 return
@@ -1448,6 +1857,7 @@ class CustomerBot:
                 ])
             if service.get("provider_checked_at"):
                 lines.append(f"آخرین بررسی ثبت‌شده پنل: {service['provider_checked_at']}")
+            lines.append(_provider_freshness_text(service.get("provider_checked_at")))
             if int(service.get("outstanding_debt_minor") or 0):
                 lines.append(f"بدهی معوق: {int(service['outstanding_debt_minor']):,} {service.get('currency') or ''}")
             if service.get("subscription_url"):
@@ -1527,12 +1937,12 @@ class CustomerBot:
                     result = await change_service.renew(telegram_id=uid, service_id=service_id,
                         idempotency_key=idempotency_key, now=int(datetime.now(timezone.utc).timestamp()))
                     expiry = result.get("expires_at", "")
-                    await self.api.send_text(chat_id, f"✅ تمدید سرویس ثبت شد.\nانقضای جدید: {expiry}\nمبلغ: {int(result['amount_minor']):,} {result['currency']}", BACK_MENU)
+                    await self.api.send_text(chat_id, f"✅ تمدید سرویس ثبت شد.\nانقضای جدید: {expiry}\nمبلغ: {int(result['amount_minor']):,} {result['currency']}\nشناسه پیگیری: {result['operation_id']}\nبرای مشاهده وضعیت: /my-service-operations", BACK_MENU)
                 else:
                     result = await change_service.top_up_traffic(telegram_id=uid, service_id=service_id,
                         idempotency_key=idempotency_key, now=int(datetime.now(timezone.utc).timestamp()))
                     gib = int(result.get("traffic_limit_bytes") or 0) / (1024 ** 3)
-                    await self.api.send_text(chat_id, f"✅ افزایش حجم ثبت شد.\nسقف جدید: {gib:.2f} GiB\nمبلغ: {int(result['amount_minor']):,} {result['currency']}", BACK_MENU)
+                    await self.api.send_text(chat_id, f"✅ افزایش حجم ثبت شد.\nسقف جدید: {gib:.2f} GiB\nمبلغ: {int(result['amount_minor']):,} {result['currency']}\nشناسه پیگیری: {result['operation_id']}\nبرای مشاهده وضعیت: /my-service-operations", BACK_MENU)
             except PurchaseNeedsReconciliation as exc:
                 await self.api.send_text(chat_id, f"⚠️ عملیات نیازمند بررسی مدیر است؛ مبلغ رزرو شده و برای جلوگیری از تغییر تکراری، دوباره تلاش نکن. شناسه: {str(exc)[:100]}", BACK_MENU)
             except CustomerStoreError as exc:
@@ -1632,7 +2042,7 @@ class CustomerBot:
                         "مقایسه خواندنی با پنل (PasarGuard): /service-operation-check OPERATION_ID\n"
                         "این فرمان‌ها فقط گزارش می‌دهند و وضعیت پنل یا بازپرداخت را خودکار تغییر نمی‌دهند.")
             elif section == "tickets":
-                body = "🎫 تیکت‌های پشتیبانی\n/tickets\n/reply TICKET_ID | پاسخ"
+                body = "🎫 تیکت‌های پشتیبانی\n/tickets\n/reply TICKET_ID | پاسخ\n\nمسیر ارسال اعلان تیکت: /notify-route add support_ticket | CHAT_ID | TOPIC_ID\nفهرست مسیرها: /notify-route list"
             else:
                 body = "⚙️ تنظیمات ربات\nتنظیمات محرمانه فقط از محیط سرور مدیریت می‌شوند. کلیدها در تلگرام نمایش داده نمی‌شوند."
             await self.api.send_text(chat_id, body, ADMIN_MENU)
@@ -1665,7 +2075,8 @@ class CustomerBot:
             if not product:
                 await self.api.send_text(chat_id, "این محصول دیگر در دسترس نیست.", BACK_MENU)
                 return
-            await self.api.send_text(chat_id, f"تأیید خرید «{product['title']}»\nقیمت: {int(product['price_minor']):,} {product['currency']}\nموجودی: {self.data.wallet_balance(uid, product['currency']):,} {product['currency']}\nتحویل: {'خودکار پس از پرداخت' if product['delivery_mode']=='instant' else 'دستی توسط پشتیبانی'}",
+            delivery_label = "خودکار پس از پرداخت" if product["delivery_mode"] in {"instant", "inventory"} else "دستی توسط پشتیبانی"
+            await self.api.send_text(chat_id, f"تأیید خرید «{product['title']}»\nقیمت: {int(product['price_minor']):,} {product['currency']}\nموجودی: {self.data.wallet_balance(uid, product['currency']):,} {product['currency']}\nتحویل: {delivery_label}",
                 {"inline_keyboard":[[{"text":"تأیید خرید","callback_data":f"customer:manualbuy_confirm:{product_id}","style":"success"}],[{"text":"بازگشت به فروشگاه","callback_data":"customer:shop"}]]})
             return
         if key.startswith("manualbuy_confirm:"):
@@ -1673,10 +2084,15 @@ class CustomerBot:
             try:
                 result = self.data.buy_manual_product(telegram_id=uid, product_id=product_id,
                     idempotency_key=f"manual-buy:{uid}:{message.get('message_id') or 0}:{product_id}")
+                already_processed = bool(result.get("idempotent_replay"))
+                purchase_label = "این خرید قبلاً ثبت شده است" if already_processed else "خرید انجام شد"
                 if result["delivery_mode"] in {"instant", "inventory"}:
-                    body = f"✅ خرید انجام شد\nمحصول: {result['title']}\nشناسه سفارش: {result['order_id']}\n\nاطلاعات محصول:\n{result['delivery_payload']}"
+                    body = f"✅ {purchase_label}\nمحصول: {result['title']}\nشناسه سفارش: {result['order_id']}\n\nاطلاعات محصول:\n{result['delivery_payload']}"
+                elif result.get("status") == "fulfilled" and result.get("delivery_payload"):
+                    body = f"✅ این سفارش قبلاً تحویل شده است.\nمحصول: {result['title']}\nشناسه سفارش: {result['order_id']}\n\nاطلاعات تحویل:\n{result['delivery_payload']}"
                 else:
-                    body = f"✅ سفارش ثبت شد و مبلغ کسر شد.\nمحصول: {result['title']}\nشناسه سفارش: {result['order_id']}\nتحویل توسط مدیر/پشتیبانی انجام می‌شود."
+                    status_text = "این سفارش قبلاً ثبت شده و در انتظار تحویل است." if already_processed else "سفارش ثبت شد و مبلغ کسر شد."
+                    body = f"✅ {status_text}\nمحصول: {result['title']}\nشناسه سفارش: {result['order_id']}\nتحویل توسط مدیر/پشتیبانی انجام می‌شود."
                 await self.api.send_text(chat_id, body, BACK_MENU)
             except CustomerStoreError as exc:
                 await self.api.send_text(chat_id, f"خرید انجام نشد: {exc}", BACK_MENU)
@@ -1970,6 +2386,18 @@ class CustomerBot:
                             await self._handle_callback(update["callback_query"])
                     except TelegramAPIError as exc:
                         LOG.warning("Customer Telegram operation failed (%s)", type(exc).__name__)
+                try:
+                    await self._deliver_manual_delivery_notifications(limit=20)
+                except Exception as exc:
+                    LOG.warning("Manual delivery notification worker failed (%s)", type(exc).__name__)
+                try:
+                    await self._deliver_customer_ticket_notifications(limit=20)
+                except Exception as exc:
+                    LOG.warning("Support ticket notification worker failed (%s)", type(exc).__name__)
+                try:
+                    await self._deliver_admin_notifications(limit=20)
+                except Exception as exc:
+                    LOG.warning("Admin notification worker failed (%s)", type(exc).__name__)
             except TelegramAPIError as exc:
                 LOG.warning("Customer polling failed (%s); retrying", type(exc).__name__)
                 await asyncio.sleep(3)
@@ -1978,8 +2406,8 @@ class CustomerBot:
 def main() -> None:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(),
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    if os.environ.get("MANUBISGUARD_TEST_MODE", "1").lower() not in {"1", "true", "yes"}:
-        raise SystemExit("This entrypoint is staging-only; set MANUBISGUARD_TEST_MODE=1")
+    if os.environ.get("MANUBISGUARD_TEST_MODE", "").strip().lower() not in {"1", "true", "yes"}:
+        raise SystemExit("This entrypoint is staging-only; explicitly set MANUBISGUARD_TEST_MODE=1")
     try:
         asyncio.run(CustomerBot(CustomerBotConfig.from_env()).run())
     except KeyboardInterrupt:

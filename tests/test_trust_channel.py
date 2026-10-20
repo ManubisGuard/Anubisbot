@@ -1,4 +1,4 @@
-import asyncio, json, tempfile, unittest
+import asyncio, json, sqlite3, tempfile, unittest
 from pathlib import Path
 from manubisguard.notifications.trust_channel import SQLiteNotificationOutbox, TrustChannelConfig, TrustEvent, TrustChannelDeliveryWorker, render_trust_message
 
@@ -7,6 +7,54 @@ class TrustChannelTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.outbox=SQLiteNotificationOutbox(Path(self.tmp.name)/"outbox.sqlite3")
         self.config=TrustChannelConfig("tenant-a","bot-a","-1001234567890",enabled_events=frozenset({TrustEvent.NEW_SUBSCRIPTION,TrustEvent.RENEWAL}))
+    def test_migration_preserves_legacy_outbox_and_adds_claim_column(self):
+        legacy_path = Path(self.tmp.name) / "legacy-outbox.sqlite3"
+        with sqlite3.connect(legacy_path) as connection:
+            connection.execute("""CREATE TABLE notification_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL,
+                bot_instance_id TEXT NOT NULL, event_type TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL, payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','sent','dead')),
+                attempts INTEGER NOT NULL DEFAULT 0, available_at REAL NOT NULL,
+                created_at REAL NOT NULL, sent_at REAL, last_error_code TEXT,
+                UNIQUE(tenant_id,bot_instance_id,idempotency_key))""")
+            connection.execute("INSERT INTO notification_outbox(tenant_id,bot_instance_id,event_type,idempotency_key,payload_json,available_at,created_at) VALUES('tenant-a','bot-a','renewal','legacy:1','{}',10,10)")
+        migrated = SQLiteNotificationOutbox(legacy_path)
+        row = migrated.get(1)
+        self.assertEqual((row.tenant_id, row.idempotency_key, row.status), ("tenant-a", "legacy:1", "pending"))
+        SQLiteNotificationOutbox(legacy_path)
+        with sqlite3.connect(legacy_path) as connection:
+            columns = {r[1] for r in connection.execute("PRAGMA table_info(notification_outbox)")}
+            self.assertIn("claimed_at", columns)
+            self.assertEqual(connection.execute("SELECT version,name FROM notification_schema_migrations").fetchall(), [(1, "notification_outbox_and_due_index")])
+            self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
+    def test_migration_failure_rolls_back_new_outbox_schema(self):
+        failing_path = Path(self.tmp.name) / "failing-outbox.sqlite3"
+        with sqlite3.connect(failing_path) as connection:
+            connection.execute("""CREATE TABLE notification_schema_migrations (
+                version INTEGER PRIMARY KEY CHECK(version > 0), name TEXT NOT NULL,
+                applied_at REAL NOT NULL DEFAULT (unixepoch()))""")
+            connection.execute("""CREATE TRIGGER fail_outbox_migration
+                BEFORE INSERT ON notification_schema_migrations WHEN NEW.version=1
+                BEGIN SELECT RAISE(ABORT, 'injected outbox migration failure'); END""")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "injected outbox migration failure"):
+            SQLiteNotificationOutbox(failing_path)
+        with sqlite3.connect(failing_path) as connection:
+            tables = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertNotIn("notification_outbox", tables)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_schema_migrations").fetchone()[0], 0)
+
+    def test_unknown_future_outbox_schema_fails_closed(self):
+        future_path = Path(self.tmp.name) / "future-outbox.sqlite3"
+        with sqlite3.connect(future_path) as connection:
+            connection.execute("""CREATE TABLE notification_schema_migrations (
+                version INTEGER PRIMARY KEY CHECK(version > 0), name TEXT NOT NULL,
+                applied_at REAL NOT NULL DEFAULT (unixepoch()))""")
+            connection.execute("INSERT INTO notification_schema_migrations(version,name) VALUES(2,'future')")
+        with self.assertRaisesRegex(RuntimeError, "newer than this application supports"):
+            SQLiteNotificationOutbox(future_path)
+
     def test_enqueue_is_idempotent(self):
         a=self.outbox.enqueue(self.config,TrustEvent.NEW_SUBSCRIPTION,{"public_order_id":"ORD_1"},idempotency_key="order:1",now=10)
         b=self.outbox.enqueue(self.config,TrustEvent.NEW_SUBSCRIPTION,{"public_order_id":"ORD_1"},idempotency_key="order:1",now=11)

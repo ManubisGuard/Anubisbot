@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <title>MANUBIS | پنل مشتری</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="topbar"><div class="brand-mark">M</div><div><strong>MANUBIS</strong><small>پنل مشتری</small></div><span id="profile-name" class="profile-name">در حال اتصال…</span></header>
+  <main>
+    <section id="notice" class="notice" role="status">در حال اعتبارسنجی نشست تلگرام…</section>
+    <nav class="tabbar" aria-label="بخش‌های مینی‌اپ">
+      <button type="button" class="tab-button active" data-tab-target="home">خانه</button>
+      <button type="button" class="tab-button" data-tab-target="shop">فروشگاه</button>
+      <button type="button" class="tab-button" data-tab-target="services">سرویس‌ها</button>
+      <button type="button" class="tab-button" data-tab-target="orders">سفارش‌ها</button>
+      <button type="button" class="tab-button" data-tab-target="wallet">کیف پول</button>
+      <button type="button" class="tab-button" data-tab-target="support">🎫 پشتیبانی</button>
+    </nav>
+    <section class="wallet-panel tab-panel" data-tab-panel="home"><div><p class="eyebrow">حساب شما</p><h1>داشبورد مشتری</h1><p class="muted">خرید با موجودی کیف پول؛ پرداخت آنلاین در این نسخه فعال نیست.</p></div><div id="wallet-summary" class="wallet-grid"><div class="skeleton"></div></div></section>
+    <section class="section tab-panel" data-tab-panel="home"><div class="section-heading"><div><p class="eyebrow">OVERVIEW</p><h2>خلاصه کیف پول</h2></div></div><div id="wallet" class="wallet-grid"></div></section>
+    <section class="section tab-panel" data-tab-panel="shop" hidden><div class="section-heading"><div><p class="eyebrow">CATALOG</p><h2>فروشگاه سرویس‌ها</h2></div><span id="product-count" class="pill">—</span></div><div id="products" class="card-grid"></div></section>
+    <section class="section tab-panel" data-tab-panel="services" hidden><div class="section-heading"><div><p class="eyebrow">YOUR SERVICES</p><h2>سرویس‌های من</h2></div><span id="service-count" class="pill">—</span></div><div id="services" class="card-grid"></div></section>
+    <section class="section tab-panel" data-tab-panel="orders" hidden><div class="section-heading"><div><p class="eyebrow">ORDER HISTORY</p><h2>سفارش‌های من</h2></div><span id="order-count" class="pill">—</span></div><div id="orders" class="card-grid"></div></section>
+    <section class="section tab-panel" data-tab-panel="wallet" hidden><div class="section-heading"><div><p class="eyebrow">WALLET HISTORY</p><h2>تراکنش‌های کیف پول</h2></div><span id="transaction-count" class="pill">—</span></div><div id="transactions" class="card-grid"></div></section>
+    <section class="section tab-panel" data-tab-panel="support" hidden>
+      <div class="section-heading"><div><p class="eyebrow">CUSTOMER SUPPORT</p><h2>پشتیبانی</h2></div><span class="pill">ثبت تیکت</span></div>
+      <form id="support-form" class="support-form">
+        <label for="ticket-subject">عنوان تیکت</label><input id="ticket-subject" name="subject" minlength="4" maxlength="160" required placeholder="مثلاً مشکل در خرید یا اتصال سرویس">
+        <label for="ticket-message">موضوع و شرح درخواست</label><textarea id="ticket-message" name="message" minlength="8" maxlength="3000" rows="6" required placeholder="مشکل یا درخواستت را کامل توضیح بده…"></textarea>
+        <button id="ticket-submit" type="submit">ارسال تیکت برای پشتیبانی</button>
+        <p id="ticket-notice" class="muted" role="status"></p>
+      </form>
+      <div class="section-heading support-history-heading"><div><p class="eyebrow">MY REQUESTS</p><h2>تیکت‌های من</h2></div><span id="ticket-count" class="pill">—</span></div><div id="tickets" class="card-grid"></div>
+    </section>
+    <footer>اتصال امن تلگرام · اطلاعات فقط برای حساب احراز‌شده نمایش داده می‌شود.</footer>
+  </main>
+</body>
+</html>

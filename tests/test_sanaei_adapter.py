@@ -15,6 +15,19 @@ class FakeClient:
     async def post(self,path,**kwargs): return await self.request('POST',path,**kwargs)
 
 class SanaeiAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_capability_report_marks_local_surface_without_claiming_live_permission(self):
+        adapter = SanaeiAdapter(secret_resolver=lambda _:'token-secret',
+            client_factory=lambda **kw: FakeClient(lambda *args: self.fail('report must not call network'), kw['base_url']))
+        conn = PanelConnection(id='s1',tenant_id='t',name='Sanaei',kind='sanaei',
+            base_url='https://sanaei.example',auth_mode='access_token',secret_ref='s')
+        report = await adapter.capability_report(conn)
+        self.assertFalse(report['live_panel_verified'])
+        self.assertTrue(report['operations']['create_user']['adapter_method_present'])
+        self.assertEqual(report['operations']['create_user']['status'], 'unknown')
+        self.assertEqual(report['operations']['create_user']['panel_permission'], 'unknown')
+        self.assertEqual(report['operations']['create_user']['live_test'], 'not_tested')
+        self.assertEqual(report['operations']['manage_resellers']['status'], 'unsupported')
+
     async def test_token_create_payload_and_expiry_milliseconds(self):
         seen=[]
         def handler(method,path,kwargs):

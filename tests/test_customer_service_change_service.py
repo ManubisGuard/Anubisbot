@@ -144,6 +144,59 @@ class CustomerServiceChangeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.adapter.update_calls, 1)
 
 
+    async def test_read_only_reconciliation_supports_rebecca_after_ambiguous_update(self):
+        self.store.register_panel_connection(panel_id="p1", label="Rebecca", provider="rebecca",
+            base_url="https://panel.example", auth_mode="api_key", secret_ref="env:PANEL_KEY", enabled=True)
+        self.adapter = MutableAdapter(fail_after_update=True)
+        self.adapter.kind = "rebecca"
+        self.registry = AdapterRegistry()
+        self.registry.register(self.adapter)
+        self.service = CustomerServiceChangeService(self.store, secret_resolver=lambda _: "test-secret",
+            registry=self.registry)
+        with self.assertRaises(PurchaseNeedsReconciliation):
+            await self.service.top_up_traffic(telegram_id=123, service_id="svc-1",
+                idempotency_key="rebecca-ambiguous-topup", now=1000)
+        operation = self.store.list_service_change_operations(status="reconcile_required")[0]
+        comparison = await self.service.inspect_reconciliation(operation_id=operation["operation_id"])
+        self.assertEqual(comparison["comparison"], "target_present")
+        self.assertTrue(comparison["identity_verified"])
+        self.assertEqual(comparison["observed_value"], 2 * 1024**3)
+        self.assertEqual(self.adapter.update_calls, 1)
+        self.assertEqual(self.store.wallet_balance(123), 4300)
+
+    async def test_read_only_reconciliation_supports_sanaei_after_ambiguous_update(self):
+        self.store.register_panel_connection(panel_id="p1", label="Sanaei", provider="sanaei",
+            base_url="https://panel.example", auth_mode="access_token", secret_ref="env:PANEL_KEY", enabled=True)
+        self.adapter = MutableAdapter(fail_after_update=True)
+        self.adapter.kind = "sanaei"
+        self.registry = AdapterRegistry()
+        self.registry.register(self.adapter)
+        self.service = CustomerServiceChangeService(self.store, secret_resolver=lambda _: "test-secret",
+            registry=self.registry)
+        with self.assertRaises(PurchaseNeedsReconciliation):
+            await self.service.top_up_traffic(telegram_id=123, service_id="svc-1",
+                idempotency_key="sanaei-ambiguous-topup", now=1000)
+        operation = self.store.list_service_change_operations(status="reconcile_required")[0]
+        comparison = await self.service.inspect_reconciliation(operation_id=operation["operation_id"])
+        self.assertEqual(comparison["comparison"], "target_present")
+        self.assertTrue(comparison["identity_verified"])
+        self.assertEqual(comparison["observed_value"], 2 * 1024**3)
+        self.assertEqual(self.adapter.update_calls, 1)
+        self.assertEqual(self.store.wallet_balance(123), 4300)
+
+    async def test_reconciliation_refuses_username_mismatch_even_when_provider_id_matches(self):
+        self.adapter.fail_update = True
+        with self.assertRaises(PurchaseNeedsReconciliation):
+            await self.service.top_up_traffic(telegram_id=123, service_id="svc-1",
+                idempotency_key="topup-username-mismatch", now=1000)
+        operation = self.store.list_service_change_operations(status="reconcile_required")[0]
+        async def mismatched_user(connection, username):
+            return replace(self.adapter.user, username="different-username")
+        self.adapter.get_user = mismatched_user
+        comparison = await self.service.inspect_reconciliation(operation_id=operation["operation_id"])
+        self.assertEqual(comparison["comparison"], "identity_mismatch")
+        self.assertIsNone(comparison["observed_value"])
+
     async def test_reconciliation_refuses_provider_identity_mismatch(self):
         self.adapter.fail_update = True
         with self.assertRaises(PurchaseNeedsReconciliation):
@@ -173,6 +226,45 @@ class CustomerServiceChangeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(comparison["observed_value"])
         self.assertNotIn("sensitive detail", str(comparison))
         self.adapter.get_user = original_get_user
+
+    async def test_finalize_requires_fresh_target_and_never_replays_provider_mutation(self):
+        self.adapter.fail_after_update = True
+        with self.assertRaises(PurchaseNeedsReconciliation):
+            await self.service.top_up_traffic(telegram_id=123, service_id="svc-1",
+                idempotency_key="finalize-applied-timeout", now=1000)
+        operation = self.store.list_service_change_operations(status="reconcile_required")[0]
+        before = await self.service.inspect_reconciliation(operation_id=operation["operation_id"])
+        self.assertEqual(before["comparison"], "target_present")
+        result = await self.service.finalize_target_present(operation_id=operation["operation_id"],
+            actor_telegram_id=9001, reason="Confirmed target on fresh panel read")
+        self.assertFalse(result["idempotent_replay"])
+        self.assertEqual(self.store.get_service_change_operation(operation["operation_id"])["status"], "completed")
+        self.assertEqual(self.store.wallet_balance(123), 4300)
+        self.assertEqual(self.adapter.update_calls, 1)
+        replay = await self.service.finalize_target_present(operation_id=operation["operation_id"],
+            actor_telegram_id=9001, reason="Confirmed target on fresh panel read")
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(self.adapter.update_calls, 1)
+        self.assertEqual(len(self.store.list_service_change_events(operation["operation_id"])), 1)
+
+    async def test_finalize_keeps_reservation_on_before_present_or_identity_mismatch(self):
+        self.adapter.fail_update = True
+        with self.assertRaises(PurchaseNeedsReconciliation):
+            await self.service.top_up_traffic(telegram_id=123, service_id="svc-1",
+                idempotency_key="finalize-before-timeout", now=1000)
+        operation = self.store.list_service_change_operations(status="reconcile_required")[0]
+        balance = self.store.wallet_balance(123)
+        with self.assertRaisesRegex(Exception, "before_present"):
+            await self.service.finalize_target_present(operation_id=operation["operation_id"],
+                actor_telegram_id=9001, reason="Attempt finalize before")
+        self.assertEqual(self.store.get_service_change_operation(operation["operation_id"])["status"], "reconcile_required:timeouterror")
+        self.assertEqual(self.store.wallet_balance(123), balance)
+        self.adapter.user = replace(self.adapter.user, provider_user_id="other-id", data_limit_bytes=2 * 1024**3)
+        with self.assertRaisesRegex(Exception, "identity_mismatch"):
+            await self.service.finalize_target_present(operation_id=operation["operation_id"],
+                actor_telegram_id=9001, reason="Identity mismatch")
+        self.assertEqual(self.store.wallet_balance(123), balance)
+        self.assertEqual(self.store.list_service_change_events(operation["operation_id"]), [])
 
     async def test_reconciliation_rejects_completed_operation(self):
         result = await self.service.top_up_traffic(telegram_id=123, service_id="svc-1",

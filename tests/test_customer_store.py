@@ -1,5 +1,6 @@
 import sqlite3
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -18,8 +19,147 @@ class CustomerDataStoreTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_notification_routes_support_group_topics_and_tenant_isolation(self):
+        route = self.store.add_notification_route(event_key="support_ticket", chat_id=-1001234567890,
+            topic_id=77, created_by=1001)
+        self.assertEqual(route["topic_id"], 77)
+        self.assertEqual(self.store.list_notification_routes("support_ticket"), [route])
+        other = CustomerDataStore(self.path, tenant_id="bot-beta")
+        self.assertEqual(other.list_notification_routes(), [])
+        self.assertFalse(other.remove_notification_route(event_key="support_ticket", chat_id=-1001234567890, topic_id=77))
+        self.assertTrue(self.store.remove_notification_route(event_key="support_ticket", chat_id=-1001234567890, topic_id=77))
+        self.assertEqual(self.store.list_notification_routes(), [])
+        with self.assertRaisesRegex(CustomerStoreError, "Unsupported notification event"):
+            self.store.add_notification_route(event_key="unknown_event", chat_id=123, created_by=1001)
+        with self.assertRaisesRegex(CustomerStoreError, "Topic ID"):
+            self.store.add_notification_route(event_key="backup", chat_id=-1001234567890, topic_id=-1, created_by=1001)
+
+    def test_admin_notification_outbox_is_redacted_idempotent_and_tracks_each_destination(self):
+        self.store.add_notification_route(event_key="purchase", chat_id=1001, created_by=1001)
+        self.store.add_notification_route(event_key="purchase", chat_id=-1001234567890,
+                                         topic_id=77, created_by=1001)
+        payload = {"public_order_id": "order-public-1", "amount_minor": 2500, "currency": "irr",
+                   "product_title": "AI Plan", "status": "paid", "customer_id": 1001,
+                   "password": "DO-NOT-STORE", "subscription_url": "https://secret.invalid/x",
+                   "initData": "private"}
+        notification_id = self.store.enqueue_admin_notification(
+            event_key="purchase", idempotency_key="order-public-1", payload=payload, now=1000)
+        self.assertEqual(self.store.enqueue_admin_notification(
+            event_key="purchase", idempotency_key="order-public-1",
+            payload=payload, now=1001), notification_id)
+        with self.store._connect() as db:
+            raw = db.execute("SELECT payload_json FROM customer_admin_notifications WHERE notification_id=?",
+                             (notification_id,)).fetchone()[0]
+            self.assertNotIn("DO-NOT-STORE", raw)
+            self.assertNotIn("subscription_url", raw)
+            self.assertNotIn("initData", raw)
+        deliveries = self.store.claim_admin_notification_deliveries(now=1002)
+        self.assertEqual(len(deliveries), 2)
+        self.assertTrue(all(item["notification_id"] == notification_id for item in deliveries))
+        self.assertEqual({(item["chat_id"], item["topic_id"]) for item in deliveries},
+                         {(1001, 0), (-1001234567890, 77)})
+        self.store.mark_admin_notification_delivery_sent(deliveries[0]["delivery_id"], now=1003)
+        self.assertEqual(self.store.retry_admin_notification_delivery(
+            deliveries[1]["delivery_id"], attempt=1, error_code="sendfailed",
+            now=1004, max_attempts=1), "dead")
+        row = self.store.list_admin_notifications(status="dead")[0]
+        self.assertEqual(row["sent_destinations"], 1)
+        self.assertEqual(row["dead_destinations"], 1)
+        self.assertTrue(self.store.retry_admin_notification_now(notification_id, now=1005))
+        retried = self.store.claim_admin_notification_deliveries(now=1005)
+        self.assertEqual(len(retried), 1)
+        self.assertEqual(retried[0]["chat_id"], deliveries[1]["chat_id"])
+        self.assertEqual(self.store.mark_admin_notification_delivery_sent(
+            retried[0]["delivery_id"], now=1006), "sent")
+        self.assertEqual(self.store.list_admin_notifications(status="sent")[0]["status"], "sent")
+
+    def test_admin_notification_outbox_uses_fallback_only_when_no_route_and_tenant_scoped(self):
+        notification_id = self.store.enqueue_admin_notification(
+            event_key="security_alert", idempotency_key="alert-1",
+            payload={"status": "blocked", "reason_code": "auth_mismatch"}, now=2000)
+        claimed = self.store.claim_admin_notification_deliveries(
+            now=2001, fallback_admin_ids=(1001, 1002))
+        self.assertEqual(len(claimed), 2)
+        self.assertEqual({row["chat_id"] for row in claimed}, {1001, 1002})
+        other = CustomerDataStore(self.path, tenant_id="bot-beta")
+        self.assertEqual(other.list_admin_notifications(), [])
+        self.assertTrue(all(row["notification_id"] == notification_id for row in claimed))
+
+    def test_admin_notification_without_any_destination_dead_letters_and_can_requeue_after_route_added(self):
+        notification_id = self.store.enqueue_admin_notification(
+            event_key="backup", idempotency_key="backup-1",
+            payload={"status": "failed", "reason_code": "backup_failed"}, now=3000)
+        self.assertEqual(self.store.claim_admin_notification_deliveries(now=3001), [])
+        self.assertEqual(self.store.list_admin_notifications(status="dead")[0]["last_error_code"], "no_destination")
+        self.store.add_notification_route(event_key="backup", chat_id=1001, created_by=1001)
+        self.assertTrue(self.store.retry_admin_notification_now(notification_id, now=3002))
+        claimed = self.store.claim_admin_notification_deliveries(now=3002)
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(claimed[0]["chat_id"], 1001)
+
+    def test_database_uses_wal_full_sync_and_foreign_keys(self):
+        with self.store._connect() as db:
+            self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
+            self.assertEqual(db.execute("PRAGMA synchronous").fetchone()[0], 2)
+            self.assertEqual(db.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            self.assertEqual(db.execute("PRAGMA busy_timeout").fetchone()[0], 15000)
+
+    def test_backup_policy_defaults_disabled_and_is_tenant_scoped(self):
+        policy = self.store.get_backup_policy()
+        self.assertEqual(policy["enabled"], 0)
+        self.assertEqual(policy["last_status"], "never")
+        self.assertEqual(policy["destination"], "local")
+        other = CustomerDataStore(self.path, tenant_id="bot-beta")
+        other_policy = other.get_backup_policy()
+        self.assertEqual(other_policy["enabled"], 0)
+        self.assertNotEqual(other_policy["tenant_id"], policy["tenant_id"])
+
+    def test_backup_policy_persists_and_remains_disabled_after_reopen(self):
+        policy = self.store.update_backup_policy(frequency="daily", timezone_name="Europe/Berlin",
+            local_time="02:45", interval_minutes=1440, destination="both",
+            local_directory="/var/lib/anubis-bot/backups", telegram_chat_id=-1001234567890,
+            telegram_topic_id=77, retention_count=20, retention_days=60, updated_by=1001)
+        self.assertEqual(policy["frequency"], "daily")
+        self.assertEqual(policy["timezone_name"], "Europe/Berlin")
+        self.assertEqual(policy["telegram_topic_id"], 77)
+        self.assertEqual(policy["retention_count"], 20)
+        self.assertEqual(policy["enabled"], 0)
+        reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        self.assertEqual(reopened.get_backup_policy()["destination"], "both")
+        self.assertEqual(reopened.get_backup_policy()["enabled"], 0)
+        with reopened._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=8").fetchone()[0], 1)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_backup_policy_rejects_invalid_destination_and_does_not_overwrite_previous(self):
+        original = self.store.get_backup_policy()
+        with self.assertRaisesRegex(CustomerStoreError, "requires a non-zero numeric chat ID"):
+            self.store.update_backup_policy(frequency="daily", timezone_name="UTC", local_time="03:00",
+                interval_minutes=1440, destination="telegram", local_directory="/var/lib/anubis-bot/backups",
+                telegram_chat_id=None, telegram_topic_id=0, retention_count=14, retention_days=30, updated_by=1001)
+        self.assertEqual(self.store.get_backup_policy()["frequency"], original["frequency"])
+        with self.assertRaisesRegex(CustomerStoreError, "absolute path"):
+            self.store.update_backup_policy(frequency="daily", timezone_name="UTC", local_time="03:00",
+                interval_minutes=1440, destination="local", local_directory="relative/backups",
+                telegram_chat_id=None, telegram_topic_id=0, retention_count=14, retention_days=30, updated_by=1001)
+
+    def test_service_operation_audit_triggers_are_reinstalled_on_existing_v2_database(self):
+        with self.store._connect() as db:
+            db.execute("DROP TRIGGER customer_service_operation_events_no_update")
+            db.execute("DROP TRIGGER customer_service_operation_events_no_delete")
+        reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        with reopened._connect() as db:
+            triggers = {row["name"] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )}
+            self.assertIn("customer_service_operation_events_no_update", triggers)
+            self.assertIn("customer_service_operation_events_no_delete", triggers)
+
     def test_service_operation_read_paths_migrate_legacy_table_additively(self):
         with sqlite3.connect(self.path) as db:
+            db.execute("DROP TABLE customer_service_operation_events")
+            db.execute("DROP TABLE customer_service_operations")
+            db.execute("DELETE FROM schema_migrations WHERE version=2")
             db.execute("""CREATE TABLE customer_service_operations (
                 tenant_id TEXT NOT NULL, operation_id TEXT NOT NULL, telegram_id INTEGER NOT NULL,
                 service_id TEXT NOT NULL, change_type TEXT NOT NULL, idempotency_key TEXT NOT NULL,
@@ -28,6 +168,8 @@ class CustomerDataStoreTests(unittest.TestCase):
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(tenant_id,operation_id), UNIQUE(tenant_id,idempotency_key)
             )""")
+        # Reopen so versioned migrations, not read paths, repair legacy schema.
+        self.store = CustomerDataStore(self.path, tenant_id="bot-alpha")
         self.assertEqual(self.store.list_service_change_operations(status="all"), [])
         self.assertIsNone(self.store.get_service_change_operation("legacy-operation"))
         with sqlite3.connect(self.path) as db:
@@ -62,6 +204,11 @@ class CustomerDataStoreTests(unittest.TestCase):
         self.assertTrue(replay["idempotent_replay"])
         self.assertEqual(replay["operation_id"], "op-change-1")
         self.assertEqual(self.store.wallet_balance(1001), 2300)
+        with self.assertRaisesRegex(CustomerStoreError, "already has an unresolved change"):
+            self.store.reserve_service_change(operation_id="op-change-duplicate", telegram_id=1001,
+                service_id="change-service", change_type="traffic_topup",
+                idempotency_key="change-key-new", now=1002)
+        self.assertEqual(self.store.wallet_balance(1001), 2300)
         self.store.fail_service_change_before_provider(operation_id="op-change-1", reason_code="test")
         self.assertEqual(self.store.wallet_balance(1001), 3000)
         self.store.fail_service_change_before_provider(operation_id="op-change-1", reason_code="retry")
@@ -82,13 +229,117 @@ class CustomerDataStoreTests(unittest.TestCase):
         op = self.store.reserve_service_change(operation_id="op-reconcile", telegram_id=1001,
             service_id="reconcile-service", change_type="renewal", idempotency_key="reconcile-key", now=1000)
         self.store.flag_service_change_reconciliation(operation_id=op["operation_id"], reason_code="TimeoutError")
+        balance_before_blocked_retry = self.store.wallet_balance(1001)
+        with self.assertRaisesRegex(CustomerStoreError, "already has an unresolved change"):
+            self.store.reserve_service_change(operation_id="op-reconcile-duplicate", telegram_id=1001,
+                service_id="reconcile-service", change_type="traffic_topup",
+                idempotency_key="reconcile-new-key", now=1001)
+        self.assertEqual(self.store.wallet_balance(1001), balance_before_blocked_retry)
         listed = self.store.list_service_change_operations(status="reconcile_required")
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0]["operation_id"], "op-reconcile")
         self.assertEqual(listed[0]["status"], "reconcile_required:timeouterror")
+        self.assertEqual(self.store.list_service_change_operations(status="all", telegram_id=1001)[0]["operation_id"], "op-reconcile")
+        self.assertEqual(self.store.list_service_change_operations(status="all", telegram_id=2002), [])
         self.assertEqual(self.store.list_service_change_operations(status="pending"), [])
         self.assertEqual(self.store.get_service_change_operation("op-reconcile")["username"], "reconcile-user")
         self.assertIsNone(CustomerDataStore(self.path, tenant_id="bot-beta").get_service_change_operation("op-reconcile"))
+
+    def _make_reconciliation_operation(self, operation_id="op-finalize", tenant_id="bot-alpha"):
+        self.store.register_panel_connection(panel_id="panel-finalize", label="Panel", provider="pasarguard",
+            base_url="https://panel.example", auth_mode="api_key", secret_ref="env:PANEL_FINALIZE", enabled=True)
+        self.store.put_product(product_id="finalize-product", title="Finalize product", price_minor=500,
+            currency="IRR", duration_hours=12, traffic_bytes=1024, panel_id="panel-finalize", group_ids=["1"])
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="finalize-funds", amount_minor=2000,
+            entry_type="deposit")
+        self.store.create_metered_service(service_id="finalize-service", telegram_id=1001,
+            product={"product_id":"finalize-product","panel_id":"panel-finalize","pricing_mode":"fixed",
+                     "currency":"IRR","unit_price_minor":0,"duration_hours":12,"traffic_bytes":1024,
+                     "expires_at":"2030-01-01T00:00:00+00:00"},
+            provider_user_id="provider-finalize", username="finalize-user", subscription_url=None, now=1000)
+        op = self.store.reserve_service_change(operation_id=operation_id, telegram_id=1001,
+            service_id="finalize-service", change_type="renewal", idempotency_key=f"{operation_id}-key", now=1000)
+        self.store.persist_service_change_target(operation_id=operation_id,
+            before_expires_at="2030-01-01T00:00:00+00:00", before_traffic_limit_bytes=1024,
+            target_expires_at="2030-01-01T12:00:00+00:00", target_traffic_limit_bytes=None)
+        self.store.flag_service_change_reconciliation(operation_id=operation_id, reason_code="timeout")
+        return op
+
+    def test_service_change_finalize_requires_verified_target_and_is_append_only_idempotent(self):
+        self._make_reconciliation_operation()
+        with self.assertRaisesRegex(CustomerStoreError, "target_present"):
+            self.store.resolve_service_change_target_present(operation_id="op-finalize",
+                actor_telegram_id=9001, comparison="before_present",
+                observed_value="2030-01-01T00:00:00+00:00", identity_verified=True, reason="checked")
+        self.assertTrue(self.store.get_service_change_operation("op-finalize")["status"].startswith("reconcile_required:"))
+        event = self.store.resolve_service_change_target_present(operation_id="op-finalize",
+            actor_telegram_id=9001, comparison="target_present",
+            observed_value="2030-01-01T12:00:00+00:00", identity_verified=True, reason="fresh target read")
+        self.assertFalse(event["idempotent_replay"])
+        self.assertEqual(self.store.get_service_change_operation("op-finalize")["status"], "completed")
+        self.assertEqual(self.store.get_customer_service("finalize-service")["expires_at"], "2030-01-01T12:00:00+00:00")
+        self.assertEqual(self.store.wallet_balance(1001), 1500)
+        replay = self.store.resolve_service_change_target_present(operation_id="op-finalize",
+            actor_telegram_id=9001, comparison="target_present",
+            observed_value="2030-01-01T12:00:00+00:00", identity_verified=True, reason="fresh target read")
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(len(self.store.list_service_change_events("op-finalize")), 1)
+        # The audit record must survive reopening the store, as after a process restart.
+        reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        self.assertEqual(reopened.list_service_change_events("op-finalize")[0]["reason"], "fresh target read")
+        with self.store._connect() as db:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                db.execute("UPDATE customer_service_operation_events SET reason='tampered' WHERE operation_id='op-finalize'")
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                db.execute("DELETE FROM customer_service_operation_events WHERE operation_id='op-finalize'")
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+        # Explicitly enable SQLite FK enforcement in this independent connection and ensure
+        # the operation row cannot be removed while its audit evidence references it.
+        with sqlite3.connect(self.path) as db:
+            db.execute("PRAGMA foreign_keys=ON")
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "FOREIGN KEY constraint failed"):
+                db.execute("DELETE FROM customer_service_operations WHERE tenant_id='bot-alpha' AND operation_id='op-finalize'")
+        self.assertEqual(CustomerDataStore(self.path, tenant_id="bot-beta").list_service_change_events("op-finalize"), [])
+
+    def test_service_operation_audit_survives_sqlite_backup_restore_round_trip(self):
+        self._make_reconciliation_operation()
+        self.store.resolve_service_change_target_present(operation_id="op-finalize", actor_telegram_id=9001,
+            comparison="target_present", observed_value="2030-01-01T12:00:00+00:00",
+            identity_verified=True, reason="verified after provider timeout")
+        backup_path = str(Path(self.tmp.name) / "customer-restored.sqlite3")
+        # Use SQLite's online backup API, not a raw file copy, so the test also exercises
+        # a consistent snapshot mechanism while the source database is open.
+        with sqlite3.connect(self.path) as source, sqlite3.connect(backup_path) as destination:
+            source.backup(destination)
+        restored = CustomerDataStore(backup_path, tenant_id="bot-alpha")
+        events = restored.list_service_change_events("op-finalize")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["reason"], "verified after provider timeout")
+        self.assertEqual(restored.get_service_change_operation("op-finalize")["status"], "completed")
+        with restored._connect() as db:
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                db.execute("UPDATE customer_service_operation_events SET reason='tampered' WHERE operation_id='op-finalize'")
+        self.assertEqual(restored.wallet_balance(1001), 1500)
+
+    def test_service_change_finalize_rejects_wrong_tenant_missing_identity_and_conflicting_replay(self):
+        self._make_reconciliation_operation()
+        other = CustomerDataStore(self.path, tenant_id="bot-beta")
+        with self.assertRaisesRegex(CustomerStoreError, "not found"):
+            other.resolve_service_change_target_present(operation_id="op-finalize", actor_telegram_id=9001,
+                comparison="target_present", observed_value="2030-01-01T12:00:00+00:00",
+                identity_verified=True, reason="fresh target read")
+        with self.assertRaisesRegex(CustomerStoreError, "identity-verified"):
+            self.store.resolve_service_change_target_present(operation_id="op-finalize", actor_telegram_id=9001,
+                comparison="target_present", observed_value="2030-01-01T12:00:00+00:00",
+                identity_verified=False, reason="fresh target read")
+        self.store.resolve_service_change_target_present(operation_id="op-finalize", actor_telegram_id=9001,
+            comparison="target_present", observed_value="2030-01-01T12:00:00+00:00",
+            identity_verified=True, reason="fresh target read")
+        with self.assertRaisesRegex(CustomerStoreError, "already recorded"):
+            self.store.resolve_service_change_target_present(operation_id="op-finalize", actor_telegram_id=9002,
+                comparison="target_present", observed_value="2030-01-01T12:00:00+00:00",
+                identity_verified=True, reason="different operator decision")
 
     def test_wallet_ledger_is_idempotent(self):
         first = self.store.post_wallet_entry(
@@ -569,6 +820,202 @@ class CustomerDataStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.get_product("ai-plan", enabled_only=True))
         self.assertIsNotNone(self.store.get_product("ai-plan", enabled_only=False))
 
+    def test_core_schema_migration_is_versioned_and_reopening_is_idempotent(self):
+        with self.store._connect() as db:
+            versions = db.execute(
+                "SELECT version, name FROM schema_migrations ORDER BY version"
+            ).fetchall()
+            self.assertEqual([(row["version"], row["name"]) for row in versions],
+                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox")])
+
+        reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        with reopened._connect() as db:
+            versions = db.execute(
+                "SELECT version, name FROM schema_migrations ORDER BY version"
+            ).fetchall()
+            self.assertEqual([(row["version"], row["name"]) for row in versions],
+                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox")])
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_representative_unversioned_legacy_database_preserves_business_rows(self):
+        # Start from the current schema, seed durable business records, then remove
+        # migration-owned additions to model a pre-registry SQLite database.
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="legacy-ledger",
+                                     amount_minor=2500, entry_type="deposit")
+        with self.store._connect() as db:
+            db.execute(
+                """INSERT INTO customer_orders
+                   (tenant_id,order_id,telegram_id,product_id,amount_minor,currency,status,idempotency_key)
+                   VALUES('bot-alpha','legacy-order',1001,'legacy-product',1200,'IRR','pending','legacy-order-key')"""
+            )
+            db.execute(
+                """INSERT INTO payment_attempts
+                   (tenant_id,payment_id,telegram_id,provider,amount_minor,currency,status,idempotency_key,external_reference)
+                   VALUES('bot-alpha','legacy-payment',1001,'manual',1300,'IRR','pending','legacy-payment-key','legacy-ref')"""
+            )
+            db.execute(
+                """INSERT INTO customer_service_operations
+                   (tenant_id,operation_id,telegram_id,service_id,change_type,idempotency_key,
+                    amount_minor,currency,quantity,status)
+                   VALUES('bot-alpha','legacy-operation',1001,'legacy-service','renewal',
+                          'legacy-operation-key',400,'IRR',24,'reconcile_required')"""
+            )
+            db.execute("DROP INDEX IF EXISTS uq_reseller_idempotency")
+            for table, column in (
+                ("panel_connections", "metadata_json"),
+                ("reseller_accounts", "idempotency_key"),
+                ("customer_products", "category_id"),
+                ("customer_orders", "product_snapshot_json"),
+                ("customer_orders", "discount_code"),
+                ("customer_orders", "discount_amount_minor"),
+                ("manual_deposit_receipts", "receipt_file_id"),
+                ("customer_service_operations", "before_expires_at"),
+                ("customer_service_operations", "before_traffic_limit_bytes"),
+                ("customer_service_operations", "target_expires_at"),
+                ("customer_service_operations", "target_traffic_limit_bytes"),
+            ):
+                db.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+            db.execute("DROP TABLE customer_service_operation_events")
+            db.execute("DROP TABLE schema_migrations")
+
+        migrated = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        with migrated._connect() as db:
+            versions = db.execute(
+                "SELECT version, name FROM schema_migrations ORDER BY version"
+            ).fetchall()
+            self.assertEqual(
+                [(row["version"], row["name"]) for row in versions],
+                [(1, "core_additive_legacy_migrations"),
+                 (2, "service_change_operations_and_audit"),
+                 (3, "manual_shop_tables"),
+                 (4, "manual_order_purchase_snapshot"),
+                 (5, "manual_delivery_notification_outbox"),
+                 (6, "customer_ticket_notification_outbox"),
+                 (7, "per_event_telegram_notification_routes"),
+                 (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox")],
+            )
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertIn("category_id", {
+                row["name"] for row in db.execute("PRAGMA table_info(customer_products)")
+            })
+            self.assertIn("product_snapshot_json", {
+                row["name"] for row in db.execute("PRAGMA table_info(customer_orders)")
+            })
+            self.assertIn("receipt_file_id", {
+                row["name"] for row in db.execute("PRAGMA table_info(manual_deposit_receipts)")
+            })
+            self.assertIn("target_expires_at", {
+                row["name"] for row in db.execute("PRAGMA table_info(customer_service_operations)")
+            })
+            self.assertIsNotNone(db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='uq_reseller_idempotency'"
+            ).fetchone())
+            self.assertIsNotNone(db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                "AND name='customer_service_operation_events_no_update'"
+            ).fetchone())
+            audit_fk = db.execute(
+                "PRAGMA foreign_key_list(customer_service_operation_events)"
+            ).fetchall()
+            self.assertEqual(
+                {(row["from"], row["to"]) for row in audit_fk},
+                {("tenant_id", "tenant_id"), ("operation_id", "operation_id")},
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute(
+                    """INSERT INTO customer_service_operation_events
+                       (tenant_id,operation_id,event_type,actor_telegram_id,comparison,observed_value,reason)
+                       VALUES('another-tenant','legacy-operation','operator_finalized_target_present',
+                              1,'target_present','value','tenant FK regression')"""
+                )
+            self.assertEqual(
+                tuple(db.execute(
+                    "SELECT amount_minor, entry_type FROM wallet_ledger WHERE idempotency_key='legacy-ledger'"
+                ).fetchone()),
+                (2500, "deposit"),
+            )
+            self.assertEqual(
+                tuple(db.execute(
+                    "SELECT amount_minor, status FROM customer_orders WHERE order_id='legacy-order'"
+                ).fetchone()),
+                (1200, "pending"),
+            )
+            self.assertEqual(
+                tuple(db.execute(
+                    "SELECT amount_minor, status FROM payment_attempts WHERE payment_id='legacy-payment'"
+                ).fetchone()),
+                (1300, "pending"),
+            )
+            self.assertEqual(
+                tuple(db.execute(
+                    "SELECT amount_minor, status FROM customer_service_operations "
+                    "WHERE operation_id='legacy-operation'"
+                ).fetchone()),
+                (400, "reconcile_required"),
+            )
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM customer_service_operation_events"
+            ).fetchone()[0], 0)
+
+        # A second open must not reapply or duplicate either migration.
+        reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        with reopened._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 9)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_migration_failure_rolls_back_schema_data_and_version_row(self):
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="rollback-ledger",
+                                     amount_minor=900, entry_type="deposit")
+        with self.store._connect() as db:
+            db.execute("DROP INDEX IF EXISTS uq_reseller_idempotency")
+            for table, column in (
+                ("panel_connections", "metadata_json"),
+                ("reseller_accounts", "idempotency_key"),
+                ("customer_products", "category_id"),
+                ("customer_orders", "product_snapshot_json"),
+            ):
+                db.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+            db.execute("DELETE FROM schema_migrations")
+            db.execute(
+                """CREATE TRIGGER injected_migration_failure
+                   BEFORE INSERT ON schema_migrations
+                   WHEN NEW.version = 1
+                   BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END"""
+            )
+
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "injected migration failure"):
+            CustomerDataStore(self.path, tenant_id="bot-alpha")
+
+        with sqlite3.connect(self.path) as db:
+            db.row_factory = sqlite3.Row
+            self.assertNotIn("metadata_json", {
+                row["name"] for row in db.execute("PRAGMA table_info(panel_connections)")
+            })
+            self.assertNotIn("idempotency_key", {
+                row["name"] for row in db.execute("PRAGMA table_info(reseller_accounts)")
+            })
+            self.assertNotIn("category_id", {
+                row["name"] for row in db.execute("PRAGMA table_info(customer_products)")
+            })
+            self.assertNotIn("product_snapshot_json", {
+                row["name"] for row in db.execute("PRAGMA table_info(customer_orders)")
+            })
+            self.assertIsNone(db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='uq_reseller_idempotency'"
+            ).fetchone())
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 0)
+            self.assertEqual(tuple(db.execute(
+                "SELECT amount_minor, entry_type FROM wallet_ledger WHERE idempotency_key='rollback-ledger'"
+            ).fetchone()), (900, "deposit"))
+
+    def test_unknown_future_schema_version_fails_closed(self):
+        with self.store._connect() as db:
+            db.execute(
+                "INSERT INTO schema_migrations(version,name) VALUES(99,'future_schema')"
+            )
+        with self.assertRaisesRegex(CustomerStoreError, "newer than this application supports"):
+            CustomerDataStore(self.path, tenant_id="bot-alpha")
+
     def test_existing_database_migrates_product_categories_safely(self):
         legacy_path = str(Path(self.tmp.name) / "legacy.sqlite3")
         with sqlite3.connect(legacy_path) as db:
@@ -585,6 +1032,87 @@ class CustomerDataStoreTests(unittest.TestCase):
         migrated.put_product(product_id="legacy-item", title="Legacy item", price_minor=100,
                               category_id="legacy-cat", enabled=True)
         self.assertEqual(migrated.list_products(category_id="legacy-cat")[0]["product_id"], "legacy-item")
+
+    def test_concurrent_inventory_purchases_cannot_sell_the_last_key_twice(self):
+        self.store.ensure_customer(1002, "bob", "Bob")
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="last-key-fund-a",
+                                     amount_minor=3000, entry_type="deposit")
+        self.store.post_wallet_entry(telegram_id=1002, idempotency_key="last-key-fund-b",
+                                     amount_minor=3000, entry_type="deposit")
+        self.store.put_manual_product(product_id="last-key", title="Last key", price_minor=700,
+                                      delivery_mode="inventory")
+        self.store.add_manual_inventory_key(product_id="last-key", secret_payload="ONLY-ONE-KEY")
+        def buy(uid: int):
+            try:
+                return self.store.buy_manual_product(telegram_id=uid, product_id="last-key",
+                    idempotency_key=f"last-key-order-{uid}")
+            except CustomerStoreError as exc:
+                return str(exc)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(buy, (1001, 1002)))
+        successes = [item for item in outcomes if isinstance(item, dict)]
+        failures = [item for item in outcomes if isinstance(item, str)]
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(successes[0]["delivery_payload"], "ONLY-ONE-KEY")
+        self.assertEqual(failures, ["Manual product is out of stock; no wallet debit was made"])
+        self.assertEqual(sorted((self.store.wallet_balance(1001), self.store.wallet_balance(1002))), [2300, 3000])
+        self.assertEqual(self.store.manual_inventory_count("last-key"), 0)
+
+    def test_manual_order_idempotent_replay_returns_original_purchase_snapshot(self):
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="manual-replay-fund",
+                                     amount_minor=3000, entry_type="deposit")
+        self.store.put_manual_product(product_id="manual-replay", title="Original title", price_minor=1200,
+                                      currency="IRR", delivery_mode="instant",
+                                      delivery_payload="original-delivery")
+        first = self.store.buy_manual_product(telegram_id=1001, product_id="manual-replay",
+                                              idempotency_key="manual-replay-key")
+        # Product edits after purchase must not rewrite the order's original fulfillment contract.
+        self.store.put_manual_product(product_id="manual-replay", title="Edited title", price_minor=2500,
+                                      currency="IRR", delivery_mode="manual", delivery_payload="new-delivery")
+        replay = self.store.buy_manual_product(telegram_id=1001, product_id="manual-replay",
+                                               idempotency_key="manual-replay-key")
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["order_id"], first["order_id"])
+        self.assertEqual(replay["title"], "Original title")
+        self.assertEqual(replay["delivery_mode"], "instant")
+        self.assertEqual(replay["delivery_payload"], "original-delivery")
+        self.assertEqual(self.store.wallet_balance(1001), 1800)
+
+    def test_inventory_order_replay_returns_same_key_without_second_debit(self):
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="inventory-replay-fund",
+                                     amount_minor=2500, entry_type="deposit")
+        self.store.put_manual_product(product_id="inventory-replay", title="License", price_minor=700,
+                                      currency="IRR", delivery_mode="inventory")
+        self.store.add_manual_inventory_key(product_id="inventory-replay", secret_payload="LICENSE-ONE")
+        first = self.store.buy_manual_product(telegram_id=1001, product_id="inventory-replay",
+                                              idempotency_key="inventory-replay-key")
+        replay = self.store.buy_manual_product(telegram_id=1001, product_id="inventory-replay",
+                                               idempotency_key="inventory-replay-key")
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["delivery_payload"], "LICENSE-ONE")
+        self.assertEqual(replay["order_id"], first["order_id"])
+        self.assertEqual(self.store.manual_inventory_count("inventory-replay"), 0)
+        self.assertEqual(self.store.wallet_balance(1001), 1800)
+
+    def test_fulfilled_manual_order_replay_returns_original_delivery(self):
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="manual-delivery-replay-fund",
+                                     amount_minor=2500, entry_type="deposit")
+        self.store.put_manual_product(product_id="manual-deliv-replay", title="Manual original", price_minor=700,
+                                      currency="IRR", delivery_mode="manual")
+        first = self.store.buy_manual_product(telegram_id=1001, product_id="manual-deliv-replay",
+                                              idempotency_key="manual-delivery-replay-key")
+        self.store.fulfill_manual_order(order_id=first["order_id"], delivery_payload="ACTIVATION-ORIGINAL",
+                                        fulfilled_by=6883349141)
+        self.store.put_manual_product(product_id="manual-deliv-replay", title="Renamed product", price_minor=800,
+                                      currency="IRR", delivery_mode="instant", delivery_payload="DIFFERENT")
+        replay = self.store.buy_manual_product(telegram_id=1001, product_id="manual-deliv-replay",
+                                               idempotency_key="manual-delivery-replay-key")
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["title"], "Manual original")
+        self.assertEqual(replay["delivery_mode"], "manual")
+        self.assertEqual(replay["status"], "fulfilled")
+        self.assertEqual(replay["delivery_payload"], "ACTIVATION-ORIGINAL")
+        self.assertEqual(self.store.wallet_balance(1001), 1800)
 
     def test_manual_orders_can_be_fulfilled_once_with_staff_audit(self):
         self.store.post_wallet_entry(telegram_id=1001, idempotency_key="manual-fund",
@@ -612,7 +1140,113 @@ class CustomerDataStoreTests(unittest.TestCase):
             event = db.execute("SELECT event_type,actor_telegram_id FROM manual_product_order_events WHERE tenant_id=? AND order_id=?",
                                (self.store.tenant_id, order["order_id"])).fetchone()
         self.assertEqual(tuple(event), ("fulfilled", 6883349141))
+        with self.store._connect() as db:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                db.execute("UPDATE manual_product_order_events SET event_type='edited' WHERE tenant_id=? AND order_id=?",
+                           (self.store.tenant_id, order["order_id"]))
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                db.execute("DELETE FROM manual_product_order_events WHERE tenant_id=? AND order_id=?",
+                           (self.store.tenant_id, order["order_id"]))
         self.assertEqual(self.store.wallet_balance(1001), 1800)
+
+    def test_manual_fulfillment_enqueues_durable_notification_atomically(self):
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="notify-outbox-fund",
+                                     amount_minor=3000, entry_type="deposit")
+        self.store.put_manual_product(product_id="outbox-plan", title="Outbox plan", price_minor=700,
+                                     delivery_mode="manual")
+        order = self.store.buy_manual_product(telegram_id=1001, product_id="outbox-plan",
+                                              idempotency_key="outbox-order")
+        fulfilled = self.store.fulfill_manual_order(order_id=order["order_id"],
+            delivery_payload="OUTBOX-SECRET-DELIVERY", fulfilled_by=6883349141)
+        self.assertEqual(fulfilled["status"], "fulfilled")
+        claimed = self.store.claim_manual_delivery_notifications(now=time.time() + 10)
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(claimed[0]["order_id"], order["order_id"])
+        self.assertEqual(claimed[0]["telegram_id"], 1001)
+        self.assertEqual(claimed[0]["delivery_payload"], "OUTBOX-SECRET-DELIVERY")
+        self.store.mark_manual_delivery_notification_sent(claimed[0]["notification_id"], now=time.time() + 11)
+        self.assertEqual(self.store.claim_manual_delivery_notifications(now=time.time() + 20), [])
+        self.assertEqual(self.store.wallet_balance(1001), 2300)
+
+    def test_manual_delivery_notifications_are_tenant_scoped(self):
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="notify-tenant-fund",
+                                     amount_minor=3000, entry_type="deposit")
+        self.store.put_manual_product(product_id="tenant-plan", title="Tenant plan", price_minor=700,
+                                      delivery_mode="manual")
+        order = self.store.buy_manual_product(telegram_id=1001, product_id="tenant-plan",
+                                              idempotency_key="tenant-order")
+        self.store.fulfill_manual_order(order_id=order["order_id"], delivery_payload="TENANT-PRIVATE-DELIVERY",
+                                        fulfilled_by=6883349141)
+        other_tenant = CustomerDataStore(self.path, tenant_id="bot-beta")
+        other_tenant.ensure_customer(2002, "bob", "Bob")
+        self.assertEqual(other_tenant.claim_manual_delivery_notifications(now=time.time() + 10), [])
+        claimed = self.store.claim_manual_delivery_notifications(now=time.time() + 10)
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(claimed[0]["delivery_payload"], "TENANT-PRIVATE-DELIVERY")
+
+    def test_manual_notification_enqueue_failure_rolls_back_fulfillment(self):
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="notify-rollback-fund",
+                                     amount_minor=3000, entry_type="deposit")
+        self.store.put_manual_product(product_id="rollback-plan", title="Rollback plan", price_minor=700,
+                                      delivery_mode="manual")
+        order = self.store.buy_manual_product(telegram_id=1001, product_id="rollback-plan",
+                                              idempotency_key="rollback-order")
+        with self.store._connect() as db:
+            db.execute("""CREATE TRIGGER fail_manual_delivery_enqueue
+                BEFORE INSERT ON manual_delivery_notifications
+                BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END""")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "injected outbox failure"):
+            self.store.fulfill_manual_order(order_id=order["order_id"], delivery_payload="ROLLBACK-DELIVERY",
+                                            fulfilled_by=6883349141)
+        with self.store._connect() as db:
+            row = db.execute("SELECT status,delivery_payload FROM manual_product_orders WHERE order_id=?",
+                             (order["order_id"],)).fetchone()
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM manual_delivery_notifications").fetchone()[0], 0)
+        self.assertEqual(tuple(row), ("pending_delivery", ""))
+        self.assertEqual(self.store.wallet_balance(1001), 2300)
+
+    def test_manual_delivery_notification_stale_claim_is_recovered_after_restart(self):
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="notify-stale-fund",
+                                     amount_minor=3000, entry_type="deposit")
+        self.store.put_manual_product(product_id="stale-plan", title="Stale plan", price_minor=700,
+                                      delivery_mode="manual")
+        order = self.store.buy_manual_product(telegram_id=1001, product_id="stale-plan",
+                                              idempotency_key="stale-order")
+        self.store.fulfill_manual_order(order_id=order["order_id"], delivery_payload="STALE-DELIVERY",
+                                        fulfilled_by=6883349141)
+        now = time.time() + 10
+        first = self.store.claim_manual_delivery_notifications(now=now, lease_seconds=300)
+        self.assertEqual(first[0]["attempts"], 1)
+        reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        recovered = reopened.claim_manual_delivery_notifications(now=now + 301, lease_seconds=300)
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["notification_id"], first[0]["notification_id"])
+        self.assertEqual(recovered[0]["attempts"], 2)
+        self.assertEqual(reopened.wallet_balance(1001), 2300)
+
+    def test_manual_delivery_notification_retry_backoff_and_dead_letter(self):
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="notify-retry-fund",
+                                     amount_minor=3000, entry_type="deposit")
+        self.store.put_manual_product(product_id="retry-plan", title="Retry plan", price_minor=700,
+                                      delivery_mode="manual")
+        order = self.store.buy_manual_product(telegram_id=1001, product_id="retry-plan",
+                                              idempotency_key="retry-order")
+        self.store.fulfill_manual_order(order_id=order["order_id"], delivery_payload="RETRY-DELIVERY",
+                                        fulfilled_by=6883349141)
+        now = time.time() + 10
+        item = self.store.claim_manual_delivery_notifications(now=now)[0]
+        self.store.retry_manual_delivery_notification(item["notification_id"], attempt=item["attempts"],
+                                                     error_code="telegram_error", now=now, max_attempts=2)
+        self.assertEqual(self.store.claim_manual_delivery_notifications(now=now + 1), [])
+        second = self.store.claim_manual_delivery_notifications(now=now + 2)[0]
+        self.store.retry_manual_delivery_notification(second["notification_id"], attempt=second["attempts"],
+                                                     error_code="telegram_error", now=now + 2, max_attempts=2)
+        self.assertEqual(self.store.claim_manual_delivery_notifications(now=now + 9999), [])
+        with self.store._connect() as db:
+            row = db.execute("SELECT status,last_error_code FROM manual_delivery_notifications WHERE order_id=?",
+                              (order["order_id"],)).fetchone()
+        self.assertEqual(tuple(row), ("dead", "telegram_error"))
+        self.assertEqual(self.store.wallet_balance(1001), 2300)
 
     def test_product_rejects_unknown_category(self):
         with self.assertRaisesRegex(CustomerStoreError, "category does not exist"):
@@ -652,6 +1286,64 @@ class CustomerDataStoreTests(unittest.TestCase):
         messages = self.store.ticket_messages("ticket-1", telegram_id=1001)
         self.assertEqual([m["sender_type"] for m in messages], ["customer", "staff"])
         self.assertEqual(self.store.ticket_messages("ticket-1", telegram_id=1002), [])
+
+
+    def test_manual_order_snapshot_migration_backfills_legacy_order(self):
+        self.store.put_manual_product(product_id="legacy-order", title="Legacy product title", price_minor=500,
+                                      currency="IRR", delivery_mode="inventory")
+        with self.store._connect() as db:
+            db.execute("ALTER TABLE manual_product_orders DROP COLUMN product_title_snapshot")
+            db.execute("ALTER TABLE manual_product_orders DROP COLUMN delivery_mode_snapshot")
+            db.execute("DELETE FROM schema_migrations WHERE version=4")
+            db.execute("""INSERT INTO manual_product_orders
+                (tenant_id,order_id,telegram_id,product_id,amount_minor,currency,status,idempotency_key,delivery_payload)
+                VALUES('bot-alpha','legacy-order-1',1001,'legacy-order',500,'IRR','fulfilled',
+                       'legacy-order-key','LEGACY-DELIVERY')""")
+
+        migrated = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        replay = migrated.buy_manual_product(telegram_id=1001, product_id="legacy-order",
+                                             idempotency_key="legacy-order-key")
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["title"], "Legacy product title")
+        self.assertEqual(replay["delivery_mode"], "inventory")
+        self.assertEqual(replay["delivery_payload"], "LEGACY-DELIVERY")
+        with migrated._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=4").fetchone()[0], 1)
+
+    def test_manual_shop_migration_preserves_existing_rows_and_creates_missing_tables(self):
+        with self.store._connect() as db:
+            db.execute(
+                "INSERT INTO manual_products(tenant_id,product_id,title,price_minor,currency,delivery_mode) "
+                "VALUES('bot-alpha','legacy-shop','Legacy shop item',500,'IRR','manual')"
+            )
+            db.execute("DELETE FROM schema_migrations WHERE version=3")
+
+        reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        with reopened._connect() as db:
+            self.assertEqual(
+                tuple(db.execute("SELECT product_id,title,price_minor FROM manual_products").fetchone()),
+                ("legacy-shop", "Legacy shop item", 500),
+            )
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=3").fetchone()[0], 1)
+            db.execute("DROP TABLE manual_delivery_notifications")
+            db.execute("DROP TABLE manual_product_order_events")
+            db.execute("DROP TABLE manual_product_orders")
+            db.execute("DROP TABLE manual_product_inventory")
+            db.execute("DROP TABLE manual_products")
+            db.execute("DELETE FROM schema_migrations WHERE version IN (3,4,5)")
+
+        recreated = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        with recreated._connect() as db:
+            tables = {row["name"] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )}
+            self.assertTrue({
+                "manual_products", "manual_product_inventory",
+                "manual_product_orders", "manual_product_order_events", "manual_delivery_notifications",
+            }.issubset(tables))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=3").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=5").fetchone()[0], 1)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
 
 if __name__ == "__main__":
