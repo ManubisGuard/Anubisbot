@@ -1,5 +1,6 @@
 import json
 import unittest
+import uuid
 from manubisguard.panels.adapters.sanaei import SanaeiAdapter
 from manubisguard.panels.contracts import PanelConnection, PanelError, UserCreate, UserUpdate
 
@@ -99,6 +100,101 @@ class SanaeiAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[1][2]['totalGB'],3)
         self.assertFalse(calls[1][2]['enable'])
         self.assertEqual(calls[1][2]['id'],'uuid-1')
+
+    async def test_legacy_create_and_list_use_single_inbound_contract(self):
+        calls=[]
+        listed={'id':'uuid-existing','email':'existing','totalGB':2,'expiryTime':0,'enable':True,'up':3,'down':4}
+        def handler(method,path,kwargs):
+            calls.append((method,path,kwargs.get('json'),kwargs.get('data')))
+            if path == '/login': return Response(200,{'success':True})
+            if path == '/panel/api/inbounds/get/7':
+                return Response(200,{'success':True,'obj':{'id':7,'protocol':'vless','settings':{'clients':[]}}})
+            if path == '/panel/api/inbounds/addClient':
+                body=json.loads(kwargs['json']['settings'])
+                self.assertEqual(kwargs['json']['id'],7)
+                self.assertEqual(body['clients'][0]['email'],'new-user')
+                return Response(200,{'success':True,'obj':None})
+            if path == '/panel/api/inbounds/list':
+                return Response(200,{'success':True,'obj':[{'id':7,'protocol':'vless',
+                    'settings':json.dumps({'clients':[listed]})}]})
+            return Response(200,{'success':True,'obj':None})
+        adapter=SanaeiAdapter(secret_resolver=lambda _:'password',
+            client_factory=lambda **kw:FakeClient(handler,kw['base_url']))
+        conn=PanelConnection(id='legacy',tenant_id='t',name='Legacy',kind='sanaei',
+            base_url='https://s.example',auth_mode='username_password',secret_ref='s',
+            metadata={'username':'admin','inbound_ids':[7]})
+        created=await adapter.create_user(conn,UserCreate(username='new-user',data_limit_bytes=2 * 1024**3,
+            extra={'inbound_ids':[7]}))
+        users=await adapter.list_users(conn,limit=999,offset=0)
+        self.assertEqual(created.username,'new-user')
+        uuid.UUID(created.metadata['uuid'])
+        self.assertIn(('GET','/panel/api/inbounds/get/7'),[(m,p) for m,p,_,_ in calls])
+        self.assertIn(('POST','/panel/api/inbounds/addClient'),[(m,p) for m,p,_,_ in calls])
+        self.assertEqual([user.username for user in users],['existing'])
+        self.assertIn(('GET','/panel/api/inbounds/list'),[(m,p) for m,p,_,_ in calls])
+
+    async def test_legacy_create_fails_closed_for_unmapped_protocol_credentials(self):
+        calls=[]
+        def handler(method,path,kwargs):
+            calls.append((method,path))
+            if path == '/login': return Response(200,{'success':True})
+            if path == '/panel/api/inbounds/get/7':
+                return Response(200,{'success':True,'obj':{'id':7,'protocol':'trojan','settings':{'clients':[]}}})
+            return Response(200,{'success':True,'obj':None})
+        adapter=SanaeiAdapter(secret_resolver=lambda _:'password',
+            client_factory=lambda **kw:FakeClient(handler,kw['base_url']))
+        conn=PanelConnection(id='legacy',tenant_id='t',name='Legacy',kind='sanaei',
+            base_url='https://s.example',auth_mode='username_password',secret_ref='s',
+            metadata={'username':'admin','inbound_ids':[7]})
+        with self.assertRaisesRegex(PanelError,'VLESS/VMess'):
+            await adapter.create_user(conn,UserCreate(username='new-user',data_limit_bytes=2 * 1024**3,
+                extra={'inbound_ids':[7]}))
+        self.assertNotIn(('POST','/panel/api/inbounds/addClient'),calls)
+
+    async def test_legacy_create_rejects_invalid_supplied_uuid_before_mutation(self):
+        calls=[]
+        def handler(method,path,kwargs):
+            calls.append((method,path))
+            if path == '/login': return Response(200,{'success':True})
+            if path == '/panel/api/inbounds/get/7':
+                return Response(200,{'success':True,'obj':{'id':7,'protocol':'vless','settings':{'clients':[]}}})
+            return Response(200,{'success':True,'obj':None})
+        adapter=SanaeiAdapter(secret_resolver=lambda _:'password',
+            client_factory=lambda **kw:FakeClient(handler,kw['base_url']))
+        conn=PanelConnection(id='legacy',tenant_id='t',name='Legacy',kind='sanaei',
+            base_url='https://s.example',auth_mode='username_password',secret_ref='s',
+            metadata={'username':'admin','inbound_ids':[7]})
+        with self.assertRaisesRegex(PanelError,'valid UUID'):
+            await adapter.create_user(conn,UserCreate(username='new-user',data_limit_bytes=2 * 1024**3,
+                extra={'inbound_ids':[7],'uuid':'not-a-uuid'}))
+        self.assertNotIn(('POST','/panel/api/inbounds/addClient'),calls)
+
+    async def test_legacy_update_and_delete_choose_protocol_specific_client_id(self):
+        for protocol, expected_id in (
+            ('vless','uuid-1'), ('vmess','uuid-1'),
+            ('trojan','trojan-password'), ('shadowsocks','alice'),
+        ):
+            with self.subTest(protocol=protocol):
+                calls=[]
+                client={'id':'uuid-1','password':'trojan-password','email':'alice',
+                    'totalGB':2,'expiryTime':0,'enable':True,'up':1,'down':2}
+                def handler(method,path,kwargs):
+                    calls.append((method,path,kwargs.get('json')))
+                    if path == '/login': return Response(200,{'success':True})
+                    if path == '/panel/api/inbounds/list':
+                        return Response(200,{'success':True,'obj':[{'id':7,'protocol':protocol,
+                            'settings':json.dumps({'clients':[client]})}]})
+                    return Response(200,{'success':True,'obj':None})
+                adapter=SanaeiAdapter(secret_resolver=lambda _:'password',
+                    client_factory=lambda **kw:FakeClient(handler,kw['base_url']))
+                conn=PanelConnection(id='legacy',tenant_id='t',name='Legacy',kind='sanaei',
+                    base_url='https://s.example',auth_mode='username_password',secret_ref='s',
+                    metadata={'username':'admin','inbound_ids':[7]})
+                await adapter.update_user(conn,'alice',UserUpdate(status='disabled'))
+                await adapter.delete_user(conn,'alice')
+                paths=[path for _,path,_ in calls]
+                self.assertIn(f'/panel/api/inbounds/updateClient/{expected_id}',paths)
+                self.assertIn(f'/panel/api/inbounds/7/delClient/{expected_id}',paths)
 
     async def test_token_delete_uses_documented_endpoint(self):
         calls=[]

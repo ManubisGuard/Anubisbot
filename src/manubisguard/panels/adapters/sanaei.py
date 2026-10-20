@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import json
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit
+from uuid import UUID, uuid4
 
 from ..contracts import (PanelCapabilities, PanelConnection, PanelError, PanelUser, UserCreate,
                          UserUpdate, local_capability_report)
@@ -181,8 +182,31 @@ class SanaeiAdapter:
                 except ValueError: settings = {}
             for client in (settings.get("clients", []) if isinstance(settings, dict) else []):
                 if isinstance(client, dict) and client.get("email") == username:
-                    return {"inboundIds": [inbound.get("id")], "client": client}, client
+                    return {"inboundIds": [inbound.get("id")], "protocol": str(inbound.get("protocol") or "").lower(),
+                            "client": client}, client
         raise PanelError("Sanaei client was not found")
+
+    @staticmethod
+    def _legacy_client_identifier(inbound: dict[str, Any], client: dict[str, Any]) -> str:
+        """Use the clientId documented by 3x-ui for the inbound's protocol."""
+        protocol = str(inbound.get("protocol") or "").lower()
+        field = {"vless": "id", "vmess": "id", "trojan": "password", "shadowsocks": "email"}.get(protocol)
+        if field is None:
+            raise PanelError("Legacy Sanaei client mutation is unsupported for this inbound protocol")
+        identifier = client.get(field)
+        if not isinstance(identifier, str) or not identifier.strip():
+            raise PanelError("Legacy Sanaei client identifier is missing")
+        return identifier.strip()
+
+    async def _legacy_create_protocol(self, connection: PanelConnection, inbound_id: int) -> None:
+        result = await self._request(connection, "GET", f"/panel/api/inbounds/get/{inbound_id}")
+        inbound = self._obj(result)
+        protocol = str(inbound.get("protocol") or "").lower()
+        # The current create payload can safely provision VLESS/VMess IDs. Trojan
+        # and Shadowsocks require protocol-specific secrets that this contract does
+        # not yet accept, so fail closed rather than create malformed clients.
+        if protocol not in {"vless", "vmess"}:
+            raise PanelError("Legacy Sanaei create currently supports VLESS/VMess inbounds only")
 
     async def get_user(self, connection: PanelConnection, username: str) -> PanelUser:
         obj, _ = await self._find_client(connection, username)
@@ -217,6 +241,15 @@ class SanaeiAdapter:
         else:
             if len(inbound_ids) != 1:
                 raise PanelError("Legacy Sanaei API supports one inbound per create operation in this adapter")
+            await self._legacy_create_protocol(connection, inbound_ids[0])
+            provided_uuid = user.extra.get("uuid")
+            if provided_uuid:
+                try:
+                    client["id"] = str(UUID(str(provided_uuid)))
+                except (ValueError, TypeError, AttributeError):
+                    raise PanelError("Legacy Sanaei VLESS/VMess client ID must be a valid UUID") from None
+            else:
+                client["id"] = str(uuid4())
             settings = {"clients": [client], "decryption": "none", "fallbacks": []}
             result = await self._request(connection, "POST", "/panel/api/inbounds/addClient",
                                          payload={"id": inbound_ids[0], "settings": json.dumps(settings, separators=(",", ":"))})
@@ -239,10 +272,11 @@ class SanaeiAdapter:
             mapped = self._obj(result)
             return self._map(mapped if "client" in mapped else {"client": merged, "inboundIds": obj.get("inboundIds", [])}, connection.base_url)
         inbound_ids = obj.get("inboundIds") or connection.metadata.get("inbound_ids") or []
-        if len(inbound_ids) != 1 or not client.get("id"):
-            raise PanelError("Legacy Sanaei update requires one inbound ID and a client UUID")
+        client_id = self._legacy_client_identifier(obj, client)
+        if len(inbound_ids) != 1:
+            raise PanelError("Legacy Sanaei update requires exactly one inbound ID")
         settings = {"clients": [merged], "decryption": "none", "fallbacks": []}
-        result = await self._request(connection, "POST", f"/panel/api/inbounds/updateClient/{quote(str(client['id']), safe='')}",
+        result = await self._request(connection, "POST", f"/panel/api/inbounds/updateClient/{quote(client_id, safe='')}",
                                      payload={"id": inbound_ids[0], "settings": json.dumps(settings, separators=(",", ":"))})
         return self._map({"client": merged, "inboundIds": inbound_ids}, connection.base_url)
 
@@ -253,9 +287,10 @@ class SanaeiAdapter:
             return
         obj, client = await self._find_client(connection, provider_user_id)
         inbound_ids = obj.get("inboundIds") or connection.metadata.get("inbound_ids") or []
-        if len(inbound_ids) != 1 or not client.get("id"):
-            raise PanelError("Legacy Sanaei delete requires one inbound ID and a client UUID")
-        await self._request(connection, "POST", f"/panel/api/inbounds/{int(inbound_ids[0])}/delClient/{quote(str(client['id']), safe='')}")
+        client_id = self._legacy_client_identifier(obj, client)
+        if len(inbound_ids) != 1:
+            raise PanelError("Legacy Sanaei delete requires exactly one inbound ID")
+        await self._request(connection, "POST", f"/panel/api/inbounds/{int(inbound_ids[0])}/delClient/{quote(client_id, safe='')}")
 
     async def list_users(self, connection: PanelConnection, *, limit: int = 200, offset: int = 0) -> list[PanelUser]:
         mode, _ = self._credentials(connection)
