@@ -323,6 +323,15 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("MANUBIS_CUSTOMER_WEBAPP_URL", rendered)
         self.assertIn("HTTPS", rendered)
 
+    async def test_trials_callback_clearly_reports_unavailable_until_implemented(self):
+        await self.bot._handle_callback({"id":"trial-cb","from":{"id":999},
+            "message":{"message_id":42,"chat":{"id":999,"type":"private"}},
+            "data":"customer:trials"})
+        rendered = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("هنوز پیاده‌سازی نشده", rendered)
+        self.assertIn("فعلاً در دسترس نیست", rendered)
+        self.assertNotIn("سرویس آزمایشی فعالی برای این حساب تعریف نشده", rendered)
+
     async def test_panel_page_explains_customer_boundary_and_no_live_connection(self):
         await self.bot._handle_callback({
             "id": "cb-1",

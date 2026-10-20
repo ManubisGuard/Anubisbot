@@ -2096,7 +2096,7 @@ class CustomerBot:
             await self.api.send_text(chat_id, "📱 مینی‌اپلیکیشن هنوز به این ربات متصل نشده است. پس از تنظیم آدرس امن، این گزینه فعال می‌شود.", BACK_MENU)
             return
         if key == "trials":
-            await self.api.send_text(chat_id, "🧪 در حال حاضر سرویس آزمایشی فعالی برای این حساب تعریف نشده است.", BACK_MENU)
+            await self.api.send_text(chat_id, "🧪 قابلیت تست/اشتراک آزمایشی هنوز پیاده‌سازی نشده و فعلاً در دسترس نیست. این گزینه تا زمان اتصال جریان واقعی فعال نخواهد شد.", BACK_MENU)
             return
         if key.startswith("manualbuy:") and not key.startswith("manualbuy_confirm:"):
             product_id = key.partition(":")[2]
