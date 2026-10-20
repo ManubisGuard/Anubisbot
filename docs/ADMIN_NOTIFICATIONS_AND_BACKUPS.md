@@ -2,18 +2,12 @@
 
 ## Current implementation boundary (2026-10-20)
 
-- SQLite migration v6 adds a durable support-ticket notification outbox. Mini App ticket creation and notification enqueue happen in the same DB transaction.
-- SQLite migration v7 adds tenant-scoped customer_notification_routes, with multiple numeric Telegram chat IDs per event and optional forum topic IDs.
-- SQLite migration v8 adds a persisted, tenant-scoped backup policy (frequency, timezone, destination, local path, Telegram chat/topic, retention) with `enabled=0` by default. Admins can configure/view it using `/backup-policy`; `/backup-policy enable` remains deliberately rejected because the scheduler, durable leases/recovery, Telegram upload and retention acceptance are incomplete.
-- SQLite is configured for same-host WAL and `synchronous=FULL`, with foreign keys and a 15-second busy timeout. WAL must not be used on a network filesystem.
-- Admin commands:
-  - /notify-route list
-  - /notify-route add support_ticket | CHAT_ID | TOPIC_ID
-  - /notify-route remove support_ticket | CHAT_ID | TOPIC_ID
-  - Use topic ID 0 for a chat without a forum topic. Group chat IDs are usually negative. The bot must be a member and have permission to send messages.
-- Ticket delivery uses configured support_ticket routes; if none exist, it falls back to MANUBISGUARD_CUSTOMER_ADMIN_IDS. The outbox retries with bounded exponential backoff, recovers stale claims and dead-letters after repeated failures.
-- Route keys currently registered: support_ticket, purchase, payment, service_test, bot_log, backup, wallet, service_change, security_alert.
-- Support-ticket delivery and the package-level one-shot backup worker now enqueue events through the route registry. The backup worker is not wired to an admin command or scheduler; `bot_log` and the other non-ticket event producers remain incomplete. Do not tell admins purchase/payment/log events are already routed.
+- SQLite migrations v6/v7 provide durable ticket notifications and tenant-scoped event destinations (numeric Telegram chat IDs plus optional forum topic IDs). Migration v9 adds a shared per-destination admin notification outbox with idempotency, retry/dead-letter states, claim leases and redacted payload allowlists.
+- Migration v8 persists a tenant-scoped backup policy (frequency, timezone, destination, local path, Telegram chat/topic, retention). It remains disabled by default; `/backup-policy enable` is rejected because a durable scheduler is not implemented.
+- The shared notification outbox is wired locally for wallet-ledger changes, verified wallet deposit/payment, customer purchases, manual product purchases, refunds, service-change reserve/complete/pre-provider-refund, admin panel checks (`service_test`), security alerts, and the one-shot backup worker. `bot_log` remains unwired. These are E2 local/mock results, not live Telegram delivery acceptance.
+- Admin commands include `/notify-route list`, `/notify-route add EVENT_KEY | CHAT_ID | TOPIC_ID`, and `/notify-route remove EVENT_KEY | CHAT_ID | TOPIC_ID`; topic ID 0 means a direct chat. The bot must be a member and have send permission. Existing ticket fallback to `MANUBISGUARD_CUSTOMER_ADMIN_IDS` remains documented; verify actual route behavior in tests before changing it.
+- The shared notification outbox retries with bounded exponential backoff, recovers stale claims and dead-letters repeated failures. Telegram delivery is at-least-once: a crash after Telegram accepts a send but before local success persistence may duplicate a notification.
+- SQLite uses same-host WAL, `synchronous=FULL`, foreign keys and a 15-second busy timeout. WAL must not be used on a network filesystem.
 
 ## Required event routing scope
 
@@ -30,18 +24,20 @@ Event groups to wire:
 - security_alert: auth abuse, repeated failures and privileged configuration changes.
 - backup: success/failure, size, destination and last/next run metadata; never include the encryption key.
 
-## Backup scheduling and destination policy (required; not yet implemented)
+## Backup scheduling and destination policy (partially implemented; E2 local only)
 
-The admin must be able to configure and inspect:
-- schedule: disabled by default; hourly/daily/custom interval and local timezone, with visible last-run and next-run times;
-- destination: local server directory, Telegram document upload to configured chat/topic, or both;
-- retention: local count/age policy and explicit cleanup preview before destructive deletion;
-- validation: SQLite online backup, integrity check, foreign-key check, restrictive file permissions, no overwrite of an existing backup path, and restore-to-new-path drills;
-- encryption: protect backups at rest where required, store key separately, and document independent key recovery; never send keys with backup files;
-- notifications: success/failure summaries through the backup event route and retry/dead-letter state for Telegram delivery;
-- controls: dry-run/preview, pause/resume, manual backup, verify backup, and restore drill that cannot overwrite the live database.
+Implemented and locally tested:
+- Admin-editable persisted schedule/timezone/destination/retention policy with disabled-by-default state and next-run preview.
+- Manual CLI backup, verify, and restore-to-new-path using SQLite's online backup API, integrity and foreign-key checks, restrictive file permissions, overwrite/symlink refusal and no live DB cutover.
+- Package-level `run_backup_once` creates one verified local snapshot beneath an explicitly approved private root, records a redacted run result and enqueues a backup notification. Failed/unverified snapshots are not recorded as success; a verified snapshot is retained if only status persistence fails.
 
-No timer, cron, production backup, Telegram upload, or cleanup job may be enabled until explicitly authorized. The existing scripts/customer_db_maintenance.py backup/verify/restore-to-new-path helper is a manual local tool. The package-level run_backup_once service is tested with disposable databases but is not exposed through a bot command or scheduler; it supports only local snapshots beneath an explicitly approved private directory. Telegram/both destinations fail closed, and no retention cleanup is performed.
+Still missing / not accepted:
+- A durable scheduler with persisted due times, leases, restart recovery, pause/resume and last/next run execution status.
+- Telegram document upload; `telegram`/`both` destinations fail closed.
+- Retention preview and cleanup worker, off-host backup and encryption-key recovery drill.
+- Bot command/UI to trigger the one-shot worker, dry-run/manual execution workflow and production-shaped restore drill.
+
+No timer, cron, production backup, Telegram upload or cleanup job may be enabled until explicitly authorized. `run_backup_once` is a library-level one-shot operation, not a scheduler or live acceptance.
 
 ## Acceptance checklist
 
@@ -64,6 +60,6 @@ Current evidence: local unit/mock tests only (E2). No live Telegram destination 
 - `/backup-policy schedule | hourly/daily/interval | Europe/Berlin | 03:00 | 1440` — configure frequency, IANA timezone, daily wall-clock time and interval length.
 - `/backup-policy destination | local/telegram/both | CHAT_ID-or-0 | TOPIC_ID | /var/lib/anubis-bot/backups` — configure destination and path. Telegram/both requires a non-zero numeric chat ID; topic 0 means no forum topic.
 - `/backup-policy retention | MAX_BACKUPS | MAX_AGE_DAYS` — configure retention bounds.
-- `/backup-policy enable` is deliberately rejected. Settings remain disabled until a scheduler with durable leases/restart recovery, retention preview, tested Telegram upload limits and restore acceptance are complete. The one-shot local worker is not a scheduler; no scheduled work is running.
+- `/backup-policy enable` is deliberately rejected. Settings remain disabled until a scheduler with durable leases/restart recovery, retention preview, tested Telegram upload limits and restore acceptance are complete. No scheduled work is running.
 
-Schedule validation uses IANA timezone data and stores policy per tenant. The one-shot local worker additionally requires the configured path to remain beneath an explicitly supplied approved root, rejects symlink components and requires current-user ownership plus private directory permissions. The scheduler still does not exist, and no production backup has been run.
+Schedule validation uses IANA timezone data and stores policy per tenant. The one-shot local worker requires the configured path to remain beneath an explicitly supplied approved root, rejects symlink components, and requires current-user ownership plus private directory permissions. No production backup has been run.

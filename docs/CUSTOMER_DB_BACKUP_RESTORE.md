@@ -36,7 +36,7 @@ A successful restore reports `restored_to_new_path=true` and `live_database_repl
 
 ## What this does not back up
 
-This utility handles one SQLite database per invocation. The package-level `run_backup_once` worker can be called by a future explicitly authorized manual runner; it verifies that the policy path stays beneath an approved private root, records the outcome and enqueues a redacted `backup` notification. It is not exposed as a bot command or scheduler, supports only the local destination, and never performs retention cleanup. Telegram/both policies fail closed until upload support is separately implemented and tested.
+This utility handles one SQLite database per invocation. The package-level `run_backup_once` worker verifies that the policy path stays beneath an approved private root, records the outcome and enqueues a redacted `backup` notification. It is currently a library-level one-shot operation, not exposed as a bot command or scheduler. It supports only the local destination and never performs retention cleanup. Telegram/both policies fail closed until upload support is separately implemented and tested.
 
 This utility does not back up other SQLite databases, external files/uploads, environment configuration, bot tokens, panel secrets, or encryption keys. Secret-store/vault encryption keys require a separately protected backup and a documented recovery/rotation procedure; a database restore without the correct key may leave encrypted credentials unrecoverable. Never place the key beside a database backup or in the same public/off-host bucket without independent access controls.
 
