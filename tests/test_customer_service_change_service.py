@@ -4,7 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from manubisguard.customer_store import CustomerDataStore
+from manubisguard.customer_store import CustomerDataStore, CustomerStoreError
 from manubisguard.panels.contracts import PanelCapabilities, PanelUser, UserUpdate
 from manubisguard.panels.registry import AdapterRegistry
 from manubisguard.sales.service import CustomerServiceChangeService, PurchaseNeedsReconciliation
@@ -110,6 +110,36 @@ class CustomerServiceChangeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.adapter.user.data_limit_bytes, 2 * 1024**3)
         self.assertEqual(self.store.get_customer_service("svc-1", 123)["traffic_limit_bytes"], 2 * 1024**3)
         self.assertEqual(self.store.wallet_balance(123), 4300)
+
+    async def test_confirmed_quote_rejects_changed_product_price_before_wallet_debit(self):
+        before_balance = self.store.wallet_balance(123)
+        self.store.put_product(product_id="basic", title="Basic", price_minor=800, currency="IRR",
+            panel_id="p1", traffic_bytes=1024**3, duration_hours=24, group_ids=["1"])
+        with self.assertRaisesRegex(CustomerStoreError, "quote changed"):
+            await self.service.change(telegram_id=123, service_id="svc-1", change_type="renewal",
+                idempotency_key="quote-price-changed", now=1000, expected_quote={
+                    "amount_minor": 700, "currency": "IRR", "quantity": 24,
+                    "before_expires_at": "2030-01-01T00:00:00+00:00",
+                    "target_expires_at": "2030-01-02T00:00:00+00:00"})
+        self.assertEqual(self.store.wallet_balance(123), before_balance)
+        self.assertEqual(self.adapter.update_calls, 0)
+        self.assertEqual(self.store.list_service_change_operations(status="all"), [])
+
+    async def test_confirmed_quote_rechecks_provider_state_and_reverses_reservation(self):
+        before_balance = self.store.wallet_balance(123)
+        self.adapter.user = replace(self.adapter.user,
+            expire_at=datetime(2030, 1, 1, 1, tzinfo=timezone.utc))
+        with self.assertRaisesRegex(CustomerStoreError, "expiry changed"):
+            await self.service.change(telegram_id=123, service_id="svc-1", change_type="renewal",
+                idempotency_key="quote-state-changed", now=1000, expected_quote={
+                    "amount_minor": 700, "currency": "IRR", "quantity": 24,
+                    "before_expires_at": "2030-01-01T00:00:00+00:00",
+                    "target_expires_at": "2030-01-02T00:00:00+00:00"})
+        self.assertEqual(self.store.wallet_balance(123), before_balance)
+        self.assertEqual(self.adapter.update_calls, 0)
+        operations = self.store.list_service_change_operations(status="all")
+        self.assertEqual(len(operations), 1)
+        self.assertEqual(operations[0]["status"], "refunded")
 
     async def test_ambiguous_provider_update_is_not_refunded_or_retried(self):
         self.adapter.fail_update = True

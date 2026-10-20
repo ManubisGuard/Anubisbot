@@ -119,7 +119,8 @@ class CustomerMiniAppWSGITests(unittest.TestCase):
             async def preview(self, *, telegram_id, service_id, change_type, now):
                 captured.update(telegram_id=telegram_id, service_id=service_id, change_type=change_type, now=now)
                 return {"service_id": service_id, "change_type": change_type, "amount_minor": 1000,
-                    "currency": "IRR", "quantity": 24, "target_expires_at": "2030-01-02T00:00:00+00:00",
+                    "currency": "IRR", "quantity": 24, "before_expires_at": "2030-01-01T00:00:00+00:00",
+                    "target_expires_at": "2030-01-02T00:00:00+00:00",
                     "provider_status": "active", "subscription_url": "https://secret.example/private",
                     "provider_token": "do-not-return"}
         self.app.service_change_service_factory = FakeChangeService
@@ -154,6 +155,52 @@ class CustomerMiniAppWSGITests(unittest.TestCase):
             body={"service_id": "svc-alice", "change_type": "traffic_topup"})
         self.assertEqual(failed["status"], "502 Bad Gateway")
         self.assertEqual(failed["body"], {"error": "service_change_preview_failed"})
+
+    def test_service_change_execution_requires_signed_quote_owner_and_allowlisted_result(self):
+        captured = {"changes": []}
+        class FakeChangeService:
+            def __init__(self, *args, **kwargs): pass
+            async def preview(self, *, telegram_id, service_id, change_type, now):
+                return {"service_id": service_id, "change_type": change_type, "amount_minor": 1000,
+                    "currency": "IRR", "quantity": 24, "before_expires_at": "2030-01-01T00:00:00+00:00",
+                    "target_expires_at": "2030-01-02T00:00:00+00:00", "provider_status": "active"}
+            async def change(self, **kwargs):
+                captured["changes"].append(kwargs)
+                return {"operation_id": "operation-123", "service_id": kwargs["service_id"],
+                    "change_type": kwargs["change_type"], "amount_minor": 1000, "currency": "IRR",
+                    "quantity": 24, "status": "completed", "expires_at": "2030-01-02T00:00:00+00:00",
+                    "provider_token": "must-not-leak"}
+        self.app.service_change_service_factory = FakeChangeService
+        preview_response = self.request("/api/v1/service-change-preview", init_data=signed_init_data(), method="POST",
+            body={"service_id": "svc-alice", "change_type": "renewal"})
+        self.assertEqual(preview_response["status"], "200 OK")
+        preview = preview_response["body"]["preview"]
+        token = preview_response["body"]["quote_token"]
+        self.assertIsNone(self.app._verify_service_change_quote(token, telegram_id=123, service_id="svc-alice",
+            change_type="renewal", now=NOW + 301))
+        quote = {key: preview[key] for key in ("amount_minor", "currency", "quantity", "before_expires_at", "target_expires_at")}
+        key = "service-change-test-id-123456"
+        tampered_quote = {**quote, "amount_minor": 1}
+        tampered = self.request("/api/v1/service-change", init_data=signed_init_data(), method="POST",
+            body={"service_id": "svc-alice", "change_type": "renewal", "idempotency_key": key,
+                  "quote": tampered_quote, "quote_token": token})
+        self.assertEqual(tampered["status"], "409 Conflict")
+        self.assertEqual(captured["changes"], [])
+        other_user = {"id": 456, "first_name": "Bob", "username": "bob"}
+        wrong_owner = self.request("/api/v1/service-change", init_data=signed_init_data(user=other_user), method="POST",
+            body={"service_id": "svc-alice", "change_type": "renewal", "idempotency_key": key,
+                  "quote": quote, "quote_token": token})
+        self.assertEqual(wrong_owner["status"], "409 Conflict")
+        self.assertEqual(captured["changes"], [])
+        success = self.request("/api/v1/service-change", init_data=signed_init_data(), method="POST",
+            body={"service_id": "svc-alice", "change_type": "renewal", "idempotency_key": key,
+                  "quote": quote, "quote_token": token})
+        self.assertEqual(success["status"], "200 OK")
+        self.assertEqual(captured["changes"][0]["telegram_id"], 123)
+        self.assertEqual({key: value for key, value in captured["changes"][0]["expected_quote"].items() if key != "quote_issued_at"}, quote)
+        self.assertEqual(captured["changes"][0]["expected_quote"]["quote_issued_at"], NOW)
+        self.assertEqual(success["body"]["result"]["operation_id"], "operation-123")
+        self.assertNotIn("provider_token", json.dumps(success["body"]))
 
     def test_shop_hides_panel_binding_and_only_returns_enabled_products(self):
         response = self.request("/api/v1/shop", init_data=signed_init_data())

@@ -6,6 +6,7 @@ views and a wallet-backed purchase endpoint; payment gateway and admin routes ar
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -203,6 +204,48 @@ class CustomerMiniAppWSGI:
             "idempotent_replay": bool(outcome.idempotent_replay),
         })
 
+    def _service_change_quote_key(self) -> bytes:
+        return hmac.new(self.bot_token.encode("utf-8"), b"manubis-service-change-quote-v1", hashlib.sha256).digest()
+
+    def _sign_service_change_quote(self, *, telegram_id: int, service_id: str,
+                                   change_type: str, preview: dict[str, Any], issued_at: int) -> tuple[str, dict[str, Any]]:
+        keys = ["amount_minor", "currency", "quantity"]
+        keys.append("before_expires_at" if change_type == "renewal" else "before_traffic_limit_bytes")
+        keys.append("target_expires_at" if change_type == "renewal" else "target_traffic_limit_bytes")
+        if any(key not in preview for key in keys):
+            raise ValueError("Incomplete service-change quote")
+        quote = {key: preview[key] for key in keys}
+        payload = json.dumps({"telegram_id": telegram_id, "service_id": service_id,
+            "change_type": change_type, "issued_at": int(issued_at), "quote": quote},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        encode = lambda value: base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+        signature = hmac.new(self._service_change_quote_key(), payload, hashlib.sha256).digest()
+        return encode(payload) + "." + encode(signature), quote
+
+    def _verify_service_change_quote(self, token: Any, *, telegram_id: int, service_id: str,
+                                     change_type: str, now: int) -> dict[str, Any] | None:
+        if not isinstance(token, str) or len(token) > 4096 or token.count(".") != 1:
+            return None
+        try:
+            payload_part, signature_part = token.split(".", 1)
+            decode = lambda value: base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+            payload = decode(payload_part)
+            supplied_signature = decode(signature_part)
+            expected_signature = hmac.new(self._service_change_quote_key(), payload, hashlib.sha256).digest()
+            if not hmac.compare_digest(expected_signature, supplied_signature):
+                return None
+            data = json.loads(payload.decode("utf-8"))
+            issued_at = data.get("issued_at")
+            if (isinstance(issued_at, bool) or not isinstance(issued_at, int)
+                    or issued_at > now + 30 or now - issued_at > 300):
+                return None
+            if (data.get("telegram_id") != telegram_id or data.get("service_id") != service_id
+                    or data.get("change_type") != change_type or not isinstance(data.get("quote"), dict)):
+                return None
+            return {"_quote": data["quote"], "_issued_at": issued_at}
+        except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+            return None
+
     def _preview_service_change(self, environ: dict[str, Any], telegram_id: int,
                                 start_response: Callable[..., Any]) -> list[bytes]:
         if str(environ.get("CONTENT_TYPE", "")).split(";", 1)[0].strip().lower() != "application/json":
@@ -227,25 +270,98 @@ class CustomerMiniAppWSGI:
         from manubisguard.panels.registry import default_registry
         from manubisguard.sales.service import CustomerServiceChangeService
         resolver = self._resolve_panel_secret
+        quote_issued_at = int(self.clock())
         try:
             registry = default_registry(secret_resolver=resolver)
             factory = self.service_change_service_factory or CustomerServiceChangeService
             service = factory(self.store, secret_resolver=resolver, registry=registry)
             preview = asyncio.run(service.preview(telegram_id=telegram_id, service_id=service_id,
-                change_type=change_type, now=int(self.clock())))
+                change_type=change_type, now=quote_issued_at))
         except Exception as exc:
             from manubisguard.customer_store import CustomerStoreError
             if isinstance(exc, CustomerStoreError):
                 return self._response(start_response, HTTPStatus.CONFLICT, {"error": "service_change_unavailable"})
             return self._response(start_response, HTTPStatus.BAD_GATEWAY, {"error": "service_change_preview_failed"})
-        # Response is an explicit allowlist: never serialize provider models, URLs or credentials.
+        # The signed quote binds owner, service, type, price, quantity and observed before/target state.
+        try:
+            token, _ = self._sign_service_change_quote(telegram_id=telegram_id, service_id=service_id,
+                change_type=change_type, preview=preview, issued_at=quote_issued_at)
+        except (KeyError, TypeError, ValueError):
+            return self._response(start_response, HTTPStatus.BAD_GATEWAY, {"error": "service_change_preview_failed"})
         allowed = ("service_id", "change_type", "amount_minor", "currency", "quantity",
                    "provider_status", "before_expires_at", "target_expires_at", "remaining_seconds_before",
                    "before_traffic_limit_bytes", "target_traffic_limit_bytes", "traffic_used_bytes",
                    "remaining_traffic_bytes_before")
         return self._response(start_response, HTTPStatus.OK,
             {"preview": {key: preview[key] for key in allowed if key in preview},
-             "mutates_provider": False, "reserves_wallet": False})
+             "quote_token": token, "mutates_provider": False, "reserves_wallet": False})
+
+    def _execute_service_change(self, environ: dict[str, Any], telegram_id: int,
+                                start_response: Callable[..., Any]) -> list[bytes]:
+        if str(environ.get("CONTENT_TYPE", "")).split(";", 1)[0].strip().lower() != "application/json":
+            return self._response(start_response, HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": "json_required"})
+        try:
+            length = int(environ.get("CONTENT_LENGTH") or "0")
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0 or length > 4096:
+            return self._response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_request_body"})
+        try:
+            body = json.loads(environ["wsgi.input"].read(length).decode("utf-8"))
+        except (KeyError, UnicodeError, ValueError):
+            return self._response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_request_body"})
+        if not isinstance(body, dict):
+            return self._response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_request_body"})
+        service_id, change_type, key = body.get("service_id"), body.get("change_type"), body.get("idempotency_key")
+        if not isinstance(service_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", service_id):
+            return self._response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_service_id"})
+        if change_type not in {"renewal", "traffic_topup"}:
+            return self._response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_change_type"})
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,100}", key):
+            return self._response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_idempotency_key"})
+        quote = body.get("quote")
+        if not isinstance(quote, dict):
+            return self._response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_quote"})
+        signed_quote = self._verify_service_change_quote(body.get("quote_token"), telegram_id=telegram_id,
+            service_id=service_id, change_type=change_type, now=int(self.clock()))
+        if signed_quote is None or quote != signed_quote["_quote"]:
+            return self._response(start_response, HTTPStatus.CONFLICT, {"error": "quote_expired_or_invalid"})
+        quote = {**signed_quote["_quote"], "quote_issued_at": signed_quote["_issued_at"]}
+        amount, currency, quantity = quote.get("amount_minor"), quote.get("currency"), quote.get("quantity")
+        if (isinstance(amount, bool) or not isinstance(amount, int) or amount < 0
+                or not isinstance(currency, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,12}", currency)
+                or isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0):
+            return self._response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_quote"})
+        if change_type == "renewal":
+            if (not isinstance(quote.get("before_expires_at"), str) or len(quote["before_expires_at"]) > 80
+                    or not isinstance(quote.get("target_expires_at"), str) or len(quote["target_expires_at"]) > 80):
+                return self._response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_quote"})
+        else:
+            limit, target_limit = quote.get("before_traffic_limit_bytes"), quote.get("target_traffic_limit_bytes")
+            if (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0
+                    or isinstance(target_limit, bool) or not isinstance(target_limit, int) or target_limit <= limit):
+                return self._response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_quote"})
+        from manubisguard.panels.registry import default_registry
+        from manubisguard.sales.service import CustomerServiceChangeService, PurchaseNeedsReconciliation
+        resolver = self._resolve_panel_secret
+        try:
+            registry = default_registry(secret_resolver=resolver)
+            factory = self.service_change_service_factory or CustomerServiceChangeService
+            service = factory(self.store, secret_resolver=resolver, registry=registry)
+            result = asyncio.run(service.change(telegram_id=telegram_id, service_id=service_id,
+                change_type=change_type, idempotency_key=key, now=int(self.clock()), expected_quote=quote))
+        except PurchaseNeedsReconciliation:
+            return self._response(start_response, HTTPStatus.ACCEPTED,
+                {"status": "reconciliation_required", "message": "وضعیت عملیات قطعی نیست؛ برای جلوگیری از تغییر تکراری دوباره اقدام نکنید."})
+        except Exception as exc:
+            from manubisguard.customer_store import CustomerStoreError
+            if isinstance(exc, CustomerStoreError):
+                return self._response(start_response, HTTPStatus.CONFLICT, {"error": "service_change_rejected"})
+            return self._response(start_response, HTTPStatus.BAD_GATEWAY, {"error": "service_change_failed"})
+        allowed = ("operation_id", "service_id", "change_type", "amount_minor", "currency",
+                   "quantity", "status", "expires_at", "traffic_limit_bytes", "idempotent_replay")
+        return self._response(start_response, HTTPStatus.OK,
+            {"result": {key: result[key] for key in allowed if key in result}})
 
     def _create_ticket(self, environ: dict[str, Any], auth: dict[str, Any], start_response: Callable[..., Any]) -> list[bytes]:
         if str(environ.get("CONTENT_TYPE", "")).split(";", 1)[0].strip().lower() != "application/json":
@@ -288,7 +404,7 @@ class CustomerMiniAppWSGI:
         path = str(environ.get("PATH_INFO", "/"))
         if path == "/healthz" and method == "GET":
             return self._response(start_response, HTTPStatus.OK, {"ok": True})
-        if method not in {"GET", "POST"} or (method == "POST" and path not in {"/api/v1/purchase", "/api/v1/tickets", "/api/v1/service-change-preview"}) or (method == "GET" and path in {"/api/v1/purchase", "/api/v1/service-change-preview"}):
+        if method not in {"GET", "POST"} or (method == "POST" and path not in {"/api/v1/purchase", "/api/v1/tickets", "/api/v1/service-change-preview", "/api/v1/service-change"}) or (method == "GET" and path in {"/api/v1/purchase", "/api/v1/service-change-preview", "/api/v1/service-change"}):
             return self._response(start_response, HTTPStatus.METHOD_NOT_ALLOWED, {"error": "method_not_allowed"})
         origin = str(environ.get("HTTP_ORIGIN", "")).strip()
         if method == "POST" and not origin:
@@ -316,6 +432,8 @@ class CustomerMiniAppWSGI:
             return self._purchase(environ, telegram_id, start_response)
         if method == "POST" and path == "/api/v1/service-change-preview":
             return self._preview_service_change(environ, telegram_id, start_response)
+        if method == "POST" and path == "/api/v1/service-change":
+            return self._execute_service_change(environ, telegram_id, start_response)
         if method == "POST" and path == "/api/v1/tickets":
             return self._create_ticket(environ, auth, start_response)
         if path == "/api/v1/tickets":

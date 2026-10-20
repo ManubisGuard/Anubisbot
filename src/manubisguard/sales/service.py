@@ -368,11 +368,15 @@ class CustomerServiceChangeService:
         )
 
     async def change(self, *, telegram_id: int, service_id: str, change_type: str,
-                     idempotency_key: str, now: int | None = None) -> dict[str, Any]:
+                     idempotency_key: str, now: int | None = None,
+                     expected_quote: dict[str, Any] | None = None) -> dict[str, Any]:
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else int(now)
         operation_id = uuid.uuid4().hex
+        quote = expected_quote or {}
         op = self.store.reserve_service_change(operation_id=operation_id, telegram_id=telegram_id,
-            service_id=service_id, change_type=change_type, idempotency_key=idempotency_key, now=now)
+            service_id=service_id, change_type=change_type, idempotency_key=idempotency_key, now=now,
+            expected_amount_minor=quote.get("amount_minor"), expected_currency=quote.get("currency"),
+            expected_quantity=quote.get("quantity"))
         if op.get("idempotent_replay"):
             if op["status"] == "completed":
                 return {**op, "idempotent_replay": True}
@@ -404,7 +408,37 @@ class CustomerServiceChangeService:
                     raise CustomerStoreError("Unlimited or non-expiring service cannot be time-extended using this product")
                 if base_expiry.tzinfo is None:
                     base_expiry = base_expiry.replace(tzinfo=timezone.utc)
+                expected_before = quote.get("before_expires_at")
+                if expected_quote is not None:
+                    if not isinstance(expected_before, str):
+                        raise CustomerStoreError("The confirmed quote is incomplete; request a fresh preview")
+                    try:
+                        expected_dt = datetime.fromisoformat(expected_before)
+                    except ValueError:
+                        raise CustomerStoreError("The confirmed quote is invalid; request a fresh preview") from None
+                    if expected_dt.tzinfo is None:
+                        expected_dt = expected_dt.replace(tzinfo=timezone.utc)
+                    if expected_dt.astimezone(timezone.utc).replace(microsecond=0) != base_expiry.astimezone(timezone.utc).replace(microsecond=0):
+                        raise CustomerStoreError("The service expiry changed after preview; request a fresh quote")
                 new_expiry = max(base_expiry, datetime.fromtimestamp(now, timezone.utc)) + timedelta(hours=int(op["quantity"]))
+                if expected_quote is not None:
+                    expected_target = quote.get("target_expires_at")
+                    if not isinstance(expected_target, str):
+                        raise CustomerStoreError("The confirmed quote target is missing")
+                    try:
+                        expected_target_dt = datetime.fromisoformat(expected_target)
+                    except ValueError:
+                        raise CustomerStoreError("The confirmed quote target is invalid") from None
+                    if expected_target_dt.tzinfo is None:
+                        expected_target_dt = expected_target_dt.replace(tzinfo=timezone.utc)
+                    quote_issued_at = quote.get("quote_issued_at", now)
+                    if isinstance(quote_issued_at, bool) or not isinstance(quote_issued_at, int):
+                        raise CustomerStoreError("The confirmed quote timestamp is invalid")
+                    quoted_base = max(base_expiry, datetime.fromtimestamp(quote_issued_at, timezone.utc))
+                    quoted_target = quoted_base + timedelta(hours=int(op["quantity"]))
+                    if expected_target_dt.astimezone(timezone.utc).replace(microsecond=0) != quoted_target.astimezone(timezone.utc).replace(microsecond=0):
+                        raise CustomerStoreError("The calculated expiry differs from the confirmed quote; request a fresh preview")
+                    new_expiry = expected_target_dt
                 self.store.persist_service_change_target(
                     operation_id=str(op["operation_id"]),
                     before_expires_at=base_expiry.isoformat(),
@@ -421,9 +455,15 @@ class CustomerServiceChangeService:
                 current_limit = int(op.get("traffic_limit_bytes") or 0)
             if current_limit <= 0:
                 raise CustomerStoreError("Unlimited or unknown traffic limit cannot be topped up safely")
+            if expected_quote is not None:
+                expected_limit = quote.get("before_traffic_limit_bytes")
+                if isinstance(expected_limit, bool) or not isinstance(expected_limit, int) or int(expected_limit) != int(current_limit):
+                    raise CustomerStoreError("The service traffic limit changed after preview; request a fresh quote")
             new_limit = int(current_limit) + int(op["quantity"])
             if new_limit <= int(current_limit):
                 raise CustomerStoreError("Traffic limit overflow")
+            if expected_quote is not None and quote.get("target_traffic_limit_bytes") != new_limit:
+                raise CustomerStoreError("The calculated traffic limit differs from the confirmed quote; request a fresh preview")
             self.store.persist_service_change_target(
                 operation_id=str(op["operation_id"]),
                 before_expires_at=current.expire_at.isoformat() if current.expire_at else op.get("expires_at"),

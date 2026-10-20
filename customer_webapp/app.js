@@ -3,6 +3,7 @@
   const $ = (id) => document.getElementById(id);
   const pendingKey = (productId) => `manubis-miniapp-idempotency:${productId}`;
   const ticketPendingKey = 'manubis-miniapp-ticket-pending';
+  const serviceChangePendingKey = (serviceId, changeType) => `manubis-miniapp-service-change:${serviceId}:${changeType}`;
   const initData = tg && tg.initData ? tg.initData : "";
   document.querySelectorAll('[data-tab-target]').forEach((button) => button.addEventListener('click', () => {
     const target = button.dataset.tabTarget;
@@ -123,6 +124,7 @@
       const result = await api('/api/v1/service-change-preview', { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ service_id: service.service_id, change_type: changeType }) });
       const preview = result.payload.preview || {};
+      resultNode.dataset.quoteToken = result.payload.quote_token || '';
       const lines = ['پیش‌نمایش خواندنی (بدون برداشت وجه یا تغییر پنل)', `هزینه تخمینی: ${money(preview.amount_minor, preview.currency)}`];
       if (changeType === 'renewal') {
         lines.push(`انقضای فعلی: ${preview.before_expires_at || 'نامشخص'}`);
@@ -131,8 +133,11 @@
         lines.push(`سقف فعلی: ${(Number(preview.before_traffic_limit_bytes || 0) / (1024 ** 3)).toFixed(2)} GiB`);
         lines.push(`سقف محاسباتی پس از افزایش: ${(Number(preview.target_traffic_limit_bytes || 0) / (1024 ** 3)).toFixed(2)} GiB`);
       }
-      lines.push('این فقط پیش‌نمایش است؛ تأیید و اجرای تغییر در مینی‌اپ هنوز فعال نشده است.');
-      resultNode.textContent = lines.join('\n');
+      lines.push('قبل از تأیید، قیمت و وضعیت سرویس دوباره در سرور بررسی می‌شود.');
+      resultNode.replaceChildren(element('p', '', lines.join('\n')));
+      const confirmButton = element('button', 'confirm-service-change', changeType === 'renewal' ? 'تأیید و اجرای تمدید' : 'تأیید و افزایش حجم');
+      confirmButton.addEventListener('click', () => confirmServiceChange(service, changeType, preview, confirmButton, resultNode));
+      resultNode.append(confirmButton);
     } catch (error) {
       resultNode.textContent = error.status === 409
         ? 'برای این سرویس پیش‌نمایش امن ممکن نیست؛ مالکیت، محصول اصلی یا اتصال پنل را بررسی کنید.'
@@ -141,6 +146,65 @@
       button.disabled = false;
       button.textContent = previousLabel;
     }
+  }
+  async function confirmServiceChange(service, changeType, quote, button, resultNode) {
+    const keyName = serviceChangePendingKey(service.service_id, changeType);
+    let key;
+    try {
+      const fingerprint = JSON.stringify({ changeType, amount_minor: quote.amount_minor, currency: quote.currency,
+        quantity: quote.quantity, before_expires_at: quote.before_expires_at,
+        before_traffic_limit_bytes: quote.before_traffic_limit_bytes });
+      const prior = JSON.parse(sessionStorage.getItem(keyName) || 'null');
+      if (prior && prior.fingerprint === fingerprint && typeof prior.key === 'string') key = prior.key;
+      else {
+        key = crypto.randomUUID ? crypto.randomUUID() : `svc-${Date.now()}-${Math.random().toString(36).slice(2)}-change`;
+        sessionStorage.setItem(keyName, JSON.stringify({ fingerprint, key }));
+      }
+    } catch (_) {
+      resultNode.append(element('p', 'error-text', 'ذخیره شناسه امن عملیات در دسترس نیست؛ برای جلوگیری از اجرای تکراری، عملیات متوقف شد.'));
+      return;
+    }
+    const details = changeType === 'renewal'
+      ? `تمدید به مدت ${Number(quote.quantity).toLocaleString('fa-IR')} ساعت با هزینه ${money(quote.amount_minor, quote.currency)}. انقضای فعلی: ${quote.before_expires_at || 'نامشخص'}`
+      : `افزایش حجم به اندازه ${(Number(quote.quantity) / (1024 ** 3)).toFixed(2)} GiB با هزینه ${money(quote.amount_minor, quote.currency)}. سقف فعلی: ${(Number(quote.before_traffic_limit_bytes) / (1024 ** 3)).toFixed(2)} GiB`;
+    confirm(`آیا عملیات زیر را اجرا کنیم؟\n\n${details}\n\nمبلغ از کیف پول کسر می‌شود. اگر نتیجه نامشخص باشد، درخواست را دوباره با شناسه جدید ارسال نکنید.`, async (accepted) => {
+      if (!accepted) return;
+      button.disabled = true; button.textContent = 'در حال تأیید قیمت و اجرای عملیات…';
+      const expectedQuote = {
+        amount_minor: quote.amount_minor, currency: quote.currency, quantity: quote.quantity,
+        ...(changeType === 'renewal'
+          ? { before_expires_at: quote.before_expires_at, target_expires_at: quote.target_expires_at }
+          : { before_traffic_limit_bytes: quote.before_traffic_limit_bytes, target_traffic_limit_bytes: quote.target_traffic_limit_bytes })
+      };
+      try {
+        const response = await api('/api/v1/service-change', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ service_id: service.service_id, change_type: changeType, idempotency_key: key, quote: expectedQuote, quote_token: resultNode.dataset.quoteToken }) });
+        if (response.status === 202 || response.payload.status === 'reconciliation_required') {
+          button.textContent = 'در انتظار بررسی پشتیبانی'; button.disabled = true;
+          resultNode.append(element('p', 'error-text', 'نتیجه عملیات قطعی نیست؛ مبلغ رزرو شده است. دوباره اقدام نکنید و از پشتیبانی پیگیری کنید.'));
+          return;
+        }
+        sessionStorage.removeItem(keyName);
+        const result = response.payload.result || {};
+        button.textContent = 'عملیات تکمیل شد';
+        notice(`عملیات سرویس با موفقیت انجام شد. شناسه پیگیری: ${result.operation_id || '—'}`, 'success');
+        resultNode.append(element('p', 'success-text', changeType === 'renewal'
+          ? `تمدید انجام شد. انقضای جدید: ${result.expires_at || 'ثبت شد'} · شناسه پیگیری: ${result.operation_id || '—'}`
+          : `افزایش حجم انجام شد. سقف جدید: ${(Number(result.traffic_limit_bytes || 0) / (1024 ** 3)).toFixed(2)} GiB · شناسه پیگیری: ${result.operation_id || '—'}`));
+        try {
+          const [wallet, services, orders, transactions] = await Promise.all([api('/api/v1/wallet'), api('/api/v1/services'), api('/api/v1/orders'), api('/api/v1/transactions')]);
+          renderWallet(wallet.payload); renderServices(services.payload.services || []); renderOrders(orders.payload.orders || []); renderTransactions(transactions.payload.transactions || []);
+        } catch (_) {}
+      } catch (error) {
+        if (error.status === 409) {
+          button.disabled = true; button.textContent = 'پیش‌نمایش تازه بگیرید';
+          resultNode.append(element('p', 'error-text', 'قیمت، وضعیت سرویس یا اعتبار پیش‌نمایش تغییر کرده است؛ پیش‌نمایش تازه بگیرید و سپس دوباره تأیید کنید.'));
+        } else {
+          button.disabled = false; button.textContent = 'تلاش مجدد با همان شناسه';
+          resultNode.append(element('p', 'error-text', 'نتیجه درخواست قطعی نیست. برای جلوگیری از تغییر تکراری، در صورت تلاش مجدد همان شناسه حفظ می‌شود.'));
+        }
+      }
+    });
   }
   function renderOrders(orders) {
     const root = $('orders'); root.replaceChildren(); $('order-count').textContent = orders.length.toLocaleString('fa-IR') + ' سفارش';

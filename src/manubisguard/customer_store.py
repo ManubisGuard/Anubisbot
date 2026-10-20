@@ -2299,7 +2299,10 @@ class CustomerDataStore:
         return dict(row) if row else None
 
     def reserve_service_change(self, *, operation_id: str, telegram_id: int, service_id: str,
-                               change_type: str, idempotency_key: str, now: int) -> dict[str, Any]:
+                               change_type: str, idempotency_key: str, now: int,
+                               expected_amount_minor: int | None = None,
+                               expected_currency: str | None = None,
+                               expected_quantity: int | None = None) -> dict[str, Any]:
         """Reserve wallet funds and persist a service-change intent before any provider mutation."""
         if change_type not in {"renewal", "traffic_topup"}:
             raise CustomerStoreError("Unsupported service change")
@@ -2315,6 +2318,10 @@ class CustomerDataStore:
                     raise CustomerStoreError("Service-change idempotency key belongs to a different request")
                 service = db.execute("SELECT * FROM customer_services WHERE tenant_id=? AND service_id=? AND telegram_id=?",
                                      (self.tenant_id, service_id, telegram_id)).fetchone()
+                if ((expected_amount_minor is not None and int(previous["amount_minor"]) != int(expected_amount_minor))
+                        or (expected_currency is not None and str(previous["currency"]) != str(expected_currency))
+                        or (expected_quantity is not None and int(previous["quantity"]) != int(expected_quantity))):
+                    raise CustomerStoreError("Service-change idempotency key reused with a different quote")
                 db.commit()
                 replay = {**dict(previous), "idempotent_replay": True}
                 if service:
@@ -2350,6 +2357,10 @@ class CustomerDataStore:
                 raise CustomerStoreError("The original product has no valid renewal duration or traffic amount")
             amount = int(product["price_minor"])
             currency = str(product["currency"])
+            if ((expected_amount_minor is not None and amount != int(expected_amount_minor))
+                    or (expected_currency is not None and currency != str(expected_currency))
+                    or (expected_quantity is not None and quantity != int(expected_quantity))):
+                raise CustomerStoreError("The service-change quote changed; request a fresh preview before confirming")
             balance = int(db.execute("SELECT COALESCE(SUM(amount_minor),0) FROM wallet_ledger WHERE tenant_id=? AND telegram_id=? AND currency=?",
                                      (self.tenant_id, telegram_id, currency)).fetchone()[0])
             if balance < amount:
