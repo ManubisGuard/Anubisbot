@@ -102,7 +102,44 @@
       if (service.expires_at) card.append(element('p', '', `انقضا: ${service.expires_at}`));
       if (Number(service.traffic_limit_bytes || 0) > 0) card.append(element('p', '', `مصرف: ${(Number(service.traffic_used_bytes || 0) / (1024 ** 3)).toFixed(2)} / ${(Number(service.traffic_limit_bytes) / (1024 ** 3)).toFixed(2)} GiB`));
       if (service.subscription_url) { const link = element('a', 'service-link', 'بازکردن لینک خصوصی اشتراک'); link.href = service.subscription_url; link.target = '_blank'; link.rel = 'noopener noreferrer'; card.append(link); }
+      const actions = element('div', 'service-actions');
+      for (const [changeType, label] of [['renewal', 'پیش‌نمایش تمدید'], ['traffic_topup', 'پیش‌نمایش افزایش حجم']]) {
+        const button = element('button', 'secondary-button', label);
+        button.addEventListener('click', () => previewServiceChange(service, changeType, button, card));
+        actions.append(button);
+      }
+      card.append(actions);
       root.append(card);
+    }
+  }
+  async function previewServiceChange(service, changeType, button, card) {
+    let resultNode = card.querySelector('.service-change-preview');
+    if (!resultNode) { resultNode = element('div', 'service-change-preview'); card.append(resultNode); }
+    button.disabled = true;
+    const previousLabel = button.textContent;
+    button.textContent = 'در حال بررسی خواندنی…';
+    resultNode.textContent = 'در حال بررسی وضعیت فعلی پنل؛ هیچ تغییری اعمال نمی‌شود.';
+    try {
+      const result = await api('/api/v1/service-change-preview', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ service_id: service.service_id, change_type: changeType }) });
+      const preview = result.payload.preview || {};
+      const lines = ['پیش‌نمایش خواندنی (بدون برداشت وجه یا تغییر پنل)', `هزینه تخمینی: ${money(preview.amount_minor, preview.currency)}`];
+      if (changeType === 'renewal') {
+        lines.push(`انقضای فعلی: ${preview.before_expires_at || 'نامشخص'}`);
+        lines.push(`انقضای محاسباتی پس از تمدید: ${preview.target_expires_at || 'نامشخص'}`);
+      } else {
+        lines.push(`سقف فعلی: ${(Number(preview.before_traffic_limit_bytes || 0) / (1024 ** 3)).toFixed(2)} GiB`);
+        lines.push(`سقف محاسباتی پس از افزایش: ${(Number(preview.target_traffic_limit_bytes || 0) / (1024 ** 3)).toFixed(2)} GiB`);
+      }
+      lines.push('این فقط پیش‌نمایش است؛ تأیید و اجرای تغییر در مینی‌اپ هنوز فعال نشده است.');
+      resultNode.textContent = lines.join('\n');
+    } catch (error) {
+      resultNode.textContent = error.status === 409
+        ? 'برای این سرویس پیش‌نمایش امن ممکن نیست؛ مالکیت، محصول اصلی یا اتصال پنل را بررسی کنید.'
+        : 'دریافت پیش‌نمایش ناموفق بود؛ هیچ مبلغی کسر یا تغییری اعمال نشده است.';
+    } finally {
+      button.disabled = false;
+      button.textContent = previousLabel;
     }
   }
   function renderOrders(orders) {
