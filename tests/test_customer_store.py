@@ -820,13 +820,39 @@ class CustomerDataStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.get_product("ai-plan", enabled_only=True))
         self.assertIsNotNone(self.store.get_product("ai-plan", enabled_only=False))
 
+    def test_manual_products_share_category_filtering_and_hide_disabled_categories(self):
+        self.store.put_category(category_id="ai", title="AI services")
+        self.store.put_manual_product(product_id="ai-manual", title="AI gift", price_minor=500,
+            delivery_mode="instant", delivery_payload="PRIVATE-DELIVERY", category_id="ai")
+        self.store.put_manual_product(product_id="uncategorized", title="General item", price_minor=300,
+            delivery_mode="instant", delivery_payload="GENERAL-DELIVERY")
+        self.assertEqual([item["product_id"] for item in self.store.list_manual_products(category_id="ai")], ["ai-manual"])
+        self.assertEqual({item["product_id"] for item in self.store.list_manual_products()}, {"ai-manual", "uncategorized"})
+        self.store.set_category_enabled("ai", False)
+        self.assertEqual([item["product_id"] for item in self.store.list_manual_products()], ["uncategorized"])
+        self.assertIsNone(self.store.get_manual_product("ai-manual"))
+        with self.assertRaisesRegex(CustomerStoreError, "unavailable"):
+            self.store.buy_manual_product(telegram_id=1001, product_id="ai-manual", idempotency_key="disabled-category-purchase")
+        self.assertEqual([item["product_id"] for item in self.store.list_manual_products(enabled_only=False, category_id="ai")], ["ai-manual"])
+
+    def test_manual_product_category_must_exist_in_same_tenant(self):
+        other = CustomerDataStore(self.path, tenant_id="bot-beta")
+        self.store.put_category(category_id="ai", title="AI services")
+        with self.assertRaisesRegex(CustomerStoreError, "category does not exist"):
+            other.put_manual_product(product_id="cross-tenant", title="Cross tenant", price_minor=100,
+                delivery_mode="manual", category_id="ai")
+        self.assertEqual(other.list_manual_products(category_id="ai"), [])
+        with self.assertRaisesRegex(CustomerStoreError, "category does not exist"):
+            self.store.put_manual_product(product_id="orphan-manual", title="Orphan", price_minor=100,
+                delivery_mode="manual", category_id="missing")
+
     def test_core_schema_migration_is_versioned_and_reopening_is_idempotent(self):
         with self.store._connect() as db:
             versions = db.execute(
                 "SELECT version, name FROM schema_migrations ORDER BY version"
             ).fetchall()
             self.assertEqual([(row["version"], row["name"]) for row in versions],
-                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox")])
+                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"), (10, "manual_product_category_binding")])
 
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         with reopened._connect() as db:
@@ -834,7 +860,7 @@ class CustomerDataStoreTests(unittest.TestCase):
                 "SELECT version, name FROM schema_migrations ORDER BY version"
             ).fetchall()
             self.assertEqual([(row["version"], row["name"]) for row in versions],
-                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox")])
+                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"), (10, "manual_product_category_binding")])
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_representative_unversioned_legacy_database_preserves_business_rows(self):
@@ -892,11 +918,15 @@ class CustomerDataStoreTests(unittest.TestCase):
                  (5, "manual_delivery_notification_outbox"),
                  (6, "customer_ticket_notification_outbox"),
                  (7, "per_event_telegram_notification_routes"),
-                 (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox")],
+                 (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"),
+                 (10, "manual_product_category_binding")],
             )
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertIn("category_id", {
                 row["name"] for row in db.execute("PRAGMA table_info(customer_products)")
+            })
+            self.assertIn("category_id", {
+                row["name"] for row in db.execute("PRAGMA table_info(manual_products)")
             })
             self.assertIn("product_snapshot_json", {
                 row["name"] for row in db.execute("PRAGMA table_info(customer_orders)")
@@ -960,7 +990,7 @@ class CustomerDataStoreTests(unittest.TestCase):
         # A second open must not reapply or duplicate either migration.
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         with reopened._connect() as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 9)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 10)
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_migration_failure_rolls_back_schema_data_and_version_row(self):
@@ -1310,6 +1340,21 @@ class CustomerDataStoreTests(unittest.TestCase):
         with migrated._connect() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=4").fetchone()[0], 1)
 
+    def test_v10_migration_adds_manual_category_column_without_losing_rows(self):
+        self.store.put_manual_product(product_id="pre-v10", title="Pre-v10 item", price_minor=500,
+            delivery_mode="manual")
+        with self.store._connect() as db:
+            db.execute("DROP INDEX IF EXISTS ix_manual_products_tenant_category_enabled")
+            db.execute("ALTER TABLE manual_products DROP COLUMN category_id")
+            db.execute("DELETE FROM schema_migrations WHERE version=10")
+        migrated = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        product = migrated.get_manual_product("pre-v10")
+        self.assertEqual(product["title"], "Pre-v10 item")
+        self.assertEqual(product["category_id"], "")
+        with migrated._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=10").fetchone()[0], 1)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
     def test_manual_shop_migration_preserves_existing_rows_and_creates_missing_tables(self):
         with self.store._connect() as db:
             db.execute(
@@ -1330,7 +1375,7 @@ class CustomerDataStoreTests(unittest.TestCase):
             db.execute("DROP TABLE manual_product_orders")
             db.execute("DROP TABLE manual_product_inventory")
             db.execute("DROP TABLE manual_products")
-            db.execute("DELETE FROM schema_migrations WHERE version IN (3,4,5)")
+            db.execute("DELETE FROM schema_migrations WHERE version IN (3,4,5,10)")
 
         recreated = CustomerDataStore(self.path, tenant_id="bot-alpha")
         with recreated._connect() as db:
@@ -1341,6 +1386,7 @@ class CustomerDataStoreTests(unittest.TestCase):
                 "manual_products", "manual_product_inventory",
                 "manual_product_orders", "manual_product_order_events", "manual_delivery_notifications",
             }.issubset(tables))
+            self.assertIn("category_id", {row["name"] for row in db.execute("PRAGMA table_info(manual_products)")})
             self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=3").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=5").fetchone()[0], 1)
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])

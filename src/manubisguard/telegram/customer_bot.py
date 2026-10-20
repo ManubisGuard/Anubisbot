@@ -1028,8 +1028,8 @@ class CustomerBot:
         if is_admin and command == "/manual-product":
             payload = text.partition(" ")[2].strip()
             help_text = ("مدیریت محصول دستی:\n"
-                "/manual-product add ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح\n"
-                "/manual-product edit ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح\n"
+                "/manual-product add ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح | category_id اختیاری\n"
+                "/manual-product edit ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح | category_id اختیاری\n"
                 "/manual-product archive ID\n/manual-product list\n"
                 "instant: متن ثابت ارسال می‌شود؛ inventory: یک کلید یکتا از موجودی تحویل می‌شود؛ "
                 "manual: سفارش در انتظار تحویل مدیر می‌ماند. برای موجودی: /manual-key add PRODUCT_ID | KEY")
@@ -1039,7 +1039,8 @@ class CustomerBot:
                 for item in products[:50]:
                     status = "فعال" if item["enabled"] else "آرشیو"
                     stock = f" — موجودی: {self.data.manual_inventory_count(item['product_id'])}" if item["delivery_mode"] == "inventory" and item["enabled"] else ""
-                    lines.append(f"• {item['product_id']} — {item['title']} — {item['price_minor']} {item['currency']} — {item['delivery_mode']} — {status}{stock}")
+                    category_label = item.get("category_id") or "بدون دسته"
+                    lines.append(f"• {item['product_id']} — {item['title']} — {item['price_minor']} {item['currency']} — {item['delivery_mode']} — {category_label} — {status}{stock}")
                 await self.api.send_text(chat_id, "\n".join(lines) if lines else "محصول دستی ثبت نشده است.", ADMIN_MENU)
                 return
             if payload.startswith("archive "):
@@ -1054,7 +1055,7 @@ class CustomerBot:
                     self.data.put_manual_product(product_id=product_id, title=existing["title"],
                         price_minor=int(existing["price_minor"]), currency=existing["currency"],
                         delivery_mode=existing["delivery_mode"], delivery_payload=existing["delivery_payload"],
-                        description=existing["description"], enabled=False)
+                        description=existing["description"], enabled=False, category_id=existing.get("category_id", ""))
                 except (ValueError, CustomerStoreError) as exc:
                     await self.api.send_text(chat_id, f"آرشیو محصول انجام نشد: {exc}", ADMIN_MENU)
                     return
@@ -1063,14 +1064,16 @@ class CustomerBot:
             if payload.startswith("edit "):
                 fields = [x.strip() for x in payload[5:].split("|")]
                 try:
-                    if len(fields) != 7:
-                        raise ValueError("برای ویرایش دقیقاً ۷ فیلد لازم است.")
-                    product_id, title, price_raw, currency, delivery_mode, delivery_payload, description = fields
-                    if not self.data.get_manual_product(product_id):
+                    if len(fields) not in {7, 8}:
+                        raise ValueError("برای ویرایش ۷ فیلد و دسته‌بندی اختیاری لازم است.")
+                    product_id, title, price_raw, currency, delivery_mode, delivery_payload, description = fields[:7]
+                    existing = self.data.get_manual_product(product_id, enabled_only=False)
+                    if not existing or not existing["enabled"]:
                         raise ValueError("محصول فعال پیدا نشد؛ شناسه را بررسی کنید.")
+                    category_id = fields[7] if len(fields) == 8 else existing.get("category_id", "")
                     self.data.put_manual_product(product_id=product_id, title=title, price_minor=int(price_raw),
                         currency=currency, delivery_mode=delivery_mode.lower(), delivery_payload=delivery_payload,
-                        description=description)
+                        description=description, category_id=category_id)
                 except (ValueError, CustomerStoreError) as exc:
                     await self.api.send_text(chat_id, f"ویرایش محصول دستی انجام نشد: {exc}", ADMIN_MENU)
                     return
@@ -1081,12 +1084,13 @@ class CustomerBot:
                 return
             fields = [x.strip() for x in payload[4:].split("|")]
             try:
-                if len(fields) != 7:
-                    raise ValueError("دقیقاً ۷ فیلد لازم است.")
-                product_id, title, price_raw, currency, delivery_mode, delivery_payload, description = fields
+                if len(fields) not in {7, 8}:
+                    raise ValueError("۷ فیلد و دسته‌بندی اختیاری لازم است.")
+                product_id, title, price_raw, currency, delivery_mode, delivery_payload, description = fields[:7]
+                category_id = fields[7] if len(fields) == 8 else ""
                 self.data.put_manual_product(product_id=product_id, title=title, price_minor=int(price_raw),
                     currency=currency, delivery_mode=delivery_mode.lower(), delivery_payload=delivery_payload,
-                    description=description)
+                    description=description, category_id=category_id)
             except (ValueError, CustomerStoreError) as exc:
                 await self.api.send_text(chat_id, f"محصول دستی ذخیره نشد: {exc}", ADMIN_MENU)
                 return
@@ -1756,13 +1760,12 @@ class CustomerBot:
             return
         products = [p for p in self.data.list_products(category_id=category_id)
                     if (self.data.get_panel_connection(str(p.get("panel_id") or "")) or {}).get("enabled")]
-        manual_products = self.data.list_manual_products()
+        manual_products = self.data.list_manual_products(category_id=category_id)
         lines = [f"🛍 دسته‌بندی: {category['title']}" if category else "🛍 فروشگاه محصولات و اشتراک‌ها:"]
         buttons = []
-        if not category_id:
-            for item in manual_products[:30]:
-                lines.append(f"• {item['title']} — {int(item['price_minor']):,} {item['currency']} — {'تحویل خودکار' if item['delivery_mode']=='instant' else ('تحویل کلید یکتا از موجودی' if item['delivery_mode']=='inventory' else 'تحویل توسط پشتیبانی')}")
-                buttons.append([{"text": f"خرید {item['title'][:28]}", "callback_data": f"customer:manualbuy:{item['product_id']}"}])
+        for item in manual_products[:30]:
+            lines.append(f"• {item['title']} — {int(item['price_minor']):,} {item['currency']} — {'تحویل خودکار' if item['delivery_mode']=='instant' else ('تحویل کلید یکتا از موجودی' if item['delivery_mode']=='inventory' else 'تحویل توسط پشتیبانی')}")
+            buttons.append([{"text": f"خرید {item['title'][:28]}", "callback_data": f"customer:manualbuy:{item['product_id']}"}])
         if categories:
             category_buttons = [[{"text": "همه محصولات", "callback_data": "customer:category:all"}]]
             for item in categories[:24]:
@@ -1772,9 +1775,9 @@ class CustomerBot:
             if not manual_products and not categories and category_id is None:
                 await self.api.send_text(chat_id, "🛍 فروشگاه فعلاً محصولی ندارد. مدیر می‌تواند محصول پنلی یا محصول دیجیتال دستی تعریف کند.", keyboard)
                 return
-            if category_id is not None:
-                lines.append("در این دسته فعلاً محصول پنلی فعالی وجود ندارد.")
-            elif not manual_products:
+            if category_id is not None and not manual_products:
+                lines.append("در این دسته فعلاً محصول فعالی وجود ندارد.")
+            elif category_id is None and not manual_products:
                 lines.append("محصول پنلی فعالی با اتصال معتبر وجود ندارد.")
             buttons.append(keyboard.get("inline_keyboard", [[{"text":"⬅️ منو","callback_data":"customer:home"}]])[0])
             await self.api.send_text(chat_id, "\n".join(lines), {"inline_keyboard": buttons})
@@ -2136,8 +2139,8 @@ class CustomerBot:
                 body = "برای بررسی فقط‌خواندنی اجرا کن: /panel-check PANEL_ID"
             elif section == "products":
                 body = ("🛍 مدیریت فروشگاه\nمحصولات پنلی: /product add ...\n"
-                        "محصول دستی: /manual-product add ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح\n"
-                        "ویرایش: /manual-product edit ID | عنوان | قیمت | ارز | حالت | متن-تحویل | توضیح؛ آرشیو: /manual-product archive ID؛ فهرست: /manual-product list\n"
+                        "محصول دستی: /manual-product add ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح | دسته‌بندی اختیاری\n"
+                        "ویرایش: /manual-product edit ID | عنوان | قیمت | ارز | حالت | متن-تحویل | توضیح | دسته‌بندی اختیاری؛ آرشیو: /manual-product archive ID؛ فهرست: /manual-product list\n"
                         "فهرست محصولات پنلی: /products\n\n"
                         "📦 سفارش‌های تحویل دستی: /manual-orders [pending_delivery|fulfilled|all]\n"
                         "تحویل سفارش: /manual-fulfill ORDER_ID | متن تحویل")

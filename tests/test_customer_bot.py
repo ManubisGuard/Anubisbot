@@ -591,10 +591,14 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_message({**admin,"text":"/category add ai | سرویس‌های هوش مصنوعی"})
         await self.bot._handle_message({**admin,"text":"/product add ai-plan | AI Plan | fixed | 100 | 0 | IRR | 24 | 10 | pg | 1 | ai"})
         await self.bot._handle_message({**admin,"text":"/product add base-plan | Basic Plan | fixed | 100 | 0 | IRR | 24 | 10 | pg | 1"})
+        await self.bot._handle_message({**admin,"text":"/manual-product add ai-manual | AI Gift | 300 | IRR | instant | PRIVATE-DELIVERY | Manual AI product | ai"})
         self.assertEqual(self.bot.data.get_product("ai-plan")["category_id"], "ai")
+        self.assertEqual(self.bot.data.get_manual_product("ai-manual")["category_id"], "ai")
         self.bot.api.send_text.reset_mock()
         await self.bot._handle_callback({"id":"shop","from":{"id":999},
             "message":{"chat":{"id":999,"type":"private"}},"data":"customer:shop"})
+        root_body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("AI Gift", root_body)
         keyboard=self.bot.api.send_text.await_args.args[2]
         callbacks={b.get("callback_data") for row in keyboard["inline_keyboard"] for b in row}
         self.assertIn("customer:category:ai",callbacks)
@@ -603,7 +607,9 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
             "message":{"chat":{"id":999,"type":"private"}},"data":"customer:category:ai"})
         body=self.bot.api.send_text.await_args.args[1]
         self.assertIn("AI Plan",body)
+        self.assertIn("AI Gift",body)
         self.assertNotIn("Basic Plan",body)
+        self.assertNotIn("PRIVATE-DELIVERY",body)
 
     async def test_advanced_admin_product_command_saves_hourly_mode(self):
         self.bot.data.register_panel_connection(panel_id="pg",label="PasarGuard",provider="pasarguard",

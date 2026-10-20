@@ -438,7 +438,7 @@ class CustomerDataStore:
                     int(row["version"])
                     for row in db.execute("SELECT version FROM schema_migrations").fetchall()
                 }
-                unknown_versions = sorted(version for version in applied if version > 9)
+                unknown_versions = sorted(version for version in applied if version > 10)
                 if unknown_versions:
                     raise CustomerStoreError(
                         "Database schema is newer than this application supports"
@@ -767,6 +767,20 @@ class CustomerDataStore:
                     db.execute("INSERT INTO schema_migrations(version,name) VALUES(9,?)",
                                ("durable_per_destination_admin_notification_outbox",))
                     applied.add(9)
+                # v10 adds optional category binding to the manual catalog without
+                # changing existing products; legacy rows remain uncategorized.
+                if 10 not in applied:
+                    manual_columns = {
+                        str(row["name"])
+                        for row in db.execute("PRAGMA table_info(manual_products)").fetchall()
+                    }
+                    if "category_id" not in manual_columns:
+                        db.execute("ALTER TABLE manual_products ADD COLUMN category_id TEXT NOT NULL DEFAULT ''")
+                    db.execute("CREATE INDEX IF NOT EXISTS ix_manual_products_tenant_category_enabled "
+                               "ON manual_products(tenant_id,category_id,enabled,product_id)")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(10,?)",
+                               ("manual_product_category_binding",))
+                    applied.add(10)
                 db.commit()
             except Exception:
                 db.rollback()
@@ -778,10 +792,14 @@ class CustomerDataStore:
 
     def put_manual_product(self, *, product_id: str, title: str, price_minor: int,
                            currency: str = "IRR", delivery_mode: str = "instant",
-                           delivery_payload: str = "", description: str = "", enabled: bool = True) -> None:
+                           delivery_payload: str = "", description: str = "", enabled: bool = True,
+                           category_id: str = "") -> None:
         self._ensure_manual_shop_tables()
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", product_id.strip()) or not title.strip():
             raise CustomerStoreError("Manual product ID and title are required; ID must use ASCII letters, digits, _ or -")
+        category_id = category_id.strip()
+        if category_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", category_id):
+            raise CustomerStoreError("Invalid manual product category ID")
         if isinstance(price_minor, bool) or not isinstance(price_minor, int) or price_minor <= 0 or price_minor > 2**63-1:
             raise CustomerStoreError("Manual product price must be a positive integer")
         currency = currency.upper()
@@ -792,13 +810,18 @@ class CustomerDataStore:
         if delivery_mode == "instant" and not delivery_payload.strip():
             raise CustomerStoreError("Instant text delivery requires a non-empty delivery payload")
         with self._connect() as db:
+            if category_id and not db.execute(
+                "SELECT 1 FROM customer_categories WHERE tenant_id=? AND category_id=?",
+                (self.tenant_id, category_id),
+            ).fetchone():
+                raise CustomerStoreError("Manual product category does not exist")
             db.execute("""INSERT INTO manual_products
-                (tenant_id,product_id,title,description,price_minor,currency,delivery_mode,delivery_payload,enabled)
-                VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(tenant_id,product_id) DO UPDATE SET
-                title=excluded.title,description=excluded.description,price_minor=excluded.price_minor,
-                currency=excluded.currency,delivery_mode=excluded.delivery_mode,
+                (tenant_id,product_id,category_id,title,description,price_minor,currency,delivery_mode,delivery_payload,enabled)
+                VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(tenant_id,product_id) DO UPDATE SET
+                category_id=excluded.category_id,title=excluded.title,description=excluded.description,
+                price_minor=excluded.price_minor,currency=excluded.currency,delivery_mode=excluded.delivery_mode,
                 delivery_payload=excluded.delivery_payload,enabled=excluded.enabled,updated_at=CURRENT_TIMESTAMP""",
-                (self.tenant_id,product_id.strip(),title.strip()[:160],description[:4000],price_minor,currency,
+                (self.tenant_id,product_id.strip(),category_id,title.strip()[:160],description[:4000],price_minor,currency,
                  delivery_mode,delivery_payload[:12000],int(enabled)))
 
     def add_manual_inventory_key(self, *, product_id: str, secret_payload: str) -> int:
@@ -823,11 +846,22 @@ class CustomerDataStore:
             return int(db.execute("SELECT COUNT(*) FROM manual_product_inventory WHERE tenant_id=? AND product_id=? AND status='available'",
                                   (self.tenant_id,product_id)).fetchone()[0])
 
-    def list_manual_products(self, *, enabled_only: bool = True) -> list[dict[str, Any]]:
+    def list_manual_products(self, *, enabled_only: bool = True,
+                             category_id: str | None = None) -> list[dict[str, Any]]:
         self._ensure_manual_shop_tables()
-        sql="SELECT product_id,title,description,price_minor,currency,delivery_mode,enabled FROM manual_products WHERE tenant_id=?"
+        if category_id is not None:
+            category_id = category_id.strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", category_id):
+                raise CustomerStoreError("Invalid manual product category ID")
+        sql="SELECT product_id,category_id,title,description,price_minor,currency,delivery_mode,enabled FROM manual_products WHERE tenant_id=?"
         args: tuple[Any,...]=(self.tenant_id,)
-        if enabled_only: sql += " AND enabled=1"
+        if enabled_only:
+            sql += """ AND enabled=1 AND (category_id='' OR EXISTS (
+                SELECT 1 FROM customer_categories c WHERE c.tenant_id=manual_products.tenant_id
+                AND c.category_id=manual_products.category_id AND c.enabled=1))"""
+        if category_id is not None:
+            sql += " AND category_id=?"
+            args += (category_id,)
         sql += " ORDER BY created_at,product_id"
         with self._connect() as db: return [dict(r) for r in db.execute(sql,args).fetchall()]
 
@@ -835,7 +869,10 @@ class CustomerDataStore:
         self._ensure_manual_shop_tables()
         sql="SELECT * FROM manual_products WHERE tenant_id=? AND product_id=?"
         args: tuple[Any,...]=(self.tenant_id,product_id)
-        if enabled_only: sql += " AND enabled=1"
+        if enabled_only:
+            sql += """ AND enabled=1 AND (category_id='' OR EXISTS (
+                SELECT 1 FROM customer_categories c WHERE c.tenant_id=manual_products.tenant_id
+                AND c.category_id=manual_products.category_id AND c.enabled=1))"""
         with self._connect() as db:
             row=db.execute(sql,args).fetchone()
         return dict(row) if row else None
@@ -856,8 +893,11 @@ class CustomerDataStore:
                 result["idempotent_replay"] = True
                 db.commit()
                 return result
-            product=db.execute("SELECT * FROM manual_products WHERE tenant_id=? AND product_id=? AND enabled=1",
-                               (self.tenant_id,product_id)).fetchone()
+            product=db.execute("""SELECT * FROM manual_products WHERE tenant_id=? AND product_id=? AND enabled=1
+                AND (category_id='' OR EXISTS (SELECT 1 FROM customer_categories c
+                    WHERE c.tenant_id=manual_products.tenant_id
+                      AND c.category_id=manual_products.category_id AND c.enabled=1))""",
+                (self.tenant_id,product_id)).fetchone()
             if not product: raise CustomerStoreError("Manual product is unavailable")
             customer=db.execute("SELECT 1 FROM customer_users WHERE tenant_id=? AND telegram_id=?",
                                 (self.tenant_id,telegram_id)).fetchone()
