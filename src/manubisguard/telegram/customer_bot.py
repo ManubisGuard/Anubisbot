@@ -1802,6 +1802,18 @@ class CustomerBot:
             LOG.warning("Customer service refresh failed (%s)", type(exc).__name__)
             return False
 
+    def _queue_unauthorized_admin_callback_alert(self, uid: int) -> None:
+        # One callback alert per user/minute prevents forged-button spam from flooding admins.
+        alert_window = int(time.time() // 60)
+        try:
+            self.data.enqueue_admin_notification(
+                event_key="security_alert",
+                idempotency_key=f"unauthorized-admin-callback:{uid}:{alert_window}",
+                payload={"status": "blocked", "reason_code": "unauthorized_admin_callback", "customer_id": uid},
+            )
+        except Exception as exc:
+            LOG.warning("Security alert enqueue failed (%s)", type(exc).__name__)
+
     async def _handle_callback(self, query: dict[str, Any]) -> None:
         callback_id = query.get("id")
         message = query.get("message") or {}
@@ -1818,6 +1830,7 @@ class CustomerBot:
         is_admin = uid in self.config.admin_ids
         data = query.get("data", "")
         if data.startswith("content:") and not is_admin:
+            self._queue_unauthorized_admin_callback_alert(uid)
             if callback_id:
                 await self.api.answer_callback(callback_id, "این بخش فقط برای مدیر است")
             return
@@ -2006,6 +2019,7 @@ class CustomerBot:
             return
         if data.startswith("admin:"):
             if not is_admin:
+                self._queue_unauthorized_admin_callback_alert(uid)
                 await self.api.send_text(chat_id, "این بخش فقط برای مدیر مجاز است.", BACK_MENU)
                 return
             section = data.split(":", 1)[1]

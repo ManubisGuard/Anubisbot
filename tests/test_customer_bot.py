@@ -149,6 +149,25 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("private-receipt-reference", rendered)
             self.assertNotIn("4111111111111111", rendered)
 
+    async def test_non_admin_admin_callbacks_queue_redacted_security_alert(self):
+        self.bot.data.add_notification_route(event_key="security_alert", chat_id=6883349141,
+            created_by=6883349141)
+        for callback_id, data in (("forged-admin", "admin:finance"), ("forged-content", "content:buttons")):
+            await self.bot._handle_callback({"id": callback_id, "from": {"id": 1001},
+                "message": {"message_id": 77, "chat": {"id": 1001, "type": "private"}}, "data": data})
+        self.assertEqual(self.bot.api.answer_callback.await_count, 2)
+        self.assertIn("فقط برای مدیر", self.bot.api.send_text.await_args.args[1])
+        with self.bot.data._connect() as db:
+            rows = db.execute("SELECT event_key,idempotency_key,payload_json FROM customer_admin_notifications").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["event_key"], "security_alert")
+        self.assertIn("unauthorized-admin-callback:1001:", rows[0]["idempotency_key"])
+        payload = json.loads(rows[0]["payload_json"])
+        self.assertEqual(payload["reason_code"], "unauthorized_admin_callback")
+        self.assertEqual(payload["customer_id"], 1001)
+        self.assertNotIn("finance", json.dumps(payload))
+        self.assertNotIn("buttons", json.dumps(payload))
+
     async def test_admin_can_list_and_requeue_dead_admin_notification_without_bypassing_queue(self):
         admin = {"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"}}
         self.bot.data.add_notification_route(event_key="security_alert", chat_id=1001, created_by=6883349141)

@@ -252,8 +252,8 @@ Final static pass after Session 96 source/tests passed: Python compileall, `bash
 
 ## Session 99 — redacted security-alert producer (2026-10-20)
 
-- The customer bot now blocks non-admin attempts to invoke known admin-only commands, including the mutating `/deposit-info set` form, with a generic denial before business handlers run.
-- The handler queues a tenant-scoped `security_alert` containing only `status=blocked`, the fixed `reason_code=unauthorized_admin_command`, and the numeric customer ID. It never stores the raw command, arguments, receipt references or card-like values. Repeated attempts by the same user are coalesced into one idempotent alert per 60-second window to reduce alert flooding.
+- The customer bot blocks non-admin attempts to invoke known admin-only commands and the mutating `/deposit-info set` form before business handlers run. Forged `admin:` and `content:` callbacks from non-admin users are also denied.
+- These paths queue tenant-scoped `security_alert` records containing only a blocked status, a fixed reason code, and the numeric customer ID. Raw commands, callback data, arguments, receipt references and card-like values are never persisted. Repeated command attempts and repeated callback attempts are independently coalesced per user per 60-second window to reduce alert flooding.
 - The admin route help now accurately distinguishes connected event producers from remaining unconnected `service_test`, `bot_log` and `backup` producers. Backup policy remains configuration-only; no scheduler is enabled.
 - Focused tests: 3 passed. Complete isolated suite: **341 tests passed in 62.813 seconds (OK)**. Python compileall, Bash syntax, Mini App JavaScript syntax and `git diff --check` passed.
 - Evidence remains E2 local SQLite/unit/mock only. No live Telegram delivery, panel/payment API, operational DB, timer activation, deployment or service restart was performed.
