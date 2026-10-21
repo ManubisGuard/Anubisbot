@@ -72,6 +72,25 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.bot.api.send_text = AsyncMock()
         self.bot.api.answer_callback = AsyncMock()
 
+    async def test_customer_menu_exposes_order_history_and_empty_history_has_safe_navigation(self):
+        menu = self.bot._customer_menu(customer_id=1001)
+        callbacks = [button.get("callback_data") for row in menu["inline_keyboard"] for button in row]
+        self.assertIn("customer:orders:0", callbacks)
+
+        await self.bot._handle_callback({
+            "id": "orders-empty", "from": {"id": 1001},
+            "message": {"message_id": 7, "chat": {"id": 1001, "type": "private"}},
+            "data": "customer:orders:0",
+        })
+        self.bot.api.send_text.assert_awaited_once()
+        args = self.bot.api.send_text.await_args
+        self.assertEqual(args.args[0], 1001)
+        self.assertIn("سفارش‌های من", args.args[1])
+        self.assertIn("هنوز سفارشی", args.args[1])
+        callbacks = [button.get("callback_data") for row in args.args[2]["inline_keyboard"] for button in row]
+        self.assertIn("customer:shop", callbacks)
+        self.assertIn("customer:home", callbacks)
+
     async def test_admin_can_configure_backup_policy_but_cannot_enable_unimplemented_scheduler(self):
         admin = {"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"}}
         await self.bot._handle_message({**admin,"text":"/backup-policy schedule | daily | Europe/Berlin | 02:45 | 1440"})

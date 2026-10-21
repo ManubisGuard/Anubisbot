@@ -157,6 +157,7 @@ MENU_VISIBILITY_FIELDS = (
     ("menu_trials_enabled", "🧪 تست سرویس‌ها", "customer:trials"),
     ("menu_shop_enabled", "🛒 خرید سرویس و اشتراک", "customer:shop"),
     ("menu_services_enabled", "⚙️ سرویس‌های من", "customer:services"),
+    ("menu_orders_enabled", "🧾 سفارش‌های من", "customer:orders:0"),
     ("menu_resellers_enabled", "🏪 خرید پنل نمایندگی", "customer:resellers"),
     ("menu_myresellers_enabled", "🗂 پنل‌های من", "customer:myresellers"),
     ("menu_wallet_enabled", "💳 کیف پول و شارژ", "customer:wallet"),
@@ -288,6 +289,9 @@ class CustomerBot:
             add("menu_myresellers_enabled", "menu_myresellers", "customer:myresellers")
         add("menu_resellers_enabled", "menu_resellers", "customer:resellers", "primary")
         account_row: list[dict[str, Any]] = []
+        if _enabled(self.content, "menu_orders_enabled"):
+            account_row.append({"text": content_value(self.content, "menu_orders", "🧾 سفارش‌های من"),
+                                "callback_data": "customer:orders:0"})
         if _enabled(self.content, "menu_wallet_enabled"):
             account_row.append({"text": content_value(self.content, "menu_wallet", "💳 کیف پول و شارژ"),
                                 "callback_data": "customer:wallet", "style": "success"})
@@ -2228,6 +2232,49 @@ class CustomerBot:
             return
         key = data.partition(":")[2] if data.startswith("customer:") else ""
         discount_code = None
+        if key == "orders" or key.startswith("orders:"):
+            try:
+                page = max(0, min(9, int(key.partition(":")[2] or "0")))
+            except ValueError:
+                page = 0
+            orders = self.data.list_customer_orders(uid, limit=50)
+            page_size = 5
+            page_count = max(1, (len(orders) + page_size - 1) // page_size)
+            page = min(page, page_count - 1)
+            status_labels = {
+                "pending_payment": "در انتظار پرداخت", "awaiting_payment": "در انتظار پرداخت",
+                "paid": "پرداخت‌شده", "fulfilling": "در حال تحویل", "fulfilled": "تحویل‌شده",
+                "failed": "ناموفق", "cancelled": "لغوشده", "refunded": "بازپرداخت‌شده",
+                "reconcile_required": "نیازمند بررسی مدیر", "pending_delivery": "در انتظار تحویل",
+            }
+            lines = [f"🧾 سفارش‌های من — صفحه {page + 1} از {page_count}"]
+            selected = orders[page * page_size:(page + 1) * page_size]
+            for order in selected:
+                status = str(order.get("status") or "unknown")
+                lines.append(
+                    f"\n• {order['title']}\nشناسه: {order['order_id']}\n"
+                    f"مبلغ: {int(order['amount_minor']):,} {order['currency']}\n"
+                    f"وضعیت: {status_labels.get(status, status)}"
+                    + (f"\nتخفیف: {order['discount_code']} (−{int(order['discount_amount_minor']):,})"
+                       if order.get("discount_code") else "")
+                    + (f"\nآخرین تغییر: {order['updated_at']}" if order.get("updated_at") else "")
+                )
+            if not orders:
+                lines.append("\nهنوز سفارشی برای این حساب ثبت نشده است.")
+            rows = []
+            navigation = []
+            if page > 0:
+                navigation.append({"text": "⬅️ قبلی", "callback_data": f"customer:orders:{page - 1}"})
+            if page + 1 < page_count:
+                navigation.append({"text": "بعدی ➡️", "callback_data": f"customer:orders:{page + 1}"})
+            if navigation:
+                rows.append(navigation)
+            rows.extend([
+                [{"text": "🛒 بازگشت به فروشگاه", "callback_data": "customer:shop"}],
+                [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
+            ])
+            await self.api.send_text(chat_id, "\n".join(lines), {"inline_keyboard": rows})
+            return
         if key == "shop":
             await self._show_shop(chat_id, self._customer_menu(customer_id=uid))
             return
