@@ -18,6 +18,8 @@ CONTENT_FIELDS: tuple[tuple[str, str], ...] = (
     ("menu_factory_settings", "دکمه تنظیمات سازنده"),
     ("menu_status", "دکمه وضعیت"),
     ("menu_shop", "دکمه خرید سرویس"),
+    ("menu_profile", "دکمه حساب کاربری"),
+    ("menu_orders", "دکمه سفارش‌های من"),
     ("menu_miniapp", "دکمه ورود به مینی‌اپ"),
     ("menu_trials", "دکمه تست سرویس"),
     ("menu_myresellers", "دکمه پنل‌های من"),
@@ -166,7 +168,7 @@ MOTHER_KEYS = frozenset({
 })
 CUSTOMER_KEYS = frozenset({
     "title", "welcome_text", "logo_file_id", "logo_url", "menu_shop", "menu_miniapp",
-    "menu_trials", "menu_myresellers", "menu_admin", "menu_services",
+    "menu_trials", "menu_profile", "menu_orders", "menu_myresellers", "menu_admin", "menu_services",
     "menu_panels", "menu_resellers", "menu_wallet", "menu_trust", "menu_support",
     "menu_settings", "page_shop", "page_services", "page_panels", "page_resellers",
     "page_wallet", "page_trust", "page_support", "page_settings",

@@ -40,6 +40,8 @@ class ContentAdminTests(unittest.TestCase):
         self.assertIn("content:edit:menu_create", mother_keys)
         self.assertNotIn("content:edit:menu_shop", mother_keys)
         self.assertIn("content:edit:menu_shop", customer_keys)
+        self.assertIn("content:edit:menu_profile", customer_keys)
+        self.assertIn("content:edit:menu_orders", customer_keys)
         self.assertNotIn("content:edit:menu_create", customer_keys)
 
     def test_text_field_is_saved_and_persists(self):

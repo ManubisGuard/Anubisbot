@@ -1061,6 +1061,8 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         buttons=self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
         callbacks={b.get("callback_data") for row in buttons for b in row}
         self.assertIn("content:toggle:menu_shop_enabled",callbacks)
+        self.assertIn("content:toggle:menu_profile_enabled",callbacks)
+        self.assertIn("content:toggle:menu_orders_enabled",callbacks)
         self.bot.api.send_text.reset_mock()
         await self.bot._handle_callback({"id":"buttons-toggle","from":{"id":6883349141},
             "message":{"chat":{"id":6883349141,"type":"private"}},"data":"content:toggle:menu_shop_enabled"})
@@ -1069,6 +1071,19 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},"text":"/start"})
         labels={b.get("text") for row in self.bot.api.send_text.await_args.args[2]["keyboard"] for b in row}
         self.assertNotIn("🛒 خرید سرویس",labels)
+        for key in ("menu_profile_enabled", "menu_orders_enabled"):
+            self.bot.api.send_text.reset_mock()
+            await self.bot._handle_callback({"id":f"toggle-{key}","from":{"id":6883349141},
+                "message":{"chat":{"id":6883349141,"type":"private"}},
+                "data":f"content:toggle:{key}"})
+            self.assertEqual(self.bot.content.get(key), "off")
+        menu_callbacks = {
+            button.get("callback_data")
+            for row in self.bot._customer_menu(customer_id=999)["inline_keyboard"]
+            for button in row
+        }
+        self.assertNotIn("customer:profile", menu_callbacks)
+        self.assertNotIn("customer:orders:0", menu_callbacks)
 
     async def test_reply_keyboard_shop_button_routes_to_customer_shop(self):
         await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},"text":"/start"})

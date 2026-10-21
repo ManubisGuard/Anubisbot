@@ -226,6 +226,7 @@ class CustomerBot:
                 "menu_miniapp_enabled": "on",
                 "menu_shop_enabled": "on", "menu_services_enabled": "on",
                 "menu_profile_enabled": "on", "menu_profile": "👤 حساب کاربری من",
+                "menu_orders_enabled": "on", "menu_orders": "🧾 سفارش‌های من",
                 "menu_resellers_enabled": "on", "menu_myresellers_enabled": "on",
                 "menu_wallet_enabled": "on", "menu_support_enabled": "on", "menu_admin_enabled": "on",
                 "menu_shop": "🛒 خرید سرویس", "menu_miniapp": "📱 ورود به مینی‌اپلیکیشن",
