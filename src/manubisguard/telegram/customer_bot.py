@@ -1977,6 +1977,24 @@ class CustomerBot:
         chat_id = chat.get("id")
         if not isinstance(chat_id, int):
             return
+        # Visibility settings must be enforced by the dispatcher too, not only
+        # while rendering the current menu. Old or forged buttons can outlive it.
+        visibility_routes = {
+            "customer:miniapp": "menu_miniapp_enabled",
+            "customer:shop": "menu_shop_enabled",
+            "customer:services": "menu_services_enabled",
+            "customer:profile": "menu_profile_enabled",
+            "customer:orders": "menu_orders_enabled",
+            "customer:resellers": "menu_resellers_enabled",
+            "customer:myresellers": "menu_myresellers_enabled",
+            "customer:wallet": "menu_wallet_enabled",
+            "customer:support": "menu_support_enabled",
+        }
+        disabled_route = next((route for route in visibility_routes
+                               if data == route or data.startswith(route + ":")), None)
+        if disabled_route and not _enabled(self.content, visibility_routes[disabled_route]):
+            await self.api.send_text(chat_id, "این بخش در حال حاضر غیرفعال است.", BACK_MENU)
+            return
         if data == "customer:miniapp":
             await self.api.send_text(chat_id,
                 "مینی‌اپ مشتری هنوز به دامنهٔ HTTPS متصل نشده است. پس از راه‌اندازی بک‌اند و رابط مشتری، مقدار امن MANUBIS_CUSTOMER_WEBAPP_URL را تنظیم کن؛ درگاه پرداخت در این مرحله لازم نیست.",

@@ -439,6 +439,27 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("panel-report", notice["payload_json"])
         self.assertNotIn("https://panel.example", notice["payload_json"])
 
+    async def test_hidden_customer_routes_reject_stale_direct_callbacks(self):
+        cases = (
+            ("menu_profile_enabled", "customer:profile"),
+            ("menu_orders_enabled", "customer:orders:0"),
+            ("menu_services_enabled", "customer:services:0"),
+            ("menu_support_enabled", "customer:support:list:0"),
+            ("menu_shop_enabled", "customer:shop"),
+        )
+        for index, (setting, callback_data) in enumerate(cases):
+            with self.subTest(setting=setting):
+                self.bot.content.set(setting, "off")
+                self.bot.api.send_text.reset_mock()
+                await self.bot._handle_callback({
+                    "id": f"hidden-route-{index}",
+                    "from": {"id": 999, "first_name": "Private"},
+                    "message": {"chat": {"id": 999, "type": "private"}},
+                    "data": callback_data,
+                })
+                self.assertIn("غیرفعال است", self.bot.api.send_text.await_args.args[1])
+                self.assertNotIn("Private", self.bot.api.send_text.await_args.args[1])
+
     async def test_customer_menu_uses_only_valid_https_webapp_url(self):
         with patch.dict(os.environ, {"MANUBIS_CUSTOMER_WEBAPP_URL":"https://mini.example/customer/"}):
             keyboard = self.bot._customer_menu()
