@@ -76,12 +76,10 @@ class CustomerBotConfig:
 
 CUSTOMER_MENU = {
     "inline_keyboard": [
-        [{"text": "📱 ورود به مینی‌اپلیکیشن", "callback_data": "customer:miniapp", "style": "primary"}],
-        [{"text": "🧪 تست سرویس‌ها", "callback_data": "customer:trials", "style": "success"},
-         {"text": "🛒 خرید سرویس و اشتراک", "callback_data": "customer:shop", "style": "primary"}],
+        [{"text": "🛒 خرید سرویس و اشتراک", "callback_data": "customer:shop", "style": "primary"}],
         [{"text": "⚙️ سرویس‌ها و کانفیگ‌های من", "callback_data": "customer:services"}],
-        [{"text": "🏪 خرید پنل نمایندگی", "callback_data": "customer:resellers", "style": "primary"},
-         {"text": "🗂 پنل‌های من", "callback_data": "customer:myresellers"}],
+        [{"text": "👤 حساب کاربری من", "callback_data": "customer:profile"}],
+        [{"text": "🧾 سفارش‌های من", "callback_data": "customer:orders:0"}],
         [{"text": "💳 کیف پول و شارژ", "callback_data": "customer:wallet", "style": "success"},
          {"text": "🎫 پشتیبانی و ثبت تیکت", "callback_data": "customer:support"}],
     ]
@@ -154,7 +152,6 @@ PAGES = {
 
 MENU_VISIBILITY_FIELDS = (
     ("menu_miniapp_enabled", "📱 ورود به مینی‌اپلیکیشن", "customer:miniapp"),
-    ("menu_trials_enabled", "🧪 تست سرویس‌ها", "customer:trials"),
     ("menu_shop_enabled", "🛒 خرید سرویس و اشتراک", "customer:shop"),
     ("menu_services_enabled", "⚙️ سرویس‌های من", "customer:services"),
     ("menu_profile_enabled", "👤 حساب کاربری من", "customer:profile"),
@@ -226,13 +223,13 @@ class CustomerBot:
                 "title": "ANUBIS BOT",
                 "welcome_text": "ربات فروش و خدمات مستقل مشتری؛ متن و تصویر و تمام برچسب‌های منو از بخش مدیریت محتوا قابل ویرایش است.",
                 "logo_file_id": "", "logo_url": "",
-                "menu_miniapp_enabled": "on", "menu_trials_enabled": "on",
+                "menu_miniapp_enabled": "on",
                 "menu_shop_enabled": "on", "menu_services_enabled": "on",
                 "menu_profile_enabled": "on", "menu_profile": "👤 حساب کاربری من",
                 "menu_resellers_enabled": "on", "menu_myresellers_enabled": "on",
                 "menu_wallet_enabled": "on", "menu_support_enabled": "on", "menu_admin_enabled": "on",
                 "menu_shop": "🛒 خرید سرویس", "menu_miniapp": "📱 ورود به مینی‌اپلیکیشن",
-                "menu_trials": "🧪 تست سرویس‌ها", "menu_myresellers": "🗂 پنل‌های من",
+                "menu_myresellers": "🗂 پنل‌های من",
                 "menu_admin": "🛡 پنل مدیریت ربات", "menu_services": "⚙️ سرویس‌های من",
                 "menu_panels": "🧩 پنل‌ها و اتصال‌ها", "menu_resellers": "🏪 خرید پنل نمایندگی",
                 "menu_wallet": "💳 کیف پول و شارژ", "menu_trust": "📣 کانال اعتماد",
@@ -270,17 +267,11 @@ class CustomerBot:
             if style:
                 item["style"] = style
             rows.append([item])
-        if _enabled(self.content, "menu_miniapp_enabled"):
+        miniapp_url = _customer_webapp_url()
+        if _enabled(self.content, "menu_miniapp_enabled") and miniapp_url:
             miniapp_label = content_value(self.content, "menu_miniapp", "📱 ورود به مینی‌اپلیکیشن")
-            miniapp_url = _customer_webapp_url()
-            if miniapp_url:
-                rows.append([{"text": miniapp_label, "web_app": {"url": miniapp_url}, "style": "primary"}])
-            else:
-                rows.append([{"text": miniapp_label, "callback_data": "customer:miniapp", "style": "primary"}])
+            rows.append([{"text": miniapp_label, "web_app": {"url": miniapp_url}, "style": "primary"}])
         customer_row: list[dict[str, Any]] = []
-        if _enabled(self.content, "menu_trials_enabled"):
-            customer_row.append({"text": content_value(self.content, "menu_trials", "🧪 تست سرویس‌ها"),
-                                 "callback_data": "customer:trials", "style": "success"})
         if _enabled(self.content, "menu_shop_enabled"):
             customer_row.append({"text": content_value(self.content, "menu_shop", "🛒 خرید سرویس و اشتراک"),
                                  "callback_data": "customer:shop", "style": "primary"})

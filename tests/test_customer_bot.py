@@ -396,8 +396,9 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         keyboard = self.bot.api.send_text.await_args.args[2]
         buttons = [button for row in keyboard["keyboard"] for button in row]
         labels = {button.get("text") for button in buttons}
-        self.assertIn("📱 ورود به مینی‌اپلیکیشن", labels)
-        self.assertIn("🧪 تست سرویس‌ها", labels)
+        self.assertNotIn("📱 ورود به مینی‌اپلیکیشن", labels)
+        self.assertNotIn("🧪 تست سرویس‌ها", labels)
+        self.assertIn("🛒 خرید سرویس", labels)
         self.assertIn("🏪 خرید پنل نمایندگی", labels)
         self.assertNotIn("🗂 پنل‌های من", labels)
         self.assertIn("💳 کیف پول و شارژ", labels)
@@ -405,7 +406,7 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🛡 پنل مدیریت ربات", labels)
         self.assertTrue(keyboard["is_persistent"])
         self.assertEqual(CUSTOMER_MENU["inline_keyboard"][0][0]["style"], "primary")
-        self.assertEqual(CUSTOMER_MENU["inline_keyboard"][1][0]["style"], "success")
+        self.assertEqual(CUSTOMER_MENU["inline_keyboard"][4][0]["style"], "success")
 
     async def test_panel_check_surfaces_operation_report_without_claiming_live_permissions(self):
         from manubisguard.panels.contracts import PanelCapabilities
@@ -445,9 +446,10 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(button["web_app"]["url"], "https://mini.example/customer/")
         self.assertNotIn("callback_data", button)
         with patch.dict(os.environ, {"MANUBIS_CUSTOMER_WEBAPP_URL":"http://mini.example/customer/"}):
-            fallback = self.bot._customer_menu()["inline_keyboard"][0][0]
-        self.assertEqual(fallback["callback_data"], "customer:miniapp")
-        self.assertNotIn("web_app", fallback)
+            unavailable = self.bot._customer_menu()
+        buttons = [button for row in unavailable["inline_keyboard"] for button in row]
+        self.assertFalse(any(button.get("callback_data") == "customer:miniapp" for button in buttons))
+        self.assertFalse(any("web_app" in button for button in buttons))
 
     async def test_miniapp_callback_explains_missing_secure_url(self):
         with patch.dict(os.environ, {"MANUBIS_CUSTOMER_WEBAPP_URL":""}):
