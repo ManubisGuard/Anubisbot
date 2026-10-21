@@ -91,6 +91,34 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("customer:shop", callbacks)
         self.assertIn("customer:home", callbacks)
 
+    async def test_customer_profile_shows_own_account_summary_and_navigation(self):
+        self.bot.data.ensure_customer(999, username="profile_user", first_name="Profile")
+        self.bot.data.upsert_service(service_id="profile-service", telegram_id=999, product_id="prod-a",
+            panel_id="pg-a", provider_user_id="provider-profile", status="active")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="profile-wallet", amount_minor=4321,
+            currency="IRR", entry_type="deposit")
+        menu = self.bot._customer_menu(customer_id=999)
+        callbacks = [button.get("callback_data") for row in menu["inline_keyboard"] for button in row]
+        self.assertIn("customer:profile", callbacks)
+
+        await self.bot._handle_callback({
+            "id": "profile-summary", "from": {"id": 999, "username": "profile_user",
+                "first_name": "Profile", "last_name": "Owner"},
+            "message": {"message_id": 9, "chat": {"id": 999, "type": "private"}},
+            "data": "customer:profile",
+        })
+        body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("Profile Owner", body)
+        self.assertIn("@profile_user", body)
+        self.assertIn("شناسه تلگرام: 999", body)
+        self.assertIn("تعداد سرویس‌ها: 1", body)
+        self.assertIn("تعداد سفارش‌های اخیر: 0", body)
+        self.assertIn("IRR: 4,321", body)
+        keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        profile_callbacks = {button.get("callback_data") for row in keyboard for button in row}
+        self.assertTrue({"customer:services", "customer:orders:0", "customer:wallet",
+                         "customer:support", "customer:home"}.issubset(profile_callbacks))
+
     async def test_customer_support_menu_opens_new_ticket_and_lists_only_own_tickets(self):
         menu = self.bot._customer_menu(customer_id=1001)
         callbacks = [button.get("callback_data") for row in menu["inline_keyboard"] for button in row]

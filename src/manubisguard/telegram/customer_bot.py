@@ -157,6 +157,7 @@ MENU_VISIBILITY_FIELDS = (
     ("menu_trials_enabled", "🧪 تست سرویس‌ها", "customer:trials"),
     ("menu_shop_enabled", "🛒 خرید سرویس و اشتراک", "customer:shop"),
     ("menu_services_enabled", "⚙️ سرویس‌های من", "customer:services"),
+    ("menu_profile_enabled", "👤 حساب کاربری من", "customer:profile"),
     ("menu_orders_enabled", "🧾 سفارش‌های من", "customer:orders:0"),
     ("menu_resellers_enabled", "🏪 خرید پنل نمایندگی", "customer:resellers"),
     ("menu_myresellers_enabled", "🗂 پنل‌های من", "customer:myresellers"),
@@ -227,6 +228,7 @@ class CustomerBot:
                 "logo_file_id": "", "logo_url": "",
                 "menu_miniapp_enabled": "on", "menu_trials_enabled": "on",
                 "menu_shop_enabled": "on", "menu_services_enabled": "on",
+                "menu_profile_enabled": "on", "menu_profile": "👤 حساب کاربری من",
                 "menu_resellers_enabled": "on", "menu_myresellers_enabled": "on",
                 "menu_wallet_enabled": "on", "menu_support_enabled": "on", "menu_admin_enabled": "on",
                 "menu_shop": "🛒 خرید سرویس", "menu_miniapp": "📱 ورود به مینی‌اپلیکیشن",
@@ -285,6 +287,7 @@ class CustomerBot:
         if customer_row:
             rows.append(customer_row)
         add("menu_services_enabled", "menu_services", "customer:services")
+        add("menu_profile_enabled", "menu_profile", "customer:profile")
         if customer_id is not None and self.data.list_reseller_accounts(customer_id) and _enabled(self.content, "menu_myresellers_enabled"):
             add("menu_myresellers_enabled", "menu_myresellers", "customer:myresellers")
         add("menu_resellers_enabled", "menu_resellers", "customer:resellers", "primary")
@@ -2243,6 +2246,31 @@ class CustomerBot:
             return
         key = data.partition(":")[2] if data.startswith("customer:") else ""
         discount_code = None
+        if key == "profile":
+            self.data.ensure_customer(uid, user.get("username", ""), user.get("first_name", ""))
+            services = self.data.list_services(uid)
+            orders = self.data.list_customer_orders(uid, limit=50)
+            balances = self.data.wallet_balances(uid)
+            name = str(user.get("first_name") or "—").strip()
+            last_name = str(user.get("last_name") or "").strip()
+            if last_name:
+                name = f"{name} {last_name}"
+            username = str(user.get("username") or "").strip()
+            balance_lines = [f"• {currency}: {amount:,}" for currency, amount in balances.items()] or ["• IRR: 0"]
+            body = (f"👤 حساب کاربری من\n\nنام: {name}\n"
+                    f"نام کاربری: @{username if username else 'ثبت نشده'}\n"
+                    f"شناسه تلگرام: {uid}\n\n"
+                    f"🔐 تعداد سرویس‌ها: {len(services)}\n"
+                    f"🧾 تعداد سفارش‌های اخیر: {len(orders)}\n\n"
+                    "💳 موجودی کیف پول:\n" + "\n".join(balance_lines))
+            await self.api.send_text(chat_id, body, {"inline_keyboard": [
+                [{"text": "⚙️ سرویس‌های من", "callback_data": "customer:services"}],
+                [{"text": "🧾 سفارش‌های من", "callback_data": "customer:orders:0"}],
+                [{"text": "💳 کیف پول", "callback_data": "customer:wallet"},
+                 {"text": "🎫 پشتیبانی", "callback_data": "customer:support"}],
+                [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
+            ]})
+            return
         if key == "support":
             await self.api.send_text(chat_id, "🎫 پشتیبانی\n\nاز این بخش می‌توانی تیکت جدید ثبت کنی یا تیکت‌های قبلی خودت را ببینی. برای ادامه گفتگو از فرمان /ticket-reply استفاده کن.", {"inline_keyboard": [
                 [{"text": "✍️ ثبت تیکت جدید", "callback_data": "customer:support:new"}],
