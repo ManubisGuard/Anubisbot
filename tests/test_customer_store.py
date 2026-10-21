@@ -675,6 +675,44 @@ class CustomerDataStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
                 db.execute("DELETE FROM payment_attempt_events WHERE tenant_id=? AND payment_id=?", (self.store.tenant_id, "pay-audit"))
 
+    def test_payment_settlement_rolls_back_credit_and_audit_when_outbox_fails(self):
+        self.store.create_payment_attempt(
+            payment_id="pay-rollback-outbox", telegram_id=1001, provider="manual",
+            amount_minor=2500, currency="IRR", idempotency_key="intent-rollback-outbox",
+        )
+        original = self.store._enqueue_admin_notification_in_transaction
+        calls = 0
+
+        def fail_second(db, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected admin outbox failure")
+            return original(db, **kwargs)
+
+        self.store._enqueue_admin_notification_in_transaction = fail_second
+        try:
+            with self.assertRaisesRegex(RuntimeError, "injected admin outbox failure"):
+                self.store.settle_verified_wallet_deposit(
+                    payment_id="pay-rollback-outbox", verified_amount_minor=2500,
+                    verified_currency="IRR", external_reference="rollback-outbox-reference",
+                    verified_by=9001,
+                )
+        finally:
+            self.store._enqueue_admin_notification_in_transaction = original
+
+        self.assertEqual(self.store.get_payment_attempt("pay-rollback-outbox")["status"], "pending")
+        self.assertEqual(self.store.wallet_balance(1001), 0)
+        self.assertEqual([event["event_type"] for event in self.store.list_payment_attempt_events("pay-rollback-outbox")],
+                         ["created"])
+        with self.store._connect() as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM wallet_ledger WHERE tenant_id=? AND idempotency_key=?",
+                (self.store.tenant_id, "payment:pay-rollback-outbox")).fetchone()[0], 0)
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM customer_admin_notifications WHERE tenant_id=? AND idempotency_key IN (?,?)",
+                (self.store.tenant_id, "payment:pay-rollback-outbox", "payment-wallet:pay-rollback-outbox")).fetchone()[0], 0)
+
     def test_product_supports_metered_modes_and_rejects_missing_rate(self):
         self.store.put_product(product_id="hourly", title="Hourly", price_minor=0,
                                pricing_mode="hourly", unit_price_minor=600)
