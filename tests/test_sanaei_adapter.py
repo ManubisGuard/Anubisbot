@@ -2,7 +2,7 @@ import json
 import unittest
 import uuid
 from manubisguard.panels.adapters.sanaei import SanaeiAdapter
-from manubisguard.panels.contracts import PanelConnection, PanelError, UserCreate, UserUpdate
+from manubisguard.panels.contracts import PanelConnection, PanelError, PanelUserNotFound, UserCreate, UserUpdate
 
 class Response:
     def __init__(self,status,data=None): self.status_code=status; self._data=data; self.content=json.dumps(data).encode() if data is not None else b''
@@ -380,6 +380,74 @@ class SanaeiAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(f'/panel/api/inbounds/updateClient/{expected_id}',paths)
                 self.assertIn(f'/panel/api/inbounds/7/delClient/{expected_id}',paths)
 
+    async def test_legacy_list_users_merges_same_client_across_inbounds(self):
+        inbound_a = {"id": 7, "protocol": "vless", "settings": json.dumps({"clients": [
+            {"id": "uuid-1", "email": "alice", "totalGB": 2, "expiryTime": 0,
+             "enable": True, "up": 4, "down": 6}
+        ]})}
+        inbound_b = {"id": "8", "protocol": "vless", "settings": json.dumps({"clients": [
+            {"id": "uuid-1", "email": "alice", "totalGB": 2, "expiryTime": 0,
+             "enable": True, "up": 9, "down": 11}
+        ]})}
+        def handler(method, path, kwargs):
+            if path == "/login": return Response(200, {"success": True})
+            if path == "/panel/api/inbounds/list": return Response(200, {"success": True, "obj": [inbound_a, inbound_b]})
+            self.fail(f"unexpected request: {method} {path}")
+        adapter = SanaeiAdapter(secret_resolver=lambda _: "password",
+            client_factory=lambda **kw: FakeClient(handler, kw["base_url"]))
+        conn = PanelConnection(id="legacy", tenant_id="t", name="Legacy", kind="sanaei",
+            base_url="https://sanaei.example", auth_mode="username_password", secret_ref="s",
+            metadata={"username": "admin"})
+        users = await adapter.list_users(conn)
+        self.assertEqual([user.username for user in users], ["alice"])
+        self.assertEqual(users[0].metadata["inbound_ids"], [7, 8])
+
+    async def test_legacy_multi_inbound_user_update_and_delete_fail_before_mutation(self):
+        inbound_a = {"id": 7, "protocol": "vless", "settings": json.dumps({"clients": [
+            {"id": "uuid-1", "email": "alice", "totalGB": 2, "expiryTime": 0, "enable": True}
+        ]})}
+        inbound_b = {"id": 8, "protocol": "vless", "settings": json.dumps({"clients": [
+            {"id": "uuid-1", "email": "alice", "totalGB": 2, "expiryTime": 0, "enable": True}
+        ]})}
+        calls = []
+        def handler(method, path, kwargs):
+            calls.append((method, path))
+            if path == "/login": return Response(200, {"success": True})
+            if path == "/panel/api/inbounds/list": return Response(200, {"success": True, "obj": [inbound_a, inbound_b]})
+            self.fail(f"mutation must not be sent for multi-inbound identity: {method} {path}")
+        adapter = SanaeiAdapter(secret_resolver=lambda _: "password",
+            client_factory=lambda **kw: FakeClient(handler, kw["base_url"]))
+        conn = PanelConnection(id="legacy", tenant_id="t", name="Legacy", kind="sanaei",
+            base_url="https://sanaei.example", auth_mode="username_password", secret_ref="s",
+            metadata={"username": "admin"})
+        for operation in ("update", "delete"):
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(PanelError, "exactly one inbound"):
+                    if operation == "update":
+                        await adapter.update_user(conn, "alice", UserUpdate(status="disabled"))
+                    else:
+                        await adapter.delete_user(conn, "alice")
+        self.assertFalse(any("updateClient" in path or "delClient" in path for _, path in calls))
+
+    async def test_legacy_list_users_rejects_conflicting_identity_for_duplicate_email(self):
+        inbound_a = {"id": 7, "protocol": "vless", "settings": json.dumps({"clients": [
+            {"id": "uuid-1", "email": "alice", "totalGB": 2, "enable": True}
+        ]})}
+        inbound_b = {"id": 8, "protocol": "vless", "settings": json.dumps({"clients": [
+            {"id": "uuid-different", "email": "alice", "totalGB": 2, "enable": True}
+        ]})}
+        def handler(method, path, kwargs):
+            if path == "/login": return Response(200, {"success": True})
+            if path == "/panel/api/inbounds/list": return Response(200, {"success": True, "obj": [inbound_a, inbound_b]})
+            self.fail(f"unexpected request: {method} {path}")
+        adapter = SanaeiAdapter(secret_resolver=lambda _: "password",
+            client_factory=lambda **kw: FakeClient(handler, kw["base_url"]))
+        conn = PanelConnection(id="legacy", tenant_id="t", name="Legacy", kind="sanaei",
+            base_url="https://sanaei.example", auth_mode="username_password", secret_ref="s",
+            metadata={"username": "admin"})
+        with self.assertRaisesRegex(PanelError, "ambiguous.*inbounds"):
+            await adapter.list_users(conn)
+
     async def test_token_delete_uses_documented_endpoint(self):
         calls=[]
         def handler(method,path,kwargs): calls.append((method,path)); return Response(200,{'success':True,'obj':None})
@@ -389,3 +457,155 @@ class SanaeiAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(caps.delete_user)
         await adapter.delete_user(conn,'alice')
         self.assertEqual(calls,[('POST','/panel/api/clients/del/alice')])
+
+    async def test_token_get_user_only_maps_lookup_404_to_not_found(self):
+        conn = PanelConnection(id="s", tenant_id="t", name="Sanaei", kind="sanaei",
+            base_url="https://sanaei.example", auth_mode="access_token", secret_ref="s")
+
+        for status in (401, 403, 500):
+            with self.subTest(status=status):
+                adapter = SanaeiAdapter(secret_resolver=lambda _: "token-secret",
+                    client_factory=lambda **kw: FakeClient(
+                        lambda *args: Response(status, {"success": False}), kw["base_url"]))
+                with self.assertRaises(PanelError) as caught:
+                    await adapter.get_user(conn, "alice")
+                self.assertNotIsInstance(caught.exception, PanelUserNotFound)
+
+        adapter = SanaeiAdapter(secret_resolver=lambda _: "token-secret",
+            client_factory=lambda **kw: FakeClient(
+                lambda *args: Response(404, {"success": False}), kw["base_url"]))
+        with self.assertRaises(PanelUserNotFound):
+            await adapter.get_user(conn, "alice")
+
+    async def test_token_get_user_rejects_success_response_without_client_identity(self):
+        adapter = SanaeiAdapter(secret_resolver=lambda _: "token-secret",
+            client_factory=lambda **kw: FakeClient(
+                lambda *args: Response(200, {"success": True, "obj": {"client": {"id": "uuid-only"}}}),
+                kw["base_url"]))
+        conn = PanelConnection(id="s", tenant_id="t", name="Sanaei", kind="sanaei",
+            base_url="https://sanaei.example", auth_mode="access_token", secret_ref="s")
+        with self.assertRaisesRegex(PanelError, "omitted client email"):
+            await adapter.get_user(conn, "alice")
+
+    async def test_token_get_user_transport_failure_is_not_not_found(self):
+        def fail(*args):
+            raise RuntimeError("private transport detail")
+        adapter = SanaeiAdapter(secret_resolver=lambda _: "token-secret",
+            client_factory=lambda **kw: FakeClient(fail, kw["base_url"]))
+        conn = PanelConnection(id="s", tenant_id="t", name="Sanaei", kind="sanaei",
+            base_url="https://sanaei.example", auth_mode="access_token", secret_ref="s")
+        with self.assertRaisesRegex(PanelError, "transport failed") as caught:
+            await adapter.get_user(conn, "alice")
+        self.assertNotIsInstance(caught.exception, PanelUserNotFound)
+        self.assertNotIn("private transport detail", str(caught.exception))
+
+    async def test_capability_report_invalid_connection_fails_closed_without_secret_resolution(self):
+        resolved = []
+        adapter = SanaeiAdapter(
+            secret_resolver=lambda ref: resolved.append(ref) or "token-secret",
+            client_factory=lambda **kw: self.fail("capability report must not create a client"),
+        )
+        conn = PanelConnection(id="s", tenant_id="t", name="Sanaei", kind="sanaei",
+            base_url="https://sanaei.example", auth_mode="access_token", secret_ref="s",
+            verify_tls=False)
+        report = await adapter.capability_report(conn)
+
+        self.assertFalse(report["live_panel_verified"])
+        self.assertEqual(report["connection_validation"], "failed")
+        self.assertEqual(report["error_type"], "PanelError")
+        self.assertEqual(resolved, [])
+        self.assertEqual(report["operations"]["create_user"]["status"], "unknown")
+        self.assertEqual(report["operations"]["create_user"]["panel_permission"], "unknown")
+
+    async def test_legacy_update_and_delete_http_errors_are_generic_and_redacted(self):
+        for operation in ("update", "delete"):
+            with self.subTest(operation=operation):
+                calls = []
+                inbound = {"id": 7, "protocol": "vless", "settings": json.dumps({"clients": [
+                    {"id": "uuid-1", "email": "alice", "totalGB": 2, "expiryTime": 0,
+                     "enable": True, "up": 1, "down": 2}
+                ]})}
+
+                def handler(method, path, kwargs):
+                    calls.append((method, path))
+                    if path == "/login":
+                        return Response(200, {"success": True})
+                    if path == "/panel/api/inbounds/list":
+                        return Response(200, {"success": True, "obj": [inbound]})
+                    if "/updateClient/" in path or "/delClient/" in path:
+                        return Response(503, {"detail": "provider-secret-response"})
+                    self.fail(f"unexpected request: {method} {path}")
+
+                adapter = SanaeiAdapter(secret_resolver=lambda _: "password-secret",
+                    client_factory=lambda **kw: FakeClient(handler, kw["base_url"]))
+                conn = PanelConnection(id="legacy", tenant_id="t", name="Legacy", kind="sanaei",
+                    base_url="https://sanaei.example", auth_mode="username_password", secret_ref="s",
+                    metadata={"username": "admin"})
+                with self.assertRaisesRegex(PanelError, "HTTP 503") as caught:
+                    if operation == "update":
+                        await adapter.update_user(conn, "alice", UserUpdate(status="disabled"))
+                    else:
+                        await adapter.delete_user(conn, "alice")
+                self.assertNotIsInstance(caught.exception, PanelUserNotFound)
+                self.assertNotIn("provider-secret-response", str(caught.exception))
+                self.assertTrue(any("/updateClient/" in path or "/delClient/" in path
+                                    for _, path in calls))
+
+    async def test_legacy_update_and_delete_transport_errors_are_not_not_found(self):
+        for operation in ("update", "delete"):
+            with self.subTest(operation=operation):
+                calls = []
+                inbound = {"id": 7, "protocol": "vless", "settings": json.dumps({"clients": [
+                    {"id": "uuid-1", "email": "alice", "totalGB": 2, "expiryTime": 0,
+                     "enable": True, "up": 1, "down": 2}
+                ]})}
+
+                def handler(method, path, kwargs):
+                    calls.append((method, path))
+                    if path == "/login":
+                        return Response(200, {"success": True})
+                    if path == "/panel/api/inbounds/list":
+                        return Response(200, {"success": True, "obj": [inbound]})
+                    if "/updateClient/" in path or "/delClient/" in path:
+                        raise RuntimeError("provider-secret-transport-detail")
+                    self.fail(f"unexpected request: {method} {path}")
+
+                adapter = SanaeiAdapter(secret_resolver=lambda _: "password-secret",
+                    client_factory=lambda **kw: FakeClient(handler, kw["base_url"]))
+                conn = PanelConnection(id="legacy", tenant_id="t", name="Legacy", kind="sanaei",
+                    base_url="https://sanaei.example", auth_mode="username_password", secret_ref="s",
+                    metadata={"username": "admin"})
+                with self.assertRaisesRegex(PanelError, "transport failed") as caught:
+                    if operation == "update":
+                        await adapter.update_user(conn, "alice", UserUpdate(status="disabled"))
+                    else:
+                        await adapter.delete_user(conn, "alice")
+                self.assertNotIsInstance(caught.exception, PanelUserNotFound)
+                self.assertNotIn("provider-secret-transport-detail", str(caught.exception))
+                self.assertTrue(any("/updateClient/" in path or "/delClient/" in path
+                                    for _, path in calls))
+
+    async def test_legacy_update_and_delete_missing_user_fail_before_mutation(self):
+        for operation in ("update", "delete"):
+            with self.subTest(operation=operation):
+                calls = []
+
+                def handler(method, path, kwargs):
+                    calls.append((method, path))
+                    if path == "/login":
+                        return Response(200, {"success": True})
+                    if path == "/panel/api/inbounds/list":
+                        return Response(200, {"success": True, "obj": []})
+                    self.fail(f"mutation must not run for absent user: {method} {path}")
+
+                adapter = SanaeiAdapter(secret_resolver=lambda _: "password-secret",
+                    client_factory=lambda **kw: FakeClient(handler, kw["base_url"]))
+                conn = PanelConnection(id="legacy", tenant_id="t", name="Legacy", kind="sanaei",
+                    base_url="https://sanaei.example", auth_mode="username_password", secret_ref="s",
+                    metadata={"username": "admin"})
+                with self.assertRaises(PanelUserNotFound):
+                    if operation == "update":
+                        await adapter.update_user(conn, "alice", UserUpdate(status="disabled"))
+                    else:
+                        await adapter.delete_user(conn, "alice")
+                self.assertEqual(calls, [("POST", "/login"), ("GET", "/panel/api/inbounds/list")])

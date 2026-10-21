@@ -9,6 +9,10 @@ class PanelError(RuntimeError):
     """Safe, provider-neutral panel operation error."""
 
 
+class PanelUserNotFound(PanelError):
+    """A provider read explicitly confirmed that the requested username does not exist."""
+
+
 @dataclass(frozen=True, slots=True)
 class PanelConnection:
     id: str

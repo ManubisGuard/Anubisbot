@@ -12,7 +12,7 @@ from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
 
-from ..contracts import (PanelCapabilities, PanelConnection, PanelError, PanelUser, UserCreate,
+from ..contracts import (PanelCapabilities, PanelConnection, PanelError, PanelUser, PanelUserNotFound, UserCreate,
                          UserUpdate, local_capability_report)
 
 
@@ -42,7 +42,8 @@ class SanaeiAdapter:
         raise PanelError("Sanaei supports access_token or username_password auth mode")
 
     async def _request(self, connection: PanelConnection, method: str, path: str,
-                       *, payload: dict[str, Any] | None = None) -> Any:
+                       *, payload: dict[str, Any] | None = None,
+                       user_lookup: bool = False) -> Any:
         mode, secret = self._credentials(connection)
         headers = {"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"}
         try:
@@ -69,6 +70,8 @@ class SanaeiAdapter:
                     if isinstance(login_data, dict) and login_data.get("success") is False:
                         raise PanelError("Sanaei login was rejected")
                 response = await client.request(method, path, json=payload, headers=headers)
+            if response.status_code == 404 and user_lookup:
+                raise PanelUserNotFound("Sanaei user was not found")
             if response.status_code < 200 or response.status_code >= 300:
                 raise PanelError(f"Sanaei returned HTTP {response.status_code}")
             try: result = response.json() if response.content else {}
@@ -170,8 +173,10 @@ class SanaeiAdapter:
             data_limit_bytes=total_bytes,
             expire_at=expire, subscription_url=sub,
             raw_status=str(client.get("enable", "unknown")),
-            metadata={"inbound_ids": obj.get("inboundIds", []), "uuid": client.get("id"),
-                      "sub_id": client.get("subId") or obj.get("subId")})
+            metadata={"inbound_ids": sorted(int(x) for x in obj.get("inboundIds", []) if str(x).isdigit()),
+                      "uuid": client.get("id"), "sub_id": client.get("subId") or obj.get("subId"),
+                      "ip_limit": client.get("limitIp"), "flow": client.get("flow"),
+                      "protocol": obj.get("protocol")})
 
     async def capability_report(self, connection: PanelConnection) -> dict[str, Any]:
         """Report adapter coverage without making a panel request or claiming permission."""
@@ -214,7 +219,7 @@ class SanaeiAdapter:
     async def _find_client(self, connection: PanelConnection, username: str) -> tuple[dict[str, Any], dict[str, Any]]:
         mode, _ = self._credentials(connection)
         if mode == "token":
-            result = await self._request(connection, "GET", f"/panel/api/clients/get/{quote(username, safe='')}")
+            result = await self._request(connection, "GET", f"/panel/api/clients/get/{quote(username, safe='')}", user_lookup=True)
             obj = self._obj(result)
             return obj, obj.get("client", obj)
         result = await self._request(connection, "GET", "/panel/api/inbounds/list")
@@ -222,17 +227,48 @@ class SanaeiAdapter:
         inbounds = raw_obj if isinstance(raw_obj, list) else (raw_obj.get("inbounds", raw_obj.get("items", [])) if isinstance(raw_obj, dict) else [])
         if not isinstance(inbounds, list):
             raise PanelError("Sanaei inbound response did not contain a list")
+        matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for inbound in inbounds:
             if not isinstance(inbound, dict): continue
             settings = inbound.get("settings", {})
             if isinstance(settings, str):
                 try: settings = json.loads(settings)
                 except ValueError: settings = {}
-            for client in (settings.get("clients", []) if isinstance(settings, dict) else []):
-                if isinstance(client, dict) and client.get("email") == username:
-                    return {"inboundIds": [inbound.get("id")], "protocol": str(inbound.get("protocol") or "").lower(),
-                            "client": client}, client
-        raise PanelError("Sanaei client was not found")
+            clients = settings.get("clients", []) if isinstance(settings, dict) else []
+            if not isinstance(clients, list): continue
+            for client in clients:
+                if isinstance(client, dict) and str(client.get("email") or "") == username:
+                    matches.append((inbound, client))
+        if not matches:
+            raise PanelUserNotFound("Sanaei client was not found")
+        identities = {self._legacy_identity_key(client, inbound.get("protocol")) for inbound, client in matches}
+        if len(identities) != 1:
+            raise PanelError("Legacy Sanaei client identity is ambiguous across inbounds")
+        inbound_ids = []
+        for inbound, _client in matches:
+            inbound_id = self._legacy_inbound_id(inbound.get("id"))
+            if inbound_id not in inbound_ids:
+                inbound_ids.append(inbound_id)
+        first_inbound, first_client = matches[0]
+        return {"inboundIds": sorted(inbound_ids), "protocol": str(first_inbound.get("protocol") or "").lower(),
+                "client": first_client}, first_client
+
+    @staticmethod
+    def _legacy_inbound_id(value: Any) -> int:
+        if isinstance(value, bool):
+            raise PanelError("Legacy Sanaei client has an invalid inbound ID")
+        if isinstance(value, int) and value > 0:
+            return value
+        if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value.strip()):
+            return int(value.strip())
+        raise PanelError("Legacy Sanaei client has an invalid inbound ID")
+
+    @staticmethod
+    def _legacy_identity_key(client: dict[str, Any], protocol: Any) -> tuple[str, str, str, str, str]:
+        """Identify a legacy client without exposing credential values in errors."""
+        return (str(protocol or "").lower(), str(client.get("email") or ""),
+                str(client.get("id") or ""), str(client.get("password") or ""),
+                str(client.get("subId") or ""))
 
     @staticmethod
     def _legacy_client_identifier(inbound: dict[str, Any], client: dict[str, Any]) -> str:
@@ -351,7 +387,7 @@ class SanaeiAdapter:
         result = await self._request(connection, "GET", "/panel/api/inbounds/list")
         raw = result.get("obj", []) if isinstance(result, dict) else []
         if not isinstance(raw, list): raise PanelError("Sanaei inbound response did not contain a list")
-        users: dict[str, PanelUser] = {}
+        grouped: dict[str, dict[str, Any]] = {}
         for inbound in raw:
             if not isinstance(inbound, dict): continue
             settings = inbound.get("settings", {})
@@ -359,10 +395,27 @@ class SanaeiAdapter:
                 try: settings = json.loads(settings)
                 except ValueError: continue
             clients = settings.get("clients", []) if isinstance(settings, dict) else []
+            if not isinstance(clients, list): continue
+            protocol = str(inbound.get("protocol") or "").lower()
             for client in clients:
-                if isinstance(client, dict) and client.get("email"):
-                    users.setdefault(str(client["email"]), self._map({"client": client, "inboundIds": [inbound.get("id")]}, connection.base_url))
-        return list(users.values())[offset:offset+limit]
+                if not isinstance(client, dict) or not client.get("email"):
+                    continue
+                username = str(client["email"])
+                inbound_id = self._legacy_inbound_id(inbound.get("id"))
+                identity = self._legacy_identity_key(client, protocol)
+                current = grouped.get(username)
+                if current is None:
+                    grouped[username] = {"client": client, "protocol": protocol,
+                                         "identity": identity, "inbound_ids": [inbound_id]}
+                    continue
+                if current["identity"] != identity:
+                    raise PanelError("Legacy Sanaei client identity is ambiguous across inbounds")
+                if inbound_id not in current["inbound_ids"]:
+                    current["inbound_ids"].append(inbound_id)
+        users = [self._map({"client": item["client"], "protocol": item["protocol"],
+                            "inboundIds": sorted(item["inbound_ids"])}, connection.base_url)
+                 for item in grouped.values()]
+        return users[offset:offset+limit]
 
     async def get_usage(self, connection: PanelConnection, username: str) -> dict[str, Any]:
         mode, _ = self._credentials(connection)

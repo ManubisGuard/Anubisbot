@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import quote, urljoin, urlsplit
 
-from ..contracts import (PanelCapabilities, PanelConnection, PanelError, PanelUser, UserCreate,
+from ..contracts import (PanelCapabilities, PanelConnection, PanelError, PanelUser, PanelUserNotFound, UserCreate,
                          UserUpdate, local_capability_report)
 
 
@@ -34,7 +34,8 @@ class RebeccaAdapter:
         return secret
 
     async def _request(self, connection: PanelConnection, method: str, path: str,
-                       *, payload: dict[str, Any] | None = None) -> Any:
+                       *, payload: dict[str, Any] | None = None,
+                       user_lookup: bool = False) -> Any:
         secret = self._validate(connection)
         try:
             factory = self._client_factory
@@ -50,6 +51,8 @@ class RebeccaAdapter:
                 response = await client.request(method, path,
                     headers={"Accept": "application/json", "Authorization": f"Bearer {secret}"},
                     json=payload)
+            if response.status_code == 404 and user_lookup:
+                raise PanelUserNotFound("Rebecca user was not found")
             if response.status_code < 200 or response.status_code >= 300:
                 raise PanelError(f"Rebecca returned HTTP {response.status_code}")
             if not response.content:
@@ -58,8 +61,10 @@ class RebeccaAdapter:
                 result = response.json()
             except ValueError:
                 raise PanelError("Rebecca returned an invalid JSON response") from None
-            if isinstance(result, dict) and result.get("detail") and response.status_code >= 400:
-                raise PanelError("Rebecca rejected the operation")
+            if isinstance(result, dict) and (
+                result.get("success") is False or result.get("ok") is False or result.get("error")
+            ):
+                raise PanelError("Rebecca rejected the operation") from None
             return result
         except PanelError:
             raise
@@ -75,23 +80,46 @@ class RebeccaAdapter:
             raise PanelError("Rebecca response omitted user identity")
         exp = obj.get("expire") or obj.get("expire_at")
         if isinstance(exp, (int, float)):
-            exp = datetime.fromtimestamp(exp, timezone.utc) if exp > 0 else None
+            try:
+                exp = datetime.fromtimestamp(exp, timezone.utc) if exp > 0 else None
+            except (OverflowError, OSError, ValueError):
+                raise PanelError("Rebecca response contained an invalid expiry") from None
         elif isinstance(exp, str):
-            try: exp = datetime.fromisoformat(exp.replace("Z", "+00:00"))
-            except ValueError: exp = None
+            try:
+                exp = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+            except ValueError:
+                raise PanelError("Rebecca response contained an invalid expiry") from None
         sub = obj.get("subscription_url") or obj.get("subscription_link")
         if not sub and isinstance(obj.get("links"), list):
             sub = next((item for item in obj["links"] if isinstance(item, str) and item.strip()), None)
         if not sub and isinstance(obj.get("subscription_urls"), dict):
             urls = obj["subscription_urls"]
             sub = urls.get("username-key") or urls.get("username") or urls.get("base")
+        status = str(obj.get("status") or "unknown").strip().lower()
+        used_value = obj.get("used_traffic")
+        if used_value is None:
+            used_value = obj.get("used_bytes", 0)
+        data_limit = obj.get("data_limit", obj.get("data_limit_bytes", 0))
+        try:
+            used_bytes = int(used_value or 0)
+        except (TypeError, ValueError, OverflowError):
+            raise PanelError("Rebecca response contained an invalid usage counter") from None
+        try:
+            data_limit_bytes = int(data_limit or 0)
+        except (TypeError, ValueError, OverflowError):
+            raise PanelError("Rebecca response contained an invalid data limit") from None
+        if used_bytes < 0:
+            raise PanelError("Rebecca response contained a negative usage counter") from None
+        if data_limit_bytes < 0:
+            raise PanelError("Rebecca response contained a negative data limit") from None
         return PanelUser(provider_user_id=username, username=username,
-            status=str(obj.get("status") or "unknown"),
-            used_bytes=int(obj.get("used_traffic") or obj.get("used_bytes") or 0),
-            data_limit_bytes=int(obj.get("data_limit") or obj.get("data_limit_bytes") or 0),
+            status=status,
+            used_bytes=used_bytes,
+            data_limit_bytes=data_limit_bytes,
             expire_at=exp if isinstance(exp, datetime) else None,
             subscription_url=urljoin(base_url.rstrip("/") + "/", str(sub)) if sub else None,
-            raw_status=str(obj.get("status") or "unknown"), metadata={"service_id": obj.get("service_id")})
+            raw_status=str(obj.get("status") or "unknown"),
+            metadata={"service_id": obj.get("service_id"), "ip_limit": obj.get("ip_limit")})
 
     async def capability_report(self, connection: PanelConnection) -> dict[str, Any]:
         """Report local method coverage separately from unknown panel permissions."""
@@ -126,7 +154,7 @@ class RebeccaAdapter:
                     "error_type": type(exc).__name__}
 
     async def get_user(self, connection: PanelConnection, username: str) -> PanelUser:
-        result = await self._request(connection, "GET", f"/api/user/{quote(username, safe='')}")
+        result = await self._request(connection, "GET", f"/api/user/{quote(username, safe='')}", user_lookup=True)
         if isinstance(result, dict) and isinstance(result.get("data"), dict): result = result["data"]
         return self._map(result, connection.base_url)
 
@@ -167,8 +195,9 @@ class RebeccaAdapter:
         result = await self._request(connection, "GET", f"/api/users?limit={limit}&offset={offset}")
         if isinstance(result, dict) and isinstance(result.get("data"), dict): result = result["data"]
         users = result.get("users", []) if isinstance(result, dict) else []
-        if not isinstance(users, list): raise PanelError("Rebecca user list response was invalid")
-        return [self._map(user, connection.base_url) for user in users if isinstance(user, dict)]
+        if not isinstance(users, list) or any(not isinstance(user, dict) for user in users):
+            raise PanelError("Rebecca user list response was invalid")
+        return [self._map(user, connection.base_url) for user in users]
 
     async def get_usage(self, connection: PanelConnection, username: str) -> dict[str, Any]:
         result = await self._request(connection, "GET", f"/api/user/{quote(username, safe='')}/usage")

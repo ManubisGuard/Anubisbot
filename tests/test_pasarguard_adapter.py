@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import sys
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from manubisguard.panels.adapters.pasarguard import PasarGuardAdapter
-from manubisguard.panels.contracts import PanelConnection, PanelError, UserCreate, UserUpdate
+from manubisguard.panels.contracts import PanelConnection, PanelError, PanelUserNotFound, UserCreate, UserUpdate
 
 
 class FakeClient:
@@ -280,6 +281,163 @@ class PasarGuardAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["error_type"], "RuntimeError")
         self.assertNotIn("test-secret", repr(result))
         self.assertNotIn("private error", repr(result))
+
+
+    async def test_get_user_only_maps_definitive_404_to_not_found(self):
+        class LookupFailure(Exception):
+            def __init__(self, status_code):
+                super().__init__("private provider response")
+                self.status_code = status_code
+
+        for status in (401, 403, 500):
+            with self.subTest(status=status):
+                class BrokenClient(FakeClient):
+                    async def get_user_by_username(self, *, username, token):
+                        raise LookupFailure(status)
+
+                adapter = PasarGuardAdapter(
+                    secret_resolver=lambda _: "test-secret",
+                    sdk_factory=lambda **kwargs: BrokenClient(**kwargs),
+                )
+                with self.assertRaises(PanelError) as caught:
+                    await adapter.get_user(self.connection, "alice")
+                self.assertNotIsInstance(caught.exception, PanelUserNotFound)
+                self.assertNotIn("private provider response", str(caught.exception))
+
+        class MissingClient(FakeClient):
+            async def get_user_by_username(self, *, username, token):
+                raise LookupFailure(404)
+
+        adapter = PasarGuardAdapter(
+            secret_resolver=lambda _: "test-secret",
+            sdk_factory=lambda **kwargs: MissingClient(**kwargs),
+        )
+        with self.assertRaises(PanelUserNotFound):
+            await adapter.get_user(self.connection, "alice")
+
+    async def test_get_user_rejects_success_response_without_username(self):
+        class MalformedClient(FakeClient):
+            async def get_user_by_username(self, *, username, token):
+                return {"id": 17, "status": "active"}
+
+        adapter = PasarGuardAdapter(
+            secret_resolver=lambda _: "test-secret",
+            sdk_factory=lambda **kwargs: MalformedClient(**kwargs),
+        )
+        with self.assertRaisesRegex(PanelError, "omitted user identity"):
+            await adapter.get_user(self.connection, "alice")
+
+
+    async def test_update_and_delete_errors_do_not_chain_provider_details(self):
+        class LeakyClient(FakeClient):
+            async def modify_user_by_id(self, **kwargs):
+                raise RuntimeError("private response contains provider-secret")
+            async def remove_user_by_id(self, **kwargs):
+                raise RuntimeError("private response contains provider-secret")
+
+        adapter = PasarGuardAdapter(
+            secret_resolver=lambda _: "test-secret",
+            sdk_factory=lambda **kwargs: LeakyClient(**kwargs),
+        )
+        fake_sdk = SimpleNamespace(UserModify=lambda **kwargs: SimpleNamespace(**kwargs))
+        with patch.dict(sys.modules, {"pasarguard": fake_sdk}):
+            with self.assertRaisesRegex(PanelError, "update_user failed") as update_error:
+                await adapter.update_user(self.connection, "17", UserUpdate(status="disabled"))
+            with self.assertRaisesRegex(PanelError, "delete_user failed") as delete_error:
+                await adapter.delete_user(self.connection, "17")
+
+        for error in (update_error.exception, delete_error.exception):
+            self.assertNotIn("provider-secret", str(error))
+            self.assertIsNone(error.__cause__)
+            self.assertTrue(error.__suppress_context__)
+
+
+    async def test_capability_report_invalid_connection_fails_closed_before_secret_resolution(self):
+        resolved = []
+        adapter = PasarGuardAdapter(
+            secret_resolver=lambda ref: resolved.append(ref) or "test-secret",
+            sdk_factory=lambda **kwargs: self.fail("invalid connection must not construct SDK"),
+        )
+        report = await adapter.capability_report(replace(self.connection, base_url="http://panel.example"))
+
+        self.assertFalse(report["live_panel_verified"])
+        self.assertEqual(report["error_type"], "PanelError")
+        self.assertEqual(resolved, [])
+        self.assertTrue(report["operations"])
+        self.assertTrue(all(item["status"] == "unknown" for item in report["operations"].values()))
+        self.assertTrue(all(item["panel_permission"] == "unknown" for item in report["operations"].values()))
+
+
+    async def test_create_and_update_reject_malformed_success_payloads(self):
+        class MalformedClient(FakeClient):
+            async def create_user(self, *, user, token):
+                return {"id": 22, "username": user.username, "used_traffic": "provider-secret"}
+            async def modify_user_by_id(self, *, user_id, user, token):
+                return {"id": user_id, "username": "alice", "data_limit": -5}
+
+        adapter = PasarGuardAdapter(secret_resolver=lambda _: "test-secret",
+            sdk_factory=lambda **kwargs: MalformedClient(**kwargs))
+        fake_sdk = SimpleNamespace(
+            UserCreate=lambda **kwargs: SimpleNamespace(**kwargs),
+            UserModify=lambda **kwargs: SimpleNamespace(**kwargs),
+        )
+        with patch.dict(sys.modules, {"pasarguard": fake_sdk}):
+            with self.assertRaisesRegex(PanelError, "invalid usage counter") as create_error:
+                await adapter.create_user(self.connection, UserCreate(username="new-user"))
+            with self.assertRaisesRegex(PanelError, "negative data limit") as update_error:
+                await adapter.update_user(self.connection, "17", UserUpdate(data_limit_bytes=10))
+        for error in (create_error.exception, update_error.exception):
+            self.assertIsNone(error.__cause__)
+            self.assertTrue(error.__suppress_context__)
+            self.assertNotIn("provider-secret", str(error))
+
+    async def test_user_mapping_rejects_invalid_expiry_and_negative_counters(self):
+        for payload, expected in (
+            ({"username": "alice", "expire": "not-a-date"}, "invalid expiry"),
+            ({"username": "alice", "expire": 10**100}, "invalid expiry"),
+            ({"username": "alice", "used_traffic": -1}, "negative usage counter"),
+            ({"username": "alice", "data_limit": "provider-secret"}, "invalid data limit"),
+        ):
+            with self.subTest(expected=expected):
+                with self.assertRaisesRegex(PanelError, expected) as caught:
+                    self.adapter._map_user(payload, self.connection.base_url)
+                self.assertIsNone(caught.exception.__cause__)
+                self.assertTrue(caught.exception.__suppress_context__)
+                self.assertNotIn("provider-secret", str(caught.exception))
+
+    async def test_ambiguous_mutation_timeouts_are_sanitized_and_never_retried(self):
+        calls = {"create": 0, "update": 0, "delete": 0}
+
+        class TimeoutClient(FakeClient):
+            async def create_user(self, *, user, token):
+                calls["create"] += 1
+                raise TimeoutError("provider-secret timeout after write")
+            async def modify_user_by_id(self, **kwargs):
+                calls["update"] += 1
+                raise TimeoutError("provider-secret timeout after write")
+            async def remove_user_by_id(self, **kwargs):
+                calls["delete"] += 1
+                raise TimeoutError("provider-secret timeout after write")
+
+        adapter = PasarGuardAdapter(secret_resolver=lambda _: "test-secret",
+            sdk_factory=lambda **kwargs: TimeoutClient(**kwargs))
+        fake_sdk = SimpleNamespace(
+            UserCreate=lambda **kwargs: SimpleNamespace(**kwargs),
+            UserModify=lambda **kwargs: SimpleNamespace(**kwargs),
+        )
+        with patch.dict(sys.modules, {"pasarguard": fake_sdk}):
+            with self.assertRaisesRegex(PanelError, "create_user failed") as create_error:
+                await adapter.create_user(self.connection, UserCreate(username="new-user"))
+            with self.assertRaisesRegex(PanelError, "update_user failed") as update_error:
+                await adapter.update_user(self.connection, "17", UserUpdate(status="disabled"))
+            with self.assertRaisesRegex(PanelError, "delete_user failed") as delete_error:
+                await adapter.delete_user(self.connection, "17")
+
+        self.assertEqual(calls, {"create": 1, "update": 1, "delete": 1})
+        for error in (create_error.exception, update_error.exception, delete_error.exception):
+            self.assertNotIn("provider-secret", str(error))
+            self.assertIsNone(error.__cause__)
+            self.assertTrue(error.__suppress_context__)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,9 @@
 import json
 import unittest
+from dataclasses import replace
 from urllib.parse import urlsplit
 from manubisguard.panels.adapters.rebecca import RebeccaAdapter
-from manubisguard.panels.contracts import PanelConnection, PanelError, UserCreate, UserUpdate
+from manubisguard.panels.contracts import PanelConnection, PanelError, PanelUserNotFound, UserCreate, UserUpdate
 
 class Response:
     def __init__(self, status, data=None, text=''):
@@ -91,3 +92,108 @@ class RebeccaAdapterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(PanelError,'HTTP 403') as ctx:
             await adapter.get_user(self.connection,'alice')
         self.assertNotIn('secret internal detail',str(ctx.exception))
+
+    async def test_get_user_only_maps_lookup_404_to_not_found(self):
+        for status in (401, 403, 500):
+            with self.subTest(status=status):
+                adapter = RebeccaAdapter(
+                    secret_resolver=lambda _: "fake-key",
+                    client_factory=lambda **kw: FakeClient(
+                        lambda *args: Response(status, {"detail": "private detail"}), kw["base_url"]),
+                )
+                with self.assertRaises(PanelError) as caught:
+                    await adapter.get_user(self.connection, "alice")
+                self.assertNotIsInstance(caught.exception, PanelUserNotFound)
+                self.assertNotIn("private detail", str(caught.exception))
+
+        adapter = RebeccaAdapter(
+            secret_resolver=lambda _: "fake-key",
+            client_factory=lambda **kw: FakeClient(
+                lambda *args: Response(404, {"detail": "not found"}), kw["base_url"]),
+        )
+        with self.assertRaises(PanelUserNotFound):
+            await adapter.get_user(self.connection, "alice")
+
+    async def test_get_user_rejects_success_response_without_identity(self):
+        adapter = RebeccaAdapter(
+            secret_resolver=lambda _: "fake-key",
+            client_factory=lambda **kw: FakeClient(
+                lambda *args: Response(200, {}), kw["base_url"]),
+        )
+        with self.assertRaisesRegex(PanelError, "omitted user identity"):
+            await adapter.get_user(self.connection, "alice")
+
+    async def test_get_user_transport_failure_is_not_not_found(self):
+        def fail(*args):
+            raise RuntimeError("private transport detail")
+        adapter = RebeccaAdapter(
+            secret_resolver=lambda _: "fake-key",
+            client_factory=lambda **kw: FakeClient(fail, kw["base_url"]),
+        )
+        with self.assertRaisesRegex(PanelError, "transport failed") as caught:
+            await adapter.get_user(self.connection, "alice")
+        self.assertNotIsInstance(caught.exception, PanelUserNotFound)
+        self.assertNotIn("private transport detail", str(caught.exception))
+
+    async def test_capability_report_invalid_connection_fails_closed_without_secret_resolution(self):
+        resolved = []
+        adapter = RebeccaAdapter(
+            secret_resolver=lambda ref: resolved.append(ref) or "fake-key",
+            client_factory=lambda **kw: self.fail("capability report must not create a client"),
+        )
+        report = await adapter.capability_report(replace(self.connection, verify_tls=False))
+
+        self.assertFalse(report["live_panel_verified"])
+        self.assertEqual(report["connection_validation"], "failed")
+        self.assertEqual(report["error_type"], "PanelError")
+        self.assertEqual(resolved, [])
+        self.assertEqual(report["operations"]["create_user"]["status"], "unknown")
+        self.assertEqual(report["operations"]["create_user"]["panel_permission"], "unknown")
+
+    async def test_get_user_rejects_malformed_or_negative_numeric_fields_safely(self):
+        invalid_payloads = [
+            ({"username": "alice", "used_traffic": "provider-secret", "data_limit": 10},
+             "invalid usage counter"),
+            ({"username": "alice", "used_traffic": -1, "data_limit": 10},
+             "negative usage counter"),
+            ({"username": "alice", "used_traffic": 1, "data_limit": "provider-secret"},
+             "invalid data limit"),
+            ({"username": "alice", "used_traffic": 1, "data_limit": -10},
+             "negative data limit"),
+            ({"username": "alice", "expire": "not-a-date"},
+             "invalid expiry"),
+            ({"username": "alice", "expire": 10**100},
+             "invalid expiry"),
+        ]
+        for payload, expected in invalid_payloads:
+            with self.subTest(expected=expected, payload=payload):
+                adapter = RebeccaAdapter(
+                    secret_resolver=lambda _: "fake-key",
+                    client_factory=lambda **kw: FakeClient(
+                        lambda *args: Response(200, payload), kw["base_url"]),
+                )
+                with self.assertRaisesRegex(PanelError, expected) as caught:
+                    await adapter.get_user(self.connection, "alice")
+                self.assertNotIn("provider-secret", str(caught.exception))
+                self.assertIsNone(caught.exception.__cause__)
+                self.assertTrue(caught.exception.__suppress_context__)
+
+    async def test_delete_rejects_explicit_failure_in_success_status_response(self):
+        adapter = RebeccaAdapter(secret_resolver=lambda _: "fake-key",
+            client_factory=lambda **kw: FakeClient(
+                lambda *args: Response(200, {"success": False, "detail": "provider-secret"}),
+                kw["base_url"]))
+        with self.assertRaisesRegex(PanelError, "rejected the operation") as caught:
+            await adapter.delete_user(self.connection, "user-17")
+        self.assertNotIn("provider-secret", str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    async def test_list_users_rejects_malformed_items_instead_of_silently_dropping_them(self):
+        adapter = RebeccaAdapter(secret_resolver=lambda _: "fake-key",
+            client_factory=lambda **kw: FakeClient(
+                lambda *args: Response(200, {"users": [
+                    {"username": "alice", "status": "active"}, "malformed-user-record"
+                ]}), kw["base_url"]))
+        with self.assertRaisesRegex(PanelError, "user list response was invalid"):
+            await adapter.list_users(self.connection)

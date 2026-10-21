@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import urljoin
 
-from ..contracts import PanelCapabilities, PanelConnection, PanelError, PanelUser, UserCreate, UserUpdate
+from ..contracts import PanelCapabilities, PanelConnection, PanelError, PanelUser, PanelUserNotFound, UserCreate, UserUpdate
 
 SecretResolver = Callable[[str], str]
 
@@ -186,13 +186,20 @@ class PasarGuardAdapter:
     @classmethod
     def _map_user(cls, obj: Any, base_url: str) -> PanelUser:
         username = str(cls._value(obj, "username", default=""))
+        if not username.strip():
+            raise PanelError("PasarGuard response omitted user identity")
         uid = cls._value(obj, "id", "user_id", default=username)
         expire = cls._value(obj, "expire", "expire_at")
         if isinstance(expire, (int, float)):
-            expire = datetime.fromtimestamp(expire, tz=timezone.utc) if expire > 0 else None
+            try:
+                expire = datetime.fromtimestamp(expire, tz=timezone.utc) if expire > 0 else None
+            except (OverflowError, OSError, ValueError):
+                raise PanelError("PasarGuard response contained an invalid expiry") from None
         elif isinstance(expire, str):
-            try: expire = datetime.fromisoformat(expire.replace("Z", "+00:00"))
-            except ValueError: expire = None
+            try:
+                expire = datetime.fromisoformat(expire.replace("Z", "+00:00"))
+            except ValueError:
+                raise PanelError("PasarGuard response contained an invalid expiry") from None
         sub = cls._value(obj, "subscription_url", "subscription_link")
         if sub:
             sub = urljoin(base_url.rstrip("/") + "/", str(sub))
@@ -202,13 +209,39 @@ class PasarGuardAdapter:
         status = cls._normalize_status(raw_status)
         if isinstance(expire, datetime) and expire.tzinfo is None:
             expire = expire.replace(tzinfo=timezone.utc)
+        raw_groups = cls._value(obj, "group_ids", "groupIds", default=None)
+        group_ids = None
+        if isinstance(raw_groups, (list, tuple, set)):
+            normalized_groups = []
+            for item in raw_groups:
+                candidate = cls._value(item, "id", default=item)
+                try:
+                    normalized_groups.append(int(candidate))
+                except (TypeError, ValueError, OverflowError):
+                    normalized_groups = []
+                    break
+            if normalized_groups or not raw_groups:
+                group_ids = sorted(set(normalized_groups))
+        metadata = {"group_ids": group_ids} if group_ids is not None else {}
         return PanelUser(provider_user_id=str(uid), username=username,
             status=status,
-            used_bytes=int(used) if used is not None else None,
-            data_limit_bytes=int(limit) if limit is not None else None,
+            used_bytes=cls._validated_counter(used, "usage counter"),
+            data_limit_bytes=cls._validated_counter(limit, "data limit"),
             expire_at=expire if isinstance(expire, datetime) else None,
             subscription_url=str(sub) if sub else None,
-            raw_status=str(raw_status))
+            raw_status=str(raw_status), metadata=metadata)
+
+    @staticmethod
+    def _validated_counter(value: Any, label: str) -> int | None:
+        if value is None:
+            return None
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            raise PanelError(f"PasarGuard response contained an invalid {label}") from None
+        if number < 0:
+            raise PanelError(f"PasarGuard response contained a negative {label}") from None
+        return number
 
     @staticmethod
     def _normalize_status(value: Any) -> str:
@@ -244,7 +277,13 @@ class PasarGuardAdapter:
         try:
             result = await client.get_user_by_username(username=username, token=token)
             return self._map_user(result, connection.base_url)
+        except PanelError:
+            raise
         except Exception as exc:
+            status_code = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+            error_name = type(exc).__name__.replace("_", "").lower()
+            if status_code == 404 or "notfound" in error_name or "userdoesnotexist" in error_name:
+                raise PanelUserNotFound("PasarGuard user was not found") from None
             raise PanelError(f"PasarGuard get_user failed ({type(exc).__name__})") from None
 
     async def create_user(self, connection: PanelConnection, user: UserCreate) -> PanelUser:
@@ -259,6 +298,8 @@ class PasarGuardAdapter:
                 raise PanelError("Installed PasarGuard SDK has no supported user creation method")
             result = await create_method(user=payload, token=token)
             return self._map_user(result, connection.base_url)
+        except PanelError:
+            raise
         except Exception as exc:
             raise PanelError(f"PasarGuard create_user failed ({type(exc).__name__})") from None
 
@@ -281,14 +322,14 @@ class PasarGuardAdapter:
         except PanelError:
             raise
         except Exception as exc:
-            raise PanelError(f"PasarGuard update_user failed ({type(exc).__name__})") from exc
+            raise PanelError(f"PasarGuard update_user failed ({type(exc).__name__})") from None
 
     async def delete_user(self, connection: PanelConnection, provider_user_id: str) -> None:
         client, token = await self._authed_client(connection)
         try:
             await client.remove_user_by_id(user_id=provider_user_id, token=token)
         except Exception as exc:
-            raise PanelError(f"PasarGuard delete_user failed ({type(exc).__name__})") from exc
+            raise PanelError(f"PasarGuard delete_user failed ({type(exc).__name__})") from None
 
     async def list_users(self, connection: PanelConnection, *, limit: int = 100, offset: int = 0) -> list[PanelUser]:
         """List a bounded page of users; callers control pagination explicitly."""
