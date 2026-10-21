@@ -119,6 +119,25 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({"customer:services", "customer:orders:0", "customer:wallet",
                          "customer:support", "customer:home"}.issubset(profile_callbacks))
 
+    async def test_customer_profile_rejects_callbacks_from_another_user_or_group(self):
+        forged_queries = (
+            {"id": "profile-other-user", "from": {"id": 999},
+             "message": {"message_id": 10, "chat": {"id": 1000, "type": "private"}},
+             "data": "customer:profile"},
+            {"id": "profile-group", "from": {"id": 999},
+             "message": {"message_id": 11, "chat": {"id": -100999, "type": "supergroup"}},
+             "data": "customer:profile"},
+        )
+        for query in forged_queries:
+            with self.subTest(callback_id=query["id"]):
+                self.bot.api.send_text.reset_mock()
+                self.bot.api.answer_callback.reset_mock()
+                await self.bot._handle_callback(query)
+                self.bot.api.send_text.assert_not_awaited()
+                self.bot.api.answer_callback.assert_awaited_once_with(
+                    query["id"], "برای ادامه از گفت‌وگوی خصوصی استفاده کن"
+                )
+
     async def test_customer_support_menu_opens_new_ticket_and_lists_only_own_tickets(self):
         menu = self.bot._customer_menu(customer_id=1001)
         callbacks = [button.get("callback_data") for row in menu["inline_keyboard"] for button in row]
