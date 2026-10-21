@@ -39,6 +39,7 @@ EDITABLE_KEYS = frozenset({
     "menu_wallet_enabled",
     "menu_support_enabled",
     "menu_admin_enabled",
+    "home_keyboard_mode",
     "menu_create",
     "menu_bots",
     "menu_miniapp",

@@ -302,21 +302,25 @@ class CustomerBot:
     async def _send_brand_message(self, chat_id: int, keyboard: dict[str, Any]) -> None:
         logo = content_value(self.content, "logo_file_id")
         title = content_value(self.content, "title", "Anubis Bot")
+        mode = keyboard_mode(self.content)
         reply_keyboard = {
-            "keyboard": [[{"text": button["text"]} for button in row]
-                          for row in keyboard.get("inline_keyboard", []) if row],
+            "keyboard": [
+                [
+                    ({"text": button["text"], "web_app": button["web_app"]}
+                     if isinstance(button.get("web_app"), dict) else {"text": button["text"]})
+                    for button in row
+                ]
+                for row in keyboard.get("inline_keyboard", []) if row
+            ],
             "resize_keyboard": True,
             "is_persistent": True,
             "input_field_placeholder": "از منو انتخاب کن",
         }
         if not reply_keyboard["keyboard"]:
             reply_keyboard = {"remove_keyboard": True}
-        if keyboard_mode(self.content) == "inline":
-            reply_keyboard = {"remove_keyboard": True}
-            keyboard = self._customer_menu(customer_id=chat_id, include_admin=self._authorized(chat_id))
         welcome = content_value(self.content, "welcome_text", "این ربات مستقل فروش و خدمات مشتری است.")
         body = f"🛡 {title}\n\n{welcome}"
-        selected_markup = keyboard if keyboard_mode(self.content) == "inline" else reply_keyboard
+        selected_markup = keyboard if mode == "inline" else reply_keyboard
         if logo:
             try:
                 await self.api.call("sendPhoto", {

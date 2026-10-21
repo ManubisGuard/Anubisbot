@@ -1087,6 +1087,36 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         labels={b.get("text") for row in self.bot.api.send_text.await_args.args[2]["keyboard"] for b in row}
         self.assertNotIn("🛡 پنل مدیریت ربات",labels)
 
+    async def test_brand_reply_keyboard_preserves_secure_webapp_button(self):
+        with patch.dict(os.environ, {"MANUBIS_CUSTOMER_WEBAPP_URL": "https://mini.example/customer/"}):
+            keyboard = self.bot._customer_menu(customer_id=6883349141)
+        await self.bot._send_brand_message(6883349141, keyboard)
+        markup = self.bot.api.send_text.await_args.args[2]
+        webapp_buttons = [
+            button for row in markup["keyboard"] for button in row if "web_app" in button
+        ]
+        self.assertEqual(len(webapp_buttons), 1)
+        self.assertEqual(webapp_buttons[0]["web_app"]["url"], "https://mini.example/customer/")
+        self.assertNotIn("callback_data", webapp_buttons[0])
+
+    async def test_brand_message_inline_mode_uses_supplied_keyboard_without_rebuilding(self):
+        self.bot.content.set("home_keyboard_mode", "inline")
+        supplied = {"inline_keyboard": [[{"text": "🧪 تست", "callback_data": "customer:shop"}]]}
+        await self.bot._send_brand_message(6883349141, supplied)
+        self.assertEqual(self.bot.api.send_text.await_args.args[2], supplied)
+
+    async def test_admin_keyboard_mode_toggle_persists_supported_setting(self):
+        query = {"id": "keyboard-mode-1", "from": {"id": 6883349141},
+                 "message": {"chat": {"id": 6883349141, "type": "private"}},
+                 "data": "admin:keyboard-mode"}
+        await self.bot._handle_callback(query)
+        self.assertEqual(self.bot.content.get("home_keyboard_mode"), "inline")
+        self.bot.api.send_text.reset_mock()
+        query["id"] = "keyboard-mode-2"
+        await self.bot._handle_callback(query)
+        self.assertEqual(self.bot.content.get("home_keyboard_mode"), "reply")
+        self.assertIn("حالت منوی اصلی ذخیره شد", self.bot.api.send_text.await_args.args[1])
+
     async def test_start_photo_contains_welcome_caption_and_keyboard(self):
         self.bot.content.set("logo_file_id","test-file-id")
         self.bot.api.call=AsyncMock(return_value={})
