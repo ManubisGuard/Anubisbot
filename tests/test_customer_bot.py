@@ -91,6 +91,44 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("customer:shop", callbacks)
         self.assertIn("customer:home", callbacks)
 
+    async def test_customer_support_menu_opens_new_ticket_and_lists_only_own_tickets(self):
+        menu = self.bot._customer_menu(customer_id=1001)
+        callbacks = [button.get("callback_data") for row in menu["inline_keyboard"] for button in row]
+        self.assertIn("customer:support", callbacks)
+
+        await self.bot._handle_callback({
+            "id": "support-home", "from": {"id": 1001},
+            "message": {"message_id": 8, "chat": {"id": 1001, "type": "private"}},
+            "data": "customer:support",
+        })
+        keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        callbacks = [button.get("callback_data") for row in keyboard for button in row]
+        self.assertIn("customer:support:new", callbacks)
+        self.assertIn("customer:support:list:0", callbacks)
+
+        await self.bot._handle_callback({
+            "id": "support-new", "from": {"id": 1001},
+            "message": {"message_id": 8, "chat": {"id": 1001, "type": "private"}},
+            "data": "customer:support:new",
+        })
+        self.assertIn(1001, self.bot._pending_support)
+
+        self.bot.data.ensure_customer(1001, first_name="Customer one")
+        self.bot.data.ensure_customer(2002, first_name="Customer two")
+        self.bot.data.create_ticket(ticket_id="own-ticket-1", telegram_id=1001,
+                                    subject="مشکل اتصال من", first_message="اتصال قطع است")
+        self.bot.data.create_ticket(ticket_id="other-ticket-1", telegram_id=2002,
+                                    subject="تیکت کاربر دیگر", first_message="خصوصی")
+        await self.bot._handle_callback({
+            "id": "support-list", "from": {"id": 1001},
+            "message": {"message_id": 8, "chat": {"id": 1001, "type": "private"}},
+            "data": "customer:support:list:0",
+        })
+        rendered = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("own-ticket-1", rendered)
+        self.assertNotIn("other-ticket-1", rendered)
+        self.assertIn("مشکل اتصال من", rendered)
+
     async def test_admin_can_configure_backup_policy_but_cannot_enable_unimplemented_scheduler(self):
         admin = {"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"}}
         await self.bot._handle_message({**admin,"text":"/backup-policy schedule | daily | Europe/Berlin | 02:45 | 1440"})

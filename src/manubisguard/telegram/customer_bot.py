@@ -2232,6 +2232,56 @@ class CustomerBot:
             return
         key = data.partition(":")[2] if data.startswith("customer:") else ""
         discount_code = None
+        if key == "support":
+            await self.api.send_text(chat_id, "🎫 پشتیبانی\n\nاز این بخش می‌توانی تیکت جدید ثبت کنی یا تیکت‌های قبلی خودت را ببینی. برای ادامه گفتگو از فرمان /ticket-reply استفاده کن.", {"inline_keyboard": [
+                [{"text": "✍️ ثبت تیکت جدید", "callback_data": "customer:support:new"}],
+                [{"text": "📂 تیکت‌های من", "callback_data": "customer:support:list:0"}],
+                [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
+            ]})
+            return
+        if key == "support:new":
+            self._pending_support.add(uid)
+            await self.api.send_text(chat_id, "✍️ متن مشکل یا درخواستت را در یک پیام بفرست تا تیکت ثبت شود. برای لغو، /cancel را بفرست.", {"inline_keyboard": [
+                [{"text": "❌ لغو ثبت تیکت", "callback_data": "customer:support:cancel"}],
+                [{"text": "⬅️ بازگشت به پشتیبانی", "callback_data": "customer:support"}],
+            ]})
+            return
+        if key == "support:cancel":
+            self._pending_support.discard(uid)
+            await self.api.send_text(chat_id, "ثبت تیکت لغو شد.", {"inline_keyboard": [
+                [{"text": "⬅️ بازگشت به پشتیبانی", "callback_data": "customer:support"}],
+                [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
+            ]})
+            return
+        if key.startswith("support:list"):
+            tickets = self.data.list_tickets(uid)
+            page_size = 5
+            page_count = max(1, (len(tickets) + page_size - 1) // page_size)
+            try:
+                page = max(0, int(key.rpartition(":")[2])) if key.count(":") >= 2 else 0
+            except ValueError:
+                page = 0
+            page = min(page, page_count - 1)
+            status_labels = {"open": "باز", "pending": "در انتظار پاسخ", "closed": "بسته", "resolved": "حل‌شده"}
+            lines = [f"📂 تیکت‌های من — صفحه {page + 1} از {page_count}"]
+            selected = tickets[page * page_size:(page + 1) * page_size]
+            for ticket in selected:
+                status = str(ticket.get("status") or "unknown")
+                lines.append(f"\n• {ticket['subject']}\nشناسه: {ticket['ticket_id']}\nوضعیت: {status_labels.get(status, status)}\nبرای مشاهده پیام‌ها: /ticket {ticket['ticket_id']}\nبرای پاسخ: /ticket-reply {ticket['ticket_id']} | متن")
+            if not tickets:
+                lines.append("\nهنوز تیکت پشتیبانی ثبت نکرده‌ای.")
+            navigation = []
+            if page > 0:
+                navigation.append({"text": "⬅️ قبلی", "callback_data": f"customer:support:list:{page - 1}"})
+            if page + 1 < page_count:
+                navigation.append({"text": "بعدی ➡️", "callback_data": f"customer:support:list:{page + 1}"})
+            rows = ([navigation] if navigation else []) + [
+                [{"text": "✍️ ثبت تیکت جدید", "callback_data": "customer:support:new"}],
+                [{"text": "⬅️ بازگشت به پشتیبانی", "callback_data": "customer:support"}],
+                [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
+            ]
+            await self.api.send_text(chat_id, "\n".join(lines), {"inline_keyboard": rows})
+            return
         if key == "orders" or key.startswith("orders:"):
             try:
                 page = max(0, min(9, int(key.partition(":")[2] or "0")))
