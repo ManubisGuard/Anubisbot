@@ -446,6 +446,17 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
             ("menu_services_enabled", "customer:services:0"),
             ("menu_support_enabled", "customer:support:list:0"),
             ("menu_shop_enabled", "customer:shop"),
+            ("menu_shop_enabled", "customer:buy_confirm:product-1"),
+            ("menu_shop_enabled", "customer:manualbuy:product-1~variant-1"),
+            ("menu_shop_enabled", "customer:manualbuy_confirm:product-1"),
+            ("menu_shop_enabled", "customer:mv:product-1~variant-1:quote"),
+            ("menu_shop_enabled", "customer:buy_discount_confirm:product-1"),
+            ("menu_services_enabled", "customer:service_detail:service-1"),
+            ("menu_services_enabled", "customer:renew_confirm:service-1"),
+            ("menu_services_enabled", "customer:topup_execute:service-1"),
+            ("menu_resellers_enabled", "customer:reseller_buy_confirm:plan-1"),
+            ("menu_myresellers_enabled", "customer:rshop:account-1"),
+            ("menu_myresellers_enabled", "customer:r:account-1:product-1"),
         )
         for index, (setting, callback_data) in enumerate(cases):
             with self.subTest(setting=setting):

@@ -1979,20 +1979,42 @@ class CustomerBot:
             return
         # Visibility settings must be enforced by the dispatcher too, not only
         # while rendering the current menu. Old or forged buttons can outlive it.
-        visibility_routes = {
-            "customer:miniapp": "menu_miniapp_enabled",
-            "customer:shop": "menu_shop_enabled",
-            "customer:services": "menu_services_enabled",
-            "customer:profile": "menu_profile_enabled",
-            "customer:orders": "menu_orders_enabled",
-            "customer:resellers": "menu_resellers_enabled",
-            "customer:myresellers": "menu_myresellers_enabled",
-            "customer:wallet": "menu_wallet_enabled",
-            "customer:support": "menu_support_enabled",
-        }
-        disabled_route = next((route for route in visibility_routes
-                               if data == route or data.startswith(route + ":")), None)
-        if disabled_route and not _enabled(self.content, visibility_routes[disabled_route]):
+        visibility_routes = (
+            ("customer:miniapp", "menu_miniapp_enabled"),
+            ("customer:shop", "menu_shop_enabled"),
+            ("customer:manualbuy", "menu_shop_enabled"),
+            ("customer:manualbuy_confirm", "menu_shop_enabled"),
+            ("customer:mv", "menu_shop_enabled"),
+            ("customer:category", "menu_shop_enabled"),
+            ("customer:buy", "menu_shop_enabled"),
+            ("customer:buy_confirm", "menu_shop_enabled"),
+            ("customer:buy_discount", "menu_shop_enabled"),
+            ("customer:buy_discount_confirm", "menu_shop_enabled"),
+            ("customer:discount_cancel", "menu_shop_enabled"),
+            ("customer:services", "menu_services_enabled"),
+            ("customer:service_detail", "menu_services_enabled"),
+            ("customer:service_refresh", "menu_services_enabled"),
+            ("customer:service_qr", "menu_services_enabled"),
+            ("customer:renew_confirm", "menu_services_enabled"),
+            ("customer:renew_execute", "menu_services_enabled"),
+            ("customer:topup_confirm", "menu_services_enabled"),
+            ("customer:topup_execute", "menu_services_enabled"),
+            ("customer:resume", "menu_services_enabled"),
+            ("customer:profile", "menu_profile_enabled"),
+            ("customer:orders", "menu_orders_enabled"),
+            ("customer:resellers", "menu_resellers_enabled"),
+            ("customer:reseller_buy", "menu_resellers_enabled"),
+            ("customer:reseller_buy_confirm", "menu_resellers_enabled"),
+            ("customer:myresellers", "menu_myresellers_enabled"),
+            ("customer:rshop", "menu_myresellers_enabled"),
+            ("customer:r", "menu_myresellers_enabled"),
+            ("customer:c", "menu_myresellers_enabled"),
+            ("customer:wallet", "menu_wallet_enabled"),
+            ("customer:support", "menu_support_enabled"),
+        )
+        disabled_setting = next((setting for route, setting in visibility_routes
+                                 if data == route or data.startswith(route + ":")), None)
+        if disabled_setting and not _enabled(self.content, disabled_setting):
             await self.api.send_text(chat_id, "این بخش در حال حاضر غیرفعال است.", BACK_MENU)
             return
         if data == "customer:miniapp":
