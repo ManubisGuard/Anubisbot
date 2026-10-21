@@ -1,5 +1,6 @@
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -572,6 +573,50 @@ class CustomerDataStoreTests(unittest.TestCase):
         attempt = self.store.get_payment_attempt("pay-race-verified")
         self.assertEqual(attempt["status"], "verified")
         self.assertEqual(self.store.wallet_balance(1001), 1800)
+
+    def test_concurrent_payment_failure_and_settlement_have_one_terminal_winner(self):
+        self.store.create_payment_attempt(
+            payment_id="pay-race-terminal", telegram_id=1001, provider="manual",
+            amount_minor=1800, currency="IRR", idempotency_key="intent-race-terminal",
+        )
+        gate = threading.Barrier(2)
+
+        def settle():
+            gate.wait(timeout=2)
+            try:
+                self.store.settle_verified_wallet_deposit(
+                    payment_id="pay-race-terminal", verified_amount_minor=1800,
+                    verified_currency="IRR", external_reference="race-terminal-reference",
+                    verified_by=9001,
+                )
+                return "verified"
+            except CustomerStoreError:
+                return "settlement_rejected"
+
+        def fail():
+            gate.wait(timeout=2)
+            try:
+                self.store.fail_payment_attempt(payment_id="pay-race-terminal", failure_code="receipt_rejected")
+                return "failed"
+            except CustomerStoreError:
+                return "failure_rejected"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(lambda fn: fn(), (settle, fail)))
+
+        attempt = self.store.get_payment_attempt("pay-race-terminal")
+        events = self.store.list_payment_attempt_events("pay-race-terminal")
+        self.assertIn(attempt["status"], {"verified", "failed"})
+        self.assertEqual(sum(x in {"verified", "failed"} for x in outcomes), 1, outcomes)
+        self.assertEqual([event["event_type"] for event in events], ["created", attempt["status"]])
+        if attempt["status"] == "verified":
+            self.assertEqual(self.store.wallet_balance(1001), 1800)
+            self.assertIn("failure_rejected", outcomes)
+            self.assertEqual(events[-1]["external_reference"], "race-terminal-reference")
+        else:
+            self.assertEqual(self.store.wallet_balance(1001), 0)
+            self.assertIn("settlement_rejected", outcomes)
+            self.assertEqual(events[-1]["failure_code"], "receipt_rejected")
 
     def test_fail_payment_attempt_is_idempotent_for_already_failed_attempt(self):
         self.store.create_payment_attempt(
