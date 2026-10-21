@@ -1489,15 +1489,19 @@ class CustomerBot:
         except Exception as exc:
             await self.api.send_text(chat_id, f"دریافت نقش‌ها ناموفق بود: {type(exc).__name__}", self._customer_menu())
 
-    async def _send_customer_services(self, chat_id: int, telegram_id: int) -> None:
+    async def _send_customer_services(self, chat_id: int, telegram_id: int, page: int = 0) -> None:
         services = self.data.list_services(telegram_id)
         if not services:
             await self.api.send_text(chat_id, "🔐 هنوز سرویسی در این حساب ثبت نشده است.", BACK_MENU)
             return
+        page_size = 1  # Each service can expose up to four actions; keep total buttons <= 8.
+        page_count = max(1, (len(services) + page_size - 1) // page_size)
+        page = max(0, min(page, page_count - 1))
+        selected = services[page * page_size:(page + 1) * page_size]
         status_fa = {"pending":"در انتظار", "active":"فعال", "limited":"محدود", "expired":"منقضی", "suspended":"تعلیق‌شده", "failed":"ناموفق", "deleted":"حذف‌شده"}
-        lines = ["🔐 سرویس‌های ثبت‌شده:"]
+        lines = [f"🔐 سرویس‌های ثبت‌شده — صفحه {page + 1} از {page_count}"]
         buttons = []
-        for service in services[:25]:
+        for service in selected:
             lines.append(f"• {service['service_id']} — {service['username']} — {status_fa.get(service['status'], service['status'])}")
             if service.get("expires_at"): lines.append(f"  انقضا: {service['expires_at']}")
             if service.get("traffic_limit_bytes"):
@@ -1513,7 +1517,14 @@ class CustomerBot:
                     buttons.append([{"text": f"📶 افزایش حجم {service['service_id'][:12]}", "callback_data": f"customer:topup_confirm:{service['service_id']}"}])
             if service.get("billing_status") == "suspended_balance":
                 buttons.append([{"text": f"فعال‌سازی {service['service_id'][:12]}", "callback_data": f"customer:resume:{service['service_id']}"}])
-        buttons.append([{"text":"⬅️ منو","callback_data":"customer:home"}])
+        navigation = []
+        if page > 0:
+            navigation.append({"text": "⬅️ قبلی", "callback_data": f"customer:services:{page - 1}"})
+        if page + 1 < page_count:
+            navigation.append({"text": "بعدی ➡️", "callback_data": f"customer:services:{page + 1}"})
+        if navigation:
+            buttons.append(navigation)
+        buttons.append([{"text":"🏠 منوی اصلی","callback_data":"customer:home"}])
         await self.api.send_text(chat_id, "\n".join(lines), {"inline_keyboard":buttons})
 
     def _validate_product_target(self, panel_id: str, groups: list[str]) -> tuple[dict[str, Any], list[str]]:
@@ -2608,8 +2619,12 @@ class CustomerBot:
                 target = config.chat_id if config.chat_id.startswith("@") else "کانال فعال است"
                 await self.api.send_text(chat_id, f"📣 کانال اعتماد فعال است: {target}\nاطلاعیه‌ها بدون لینک اشتراک خصوصی، رمز یا توکن ارسال می‌شوند.", BACK_MENU)
             return
-        if key == "services":
-            await self._send_customer_services(chat_id, uid)
+        if key == "services" or key.startswith("services:"):
+            try:
+                page = max(0, min(9999, int(key.partition(":")[2] or "0")))
+            except ValueError:
+                page = 0
+            await self._send_customer_services(chat_id, uid, page=page)
             return
         if key.startswith("resume:"):
             service_id = key.partition(":")[2]

@@ -484,6 +484,38 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://secret.invalid/sub/abc", detail)
         self.assertIn("ممکن است تا بررسی بعدی پنل", detail)
 
+    async def test_customer_services_are_paginated_with_compact_keyboard(self):
+        self.bot.data.ensure_customer(999, first_name="Service owner")
+        for index in range(5):
+            service_id = f"svc-page-{index}"
+            self.bot.data.upsert_service(service_id=service_id, telegram_id=999, product_id="prod-a",
+                panel_id="pg-a", provider_user_id=f"provider-{index}", status="active",
+                traffic_limit_bytes=10 * 1024**3, traffic_used_bytes=index * 1024**3)
+            with self.bot.data._connect() as db:
+                db.execute("UPDATE customer_services SET username=?,pricing_mode=? WHERE tenant_id=? AND service_id=?",
+                    (f"user-{index}", "fixed", self.bot.data.tenant_id, service_id))
+
+        await self.bot._handle_callback({"id": "services-page-0", "from": {"id": 999},
+            "message": {"chat": {"id": 999, "type": "private"}}, "data": "customer:services"})
+        body = self.bot.api.send_text.await_args.args[1]
+        keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        callbacks = [button.get("callback_data") for row in keyboard for button in row]
+        self.assertIn("صفحه 1 از 5", body)
+        self.assertIn("customer:services:1", callbacks)
+        self.assertLessEqual(sum(len(row) for row in keyboard), 8)
+        self.assertEqual(sum(1 for callback in callbacks if callback and callback.startswith("customer:service_detail:")), 1)
+
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id": "services-page-1", "from": {"id": 999},
+            "message": {"chat": {"id": 999, "type": "private"}}, "data": "customer:services:1"})
+        body = self.bot.api.send_text.await_args.args[1]
+        keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        callbacks = [button.get("callback_data") for row in keyboard for button in row]
+        self.assertIn("صفحه 2 از 5", body)
+        self.assertIn("customer:services:0", callbacks)
+        self.assertIn("customer:services:2", callbacks)
+        self.assertLessEqual(sum(len(row) for row in keyboard), 8)
+
     async def test_customer_service_refresh_reads_provider_and_updates_snapshot(self):
         from datetime import datetime, timezone
         from types import SimpleNamespace
