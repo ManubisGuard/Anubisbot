@@ -1677,7 +1677,7 @@ class CustomerDataStore:
             ).fetchall()
             manual_rows = db.execute(
                 """SELECT order_id,product_id,amount_minor,currency,status,created_at,
-                          product_title_snapshot
+                          product_title_snapshot,delivery_mode_snapshot
                    FROM manual_product_orders
                    WHERE tenant_id=? AND telegram_id=?
                    ORDER BY created_at DESC,order_id DESC LIMIT ?""",
@@ -1696,9 +1696,12 @@ class CustomerDataStore:
             item["discount_amount_minor"] = int(item.get("discount_amount_minor") or 0)
             item["discount_code"] = str(item.get("discount_code") or "")
             item["order_kind"] = "panel"
+            item["can_redeliver_file"] = False
             result.append(item)
         for row in manual_rows:
             item = dict(row)
+            delivery_mode = str(item.pop("delivery_mode_snapshot", "") or "")
+            item["can_redeliver_file"] = item.get("status") == "fulfilled" and delivery_mode == "file"
             item["title"] = str(item.pop("product_title_snapshot", "") or item["product_id"])
             item["amount_minor"] = int(item["amount_minor"])
             item["discount_amount_minor"] = 0

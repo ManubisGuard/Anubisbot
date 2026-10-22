@@ -1857,6 +1857,21 @@ class CustomerDataStoreTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=19 AND name='manual_product_telegram_file_delivery'").fetchone()[0], 1)
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
+    def test_customer_order_history_flags_only_owned_fulfilled_file_orders_for_redelivery(self):
+        self.store.ensure_customer(1001, first_name="Buyer")
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="history-file-fund", amount_minor=1000, entry_type="deposit")
+        self.store.put_manual_product(product_id="history-file", title="History file", price_minor=400,
+            currency="IRR", delivery_mode="manual")
+        self.store.set_manual_product_file(product_id="history-file", file_id="history-telegram-file")
+        order = self.store.buy_manual_product(telegram_id=1001, product_id="history-file",
+            idempotency_key="history-file-order")
+        history = self.store.list_customer_orders(1001)
+        self.assertEqual(history[0]["order_id"], order["order_id"])
+        self.assertTrue(history[0]["can_redeliver_file"])
+        self.assertNotIn("delivery_payload", history[0])
+        self.assertNotIn("delivery_mode_snapshot", history[0])
+        self.assertFalse(CustomerDataStore(self.path, tenant_id="bot-beta").list_customer_orders(1001))
+
     def test_manual_variant_file_delivery_uses_variant_snapshot_and_owner_scope(self):
         self.store.post_wallet_entry(telegram_id=1001, idempotency_key="variant-file-fund", amount_minor=1000, entry_type="deposit")
         self.store.put_manual_product(product_id="variant-file", title="Course", price_minor=900,

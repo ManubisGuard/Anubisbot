@@ -2617,6 +2617,7 @@ class CustomerBot:
             }
             lines = [f"🧾 سفارش‌های من — صفحه {page + 1} از {page_count}"]
             selected = orders[page * page_size:(page + 1) * page_size]
+            file_buttons = []
             for order in selected:
                 status = str(order.get("status") or "unknown")
                 lines.append(
@@ -2627,6 +2628,9 @@ class CustomerBot:
                        if order.get("discount_code") else "")
                     + (f"\nآخرین تغییر: {order['updated_at']}" if order.get("updated_at") else "")
                 )
+                if order.get("can_redeliver_file"):
+                    file_buttons.append([{"text": f"📥 دریافت فایل {str(order['order_id'])[:8]}",
+                        "callback_data": f"customer:file_retry:{order['order_id']}"}])
             if not orders:
                 lines.append("\nهنوز سفارشی برای این حساب ثبت نشده است.")
             rows = []
@@ -2637,6 +2641,7 @@ class CustomerBot:
                 navigation.append({"text": "بعدی ➡️", "callback_data": f"customer:orders:{page + 1}"})
             if navigation:
                 rows.append(navigation)
+            rows.extend(file_buttons)
             rows.extend([
                 [{"text": "🛒 بازگشت به فروشگاه", "callback_data": "customer:shop"}],
                 [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],

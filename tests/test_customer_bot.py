@@ -1699,6 +1699,30 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.bot.api.call.assert_not_awaited()
         self.assertIn("متعلق به حساب شما نیست", self.bot.api.send_text.await_args.args[1])
 
+    async def test_order_history_offers_file_redelivery_without_exposing_file_id_or_recharging(self):
+        self.bot.api.call = AsyncMock(return_value={"ok": True})
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="history-file-fund", amount_minor=1200, entry_type="deposit")
+        self.bot.data.put_manual_product(product_id="history-file", title="History download", price_minor=400,
+            currency="IRR", delivery_mode="manual")
+        self.bot.data.set_manual_product_file(product_id="history-file", file_id="history-telegram-file-id")
+        order = self.bot.data.buy_manual_product(telegram_id=999, product_id="history-file",
+            idempotency_key="history-file-order")
+        await self.bot._handle_callback({"id":"history-file-orders","from":{"id":999},
+            "message":{"message_id":750,"chat":{"id":999,"type":"private"}}, "data":"customer:orders:0"})
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        self.assertIn("History download", body)
+        self.assertNotIn("history-telegram-file-id", body)
+        retry_button = next(button for row in keyboard["inline_keyboard"] for button in row
+                            if button["callback_data"] == f"customer:file_retry:{order['order_id']}")
+        self.assertIn("دریافت فایل", retry_button["text"])
+        await self.bot._handle_callback({"id":"history-file-retry","from":{"id":999},
+            "message":{"message_id":751,"chat":{"id":999,"type":"private"}},
+            "data":retry_button["callback_data"]})
+        self.bot.api.call.assert_awaited_once()
+        self.assertEqual(self.bot.api.call.await_args.args[1]["document"], "history-telegram-file-id")
+        self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 800)
+
     async def test_base_file_quote_rejects_changed_price_or_file_before_debit(self):
         self.bot.api.call = AsyncMock(return_value={"ok": True})
         self.bot.data.ensure_customer(999, first_name="Buyer")
