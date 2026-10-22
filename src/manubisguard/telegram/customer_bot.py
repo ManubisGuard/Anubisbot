@@ -1830,7 +1830,13 @@ class CustomerBot:
         if reason:
             await self.api.send_text(chat_id, f"{reason}\nکد دیگری بفرست یا /cancel را برای لغو بزن.")
             return
-        self._pending_purchase_discount[telegram_id] = {"product_id": product_id, "discount_code": code}
+        try:
+            quote_hash = self.data.product_purchase_quote_hash(product_id, discount_code=code)
+        except CustomerStoreError:
+            await self.api.send_text(chat_id, "قیمت یا تنظیمات محصول تغییر کرده است؛ دوباره از فروشگاه شروع کن.", BACK_MENU)
+            return
+        self._pending_purchase_discount[telegram_id] = {"product_id": product_id, "discount_code": code,
+            "quote_hash": quote_hash}
         original = int(product["price_minor"])
         final = original - (original * int(discount["percentage"]) // 100)
         await self.api.send_text(chat_id,
@@ -1838,7 +1844,7 @@ class CustomerBot:
             f"تخفیف: {int(discount['percentage'])}٪\nمبلغ نهایی: {final:,} {product['currency']}\n"
             "قیمت و سهمیه هنگام تأیید دوباره در پایگاه داده بررسی می‌شود.",
             {"inline_keyboard":[
-                [{"text":"تأیید خرید با تخفیف","callback_data":f"customer:buy_discount_confirm:{product_id}"}],
+                [{"text":"تأیید خرید با تخفیف","callback_data":f"customer:buy_discount_confirm:{product_id}:{quote_hash}"}],
                 [{"text":"لغو","callback_data":"customer:discount_cancel"}]
             ]})
 
@@ -2942,7 +2948,12 @@ class CustomerBot:
             price_line = f"هزینه اولیه: {price:,} {product['currency']}"
             if mode == "hourly": price_line += f"\nنرخ مصرف زمان: {rate:,} {product['currency']} در ساعت"
             elif mode == "usage": price_line += f"\nنرخ ترافیک: {rate:,} {product['currency']} به‌ازای هر GiB"
-            await self.api.send_text(chat_id, f"تأیید خرید «{product['title']}»\nمدل: {mode}\n{price_line}\nموجودی فعلی: {self.data.wallet_balance(uid, product['currency']):,} {product['currency']}\n\nبا تأیید، مبلغ اولیه از کیف پول رزرو می‌شود و درخواست ساخت سرویس به پنل ارسال خواهد شد.", {"inline_keyboard":[[{"text":"تأیید خرید","callback_data":f"customer:buy_confirm:{product_id}","style":"success"}],[{"text":"🎟 ورود کد تخفیف","callback_data":f"customer:buy_discount:{product_id}"}],[{"text":"انصراف","callback_data":"customer:shop"}]]})
+            try:
+                quote_hash = self.data.product_purchase_quote_hash(product_id)
+            except CustomerStoreError:
+                await self.api.send_text(chat_id, "این محصول دیگر برای خرید در دسترس نیست.", BACK_MENU)
+                return
+            await self.api.send_text(chat_id, f"تأیید خرید «{product['title']}»\nمدل: {mode}\n{price_line}\nموجودی فعلی: {self.data.wallet_balance(uid, product['currency']):,} {product['currency']}\n\nبا تأیید، مبلغ اولیه از کیف پول رزرو می‌شود و درخواست ساخت سرویس به پنل ارسال خواهد شد. اگر قیمت یا تنظیمات تغییر کند، باید این صفحه را دوباره باز کنی.", {"inline_keyboard":[[{"text":"تأیید خرید","callback_data":f"customer:buy_confirm:{product_id}:{quote_hash}","style":"success"}],[{"text":"🎟 ورود کد تخفیف","callback_data":f"customer:buy_discount:{product_id}"}],[{"text":"انصراف","callback_data":"customer:shop"}]]})
             return
         if key == "discount_cancel":
             self._pending_purchase_discount.pop(uid, None)
@@ -2958,16 +2969,22 @@ class CustomerBot:
             await self.api.send_text(chat_id, f"کد تخفیف محصول «{product['title']}» را در پیام بعدی بفرست. برای لغو /cancel را بزن.")
             return
         if key.startswith("buy_discount_confirm:"):
-            product_id = key.partition(":")[2]
+            confirmation = key.removeprefix("buy_discount_confirm:")
+            product_id, separator, accepted_hash = confirmation.partition(":")
             pending = self._pending_purchase_discount.get(uid) or {}
-            if pending.get("product_id") != product_id or not pending.get("discount_code"):
+            if (not separator or not accepted_hash or pending.get("product_id") != product_id
+                    or not pending.get("discount_code") or pending.get("quote_hash") != accepted_hash):
                 await self.api.send_text(chat_id, "پیش‌نمایش کد تخفیف منقضی یا نامعتبر است؛ دوباره از فروشگاه شروع کن.", BACK_MENU)
                 return
             discount_code = str(pending["discount_code"])
             self._pending_purchase_discount.pop(uid, None)
-            key = f"buy_confirm:{product_id}"
+            key = f"buy_confirm:{product_id}:{accepted_hash}"
         if key.startswith("buy_confirm:"):
-            product_id = key.partition(":")[2]
+            confirmation = key.removeprefix("buy_confirm:")
+            product_id, separator, expected_quote_hash = confirmation.partition(":")
+            if not separator or not expected_quote_hash:
+                await self.api.send_text(chat_id, "تأیید خرید منقضی شده است؛ محصول را دوباره از فروشگاه انتخاب کن.", BACK_MENU)
+                return
             if not discount_code:
                 pending = self._pending_purchase_discount.get(uid) or {}
                 if pending.get("product_id") == product_id:
@@ -2979,6 +2996,7 @@ class CustomerBot:
             try:
                 outcome = await self.purchase_service.buy_from_wallet(telegram_id=uid, product_id=product_id,
                     idempotency_key=idempotency_key, discount_code=discount_code,
+                    expected_quote_hash=expected_quote_hash,
                     now=int(datetime.now(timezone.utc).timestamp()))
                 body = f"خرید و ساخت سرویس تأیید شد.\nشناسه سفارش: {outcome.order_id}\nنام کاربری: {outcome.username}\nمبلغ اولیه: {outcome.amount_minor:,} {outcome.currency}"
                 if outcome.subscription_url: body += f"\n\nلینک اشتراک خصوصی:\n{outcome.subscription_url}"

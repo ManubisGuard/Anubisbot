@@ -1706,6 +1706,33 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertIsNone(self.bot.data.get_discount_code("HACK20"))
 
+    async def test_panel_product_confirmation_binds_quote_and_passes_token_to_purchase_service(self):
+        self.bot.data.register_panel_connection(panel_id="quote-panel",label="Fake",provider="pasarguard",
+            base_url="https://panel.example",auth_mode="api_key",secret_ref="env:PANEL_KEY",enabled=True)
+        self.bot.data.put_product(product_id="quote-product",title="Quoted product",price_minor=2500,
+            panel_id="quote-panel",traffic_bytes=1024**3,duration_hours=24,group_ids=["1"])
+        await self.bot._handle_callback({"id":"quote-product-select","from":{"id":999},
+            "message":{"chat":{"id":999,"type":"private"},"message_id":11},
+            "data":"customer:buy:quote-product"})
+        callback = self.bot.api.send_text.await_args.args[2]["inline_keyboard"][0][0]["callback_data"]
+        self.assertTrue(callback.startswith("customer:buy_confirm:quote-product:"))
+        quote_hash = callback.rsplit(":",1)[1]
+        self.bot.purchase_service.buy_from_wallet=AsyncMock(return_value=PurchaseOutcome(
+            order_id="quote-order",service_id="quote-order",status="active",amount_minor=2500,
+            currency="IRR",username="u999_quoteorder"))
+        self.bot._emit_trust_event=AsyncMock()
+        await self.bot._handle_callback({"id":"quote-product-confirm","from":{"id":999},
+            "message":{"chat":{"id":999,"type":"private"},"message_id":12},"data":callback})
+        self.assertEqual(self.bot.purchase_service.buy_from_wallet.await_args.kwargs["expected_quote_hash"], quote_hash)
+
+    async def test_legacy_panel_purchase_callback_without_quote_fails_closed(self):
+        self.bot.purchase_service.buy_from_wallet = AsyncMock()
+        await self.bot._handle_callback({"id":"old-panel-confirm","from":{"id":999},
+            "message":{"chat":{"id":999,"type":"private"},"message_id":13},
+            "data":"customer:buy_confirm:basic"})
+        self.bot.purchase_service.buy_from_wallet.assert_not_awaited()
+        self.assertIn("تأیید خرید منقضی شده", self.bot.api.send_text.await_args.args[1])
+
     async def test_customer_can_preview_discount_and_confirm_purchase_with_code(self):
         self.bot.data.register_panel_connection(panel_id="p1",label="Fake",provider="pasarguard",
             base_url="https://panel.example",auth_mode="api_key",secret_ref="env:PANEL_KEY",enabled=True)
@@ -1724,8 +1751,10 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         quote=self.bot.api.send_text.await_args.args[1]
         self.assertIn("2,000",quote)
         keyboard=self.bot.api.send_text.await_args.args[2]
-        self.assertEqual(keyboard["inline_keyboard"][0][0]["callback_data"],
-            "customer:buy_discount_confirm:basic")
+        discount_confirm_callback = keyboard["inline_keyboard"][0][0]["callback_data"]
+        self.assertTrue(discount_confirm_callback.startswith("customer:buy_discount_confirm:basic:"))
+        quote_hash = discount_confirm_callback.rsplit(":", 1)[1]
+        self.assertEqual(len(quote_hash), 20)
         self.bot.purchase_service.buy_from_wallet=AsyncMock(return_value=PurchaseOutcome(
             order_id="order123",service_id="order123",status="active",amount_minor=2000,
             currency="IRR",username="u999_order123"))
@@ -1733,10 +1762,11 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback({
             "id":"cb-discount-confirm","from":{"id":999},
             "message":{"chat":{"id":999,"type":"private"},"message_id":22},
-            "data":"customer:buy_discount_confirm:basic",
+            "data":discount_confirm_callback,
         })
         self.bot.purchase_service.buy_from_wallet.assert_awaited_once()
         self.assertEqual(self.bot.purchase_service.buy_from_wallet.await_args.kwargs["discount_code"],"SAVE20")
+        self.assertEqual(self.bot.purchase_service.buy_from_wallet.await_args.kwargs["expected_quote_hash"], quote_hash)
         self.assertIn(":discount:SAVE20",self.bot.purchase_service.buy_from_wallet.await_args.kwargs["idempotency_key"])
         self.assertNotIn(999,self.bot._pending_purchase_discount)
 

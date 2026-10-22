@@ -343,6 +343,7 @@ class CustomerPurchaseService:
     async def buy_from_wallet(self, *, telegram_id: int, product_id: str,
                               idempotency_key: str, reseller_account_id: str | None = None,
                               discount_code: str | None = None,
+                              expected_quote_hash: str | None = None,
                               now: int | None = None) -> PurchaseOutcome:
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else int(now)
         previous = self.store.get_order_by_idempotency(idempotency_key, telegram_id)
@@ -365,6 +366,10 @@ class CustomerPurchaseService:
         product = self.store.get_product(product_id, enabled_only=True)
         if not product:
             raise CustomerStoreError("Product is unavailable")
+        if expected_quote_hash is not None:
+            current_quote_hash = self.store.product_purchase_quote_hash(product_id, discount_code=discount_code)
+            if current_quote_hash != expected_quote_hash:
+                raise CustomerStoreError("Product price, terms, panel mapping or discount changed; reopen the purchase confirmation")
         panel_id = str(product.get("panel_id") or "")
         if not panel_id:
             raise CustomerStoreError("Product has no configured panel")
@@ -405,7 +410,7 @@ class CustomerPurchaseService:
         order_id = uuid.uuid4().hex
         order = self.store.reserve_product_order(order_id=order_id, telegram_id=telegram_id,
             product_id=product_id, idempotency_key=idempotency_key, reseller_account_id=reseller_account_id,
-            discount_code=discount_code, now=now)
+            discount_code=discount_code, expected_quote_hash=expected_quote_hash, now=now)
         actual_order_id = str(order["order_id"])
         if order.get("idempotent_replay"):
             if order["status"] == "active":

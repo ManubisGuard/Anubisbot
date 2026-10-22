@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from manubisguard.customer_store import CustomerDataStore
+from manubisguard.customer_store import CustomerDataStore, CustomerStoreError
 from manubisguard.panels.contracts import PanelCapabilities, PanelUser, PanelUserNotFound, UserCreate, UserUpdate
 from manubisguard.panels.registry import AdapterRegistry
 from manubisguard.sales.service import CustomerPurchaseService, PurchaseNeedsReconciliation
@@ -40,6 +40,40 @@ class CustomerPurchaseServiceTests(unittest.IsolatedAsyncioTestCase):
         self.sanaei_adapter=FakeAdapter(); self.sanaei_adapter.kind='sanaei'; self.registry.register(self.sanaei_adapter)
         self.service=CustomerPurchaseService(self.store,secret_resolver=lambda _: 'secret',registry=self.registry)
     def tearDown(self): self.tmp.cleanup()
+
+    async def test_stale_product_quote_is_rejected_before_provider_preflight_or_wallet_debit(self):
+        quote_hash = self.store.product_purchase_quote_hash("basic")
+        self.store.put_product(product_id="basic", title="Basic updated", price_minor=3500,
+            panel_id="p1", traffic_bytes=1024**3, duration_hours=24, group_ids=["1"])
+        with self.assertRaisesRegex(CustomerStoreError, "changed"):
+            await self.service.buy_from_wallet(telegram_id=123, product_id="basic",
+                idempotency_key="stale-product-quote", expected_quote_hash=quote_hash, now=1000)
+        self.assertEqual(self.adapter.calls, 0)
+        self.assertEqual(self.store.wallet_balance(123), 5000)
+        self.assertIsNone(self.store.get_order_by_idempotency("stale-product-quote", 123))
+
+    async def test_atomic_reservation_rejects_quote_changed_after_service_preflight(self):
+        quote_hash = self.store.product_purchase_quote_hash("basic")
+        self.store.put_product(product_id="basic", title="Basic changed before reservation", price_minor=3200,
+            panel_id="p1", traffic_bytes=1024**3, duration_hours=24, group_ids=["1"])
+        with self.assertRaisesRegex(CustomerStoreError, "تغییر کرده است"):
+            self.store.reserve_product_order(order_id="atomic-stale-quote", telegram_id=123,
+                product_id="basic", idempotency_key="atomic-stale-quote",
+                expected_quote_hash=quote_hash, now=1000)
+        self.assertEqual(self.store.wallet_balance(123), 5000)
+        self.assertIsNone(self.store.get_order_by_idempotency("atomic-stale-quote", 123))
+
+    async def test_discount_quote_is_bound_to_discount_configuration(self):
+        self.store.put_discount_code(code="QUOTE20", percentage=20, max_uses=3, allowed_product_ids=["basic"])
+        quote_hash = self.store.product_purchase_quote_hash("basic", discount_code="QUOTE20")
+        self.store.put_discount_code(code="QUOTE20", percentage=30, max_uses=3, allowed_product_ids=["basic"])
+        with self.assertRaisesRegex(CustomerStoreError, "changed"):
+            await self.service.buy_from_wallet(telegram_id=123, product_id="basic",
+                idempotency_key="stale-discount-quote", discount_code="QUOTE20",
+                expected_quote_hash=quote_hash, now=1000)
+        self.assertEqual(self.adapter.calls, 0)
+        self.assertEqual(self.store.wallet_balance(123), 5000)
+        self.assertEqual(self.store.get_discount_code("QUOTE20")["used_count"], 0)
 
     async def test_wallet_purchase_provisions_and_replay_does_not_charge_twice(self):
         first=await self.service.buy_from_wallet(telegram_id=123,product_id='basic',idempotency_key='buy-1',now=1000)

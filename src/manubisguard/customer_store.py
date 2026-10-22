@@ -1699,6 +1699,82 @@ class CustomerDataStore:
             row = db.execute(sql, args).fetchone()
         return dict(row) if row else None
 
+    @staticmethod
+    def _product_purchase_quote_hash_from_rows(product: dict[str, Any], panel: dict[str, Any] | None,
+                                               discount: dict[str, Any] | None,
+                                               discount_code: str) -> str:
+        try:
+            product_groups = json.loads(str(product.get("group_ids_json") or "[]"))
+        except (ValueError, TypeError):
+            product_groups = str(product.get("group_ids_json") or "")
+        panel_quote = None
+        if panel:
+            try:
+                metadata = json.loads(str(panel.get("metadata_json") or "{}"))
+            except (ValueError, TypeError):
+                metadata = {"invalid_metadata": True}
+            panel_quote = {
+                "panel_id": str(panel.get("panel_id") or ""),
+                "provider": str(panel.get("provider") or ""),
+                "base_url": str(panel.get("base_url") or "").rstrip("/"),
+                "auth_mode": str(panel.get("auth_mode") or ""),
+                "secret_ref_sha256": hashlib.sha256(str(panel.get("secret_ref") or "").encode()).hexdigest(),
+                "metadata_sha256": hashlib.sha256(json.dumps(metadata, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest(),
+                "enabled": bool(panel.get("enabled")),
+            }
+        if discount_code:
+            if discount:
+                try:
+                    allowed = sorted(set(str(x) for x in json.loads(str(discount.get("allowed_product_ids_json") or "[]"))))
+                except (ValueError, TypeError):
+                    allowed = ["invalid"]
+                discount_quote = {"code": discount_code, "percentage": int(discount["percentage"]),
+                    "enabled": bool(discount["enabled"]), "max_uses": int(discount["max_uses"]),
+                    "expires_at": int(discount["expires_at"]) if discount["expires_at"] is not None else None,
+                    "allowed_product_ids": allowed}
+            else:
+                discount_quote = {"code": discount_code, "missing": True}
+        else:
+            discount_quote = None
+        payload = {
+            "product": {
+                "product_id": str(product.get("product_id") or ""),
+                "category_id": str(product.get("category_id") or ""),
+                "title": str(product.get("title") or ""),
+                "description": str(product.get("description") or ""),
+                "price_minor": int(product.get("price_minor") or 0),
+                "currency": str(product.get("currency") or ""),
+                "duration_hours": int(product.get("duration_hours") or 0),
+                "traffic_bytes": int(product.get("traffic_bytes") or 0),
+                "pricing_mode": str(product.get("pricing_mode") or ""),
+                "unit_price_minor": int(product.get("unit_price_minor") or 0),
+                "panel_id": str(product.get("panel_id") or ""),
+                "group_ids": product_groups,
+                "enabled": bool(product.get("enabled")),
+            },
+            "panel": panel_quote,
+            "discount": discount_quote,
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+
+    def product_purchase_quote_hash(self, product_id: str, *, discount_code: str | None = None) -> str:
+        """Return a quote token bound to current product, panel mapping and discount configuration."""
+        normalized_code = str(discount_code or "").strip().upper()
+        with self._connect() as db:
+            product = db.execute("""SELECT p.* FROM customer_products p WHERE p.tenant_id=? AND p.product_id=? AND p.enabled=1
+                AND (p.category_id='' OR EXISTS (SELECT 1 FROM customer_categories c
+                    WHERE c.tenant_id=p.tenant_id AND c.category_id=p.category_id AND c.enabled=1))""",
+                (self.tenant_id, product_id)).fetchone()
+            if not product:
+                raise CustomerStoreError("Product is unavailable")
+            panel = db.execute("SELECT * FROM panel_connections WHERE tenant_id=? AND panel_id=?",
+                (self.tenant_id, product["panel_id"])).fetchone()
+            discount = db.execute("SELECT * FROM discount_codes WHERE tenant_id=? AND code=?",
+                (self.tenant_id, normalized_code)).fetchone() if normalized_code else None
+        return self._product_purchase_quote_hash_from_rows(dict(product), dict(panel) if panel else None,
+            dict(discount) if discount else None, normalized_code)
+
     def get_order_by_idempotency(self, idempotency_key: str, telegram_id: int) -> dict[str, Any] | None:
         with self._connect() as db:
             row = db.execute("SELECT * FROM customer_orders WHERE tenant_id=? AND idempotency_key=? AND telegram_id=?", (self.tenant_id, idempotency_key, telegram_id)).fetchone()
@@ -2959,6 +3035,7 @@ class CustomerDataStore:
                               idempotency_key: str, currency: str = "IRR",
                               reseller_account_id: str | None = None,
                               discount_code: str | None = None,
+                              expected_quote_hash: str | None = None,
                               now: int | None = None) -> dict[str, Any]:
         """Reserve a customer order atomically; reseller child configs are covered by the plan."""
         db = self._connect()
@@ -2976,10 +3053,21 @@ class CustomerDataStore:
                     "currency": prior["currency"], "status": prior["status"], "idempotent_replay": True,
                     "reseller_account_id": str(prior["reseller_account_id"] or "")})
                 db.commit(); return result
-            product = db.execute("SELECT * FROM customer_products WHERE tenant_id=? AND product_id=? AND enabled=1", (self.tenant_id, product_id)).fetchone()
+            product = db.execute("""SELECT p.* FROM customer_products p WHERE p.tenant_id=? AND p.product_id=? AND p.enabled=1
+                AND (p.category_id='' OR EXISTS (SELECT 1 FROM customer_categories c
+                    WHERE c.tenant_id=p.tenant_id AND c.category_id=p.category_id AND c.enabled=1))""",
+                (self.tenant_id, product_id)).fetchone()
             if not product: raise CustomerStoreError("Product is unavailable")
-            panel_state = db.execute("SELECT enabled FROM panel_connections WHERE tenant_id=? AND panel_id=?", (self.tenant_id, product["panel_id"])).fetchone()
+            panel_state = db.execute("SELECT * FROM panel_connections WHERE tenant_id=? AND panel_id=?", (self.tenant_id, product["panel_id"])).fetchone()
             if not panel_state or not panel_state["enabled"]: raise CustomerStoreError("Product panel is disabled; no wallet debit was made")
+            normalized_discount = str(discount_code or "").strip().upper()
+            if expected_quote_hash is not None:
+                quote_discount = db.execute("SELECT * FROM discount_codes WHERE tenant_id=? AND code=?",
+                    (self.tenant_id, normalized_discount)).fetchone() if normalized_discount else None
+                current_quote_hash = self._product_purchase_quote_hash_from_rows(dict(product), dict(panel_state),
+                    dict(quote_discount) if quote_discount else None, normalized_discount)
+                if current_quote_hash != expected_quote_hash:
+                    raise CustomerStoreError("قیمت، نام، تنظیمات پنل یا کد تخفیف تغییر کرده است؛ پیش‌نمایش خرید را دوباره باز کن")
             customer = db.execute("SELECT 1 FROM customer_users WHERE tenant_id=? AND telegram_id=?", (self.tenant_id, telegram_id)).fetchone()
             if not customer: raise CustomerStoreError("Customer must be registered before ordering")
             currency = str(product["currency"])
@@ -3011,7 +3099,6 @@ class CustomerDataStore:
                     if count >= max_users:
                         raise CustomerStoreError("Reseller plan has reached its maximum active service count")
                 charge = 0
-            normalized_discount = str(discount_code or "").strip().upper()
             discount_amount = 0
             if normalized_discount:
                 if reseller_account_id:
