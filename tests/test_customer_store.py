@@ -20,6 +20,22 @@ class CustomerDataStoreTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_customer_language_persists_valid_values_and_is_tenant_scoped(self):
+        self.assertEqual(self.store.get_customer_language(1001), "fa")
+        self.assertEqual(self.store.set_customer_language(1001, "EN"), "en")
+        self.assertEqual(self.store.get_customer_language(1001), "en")
+        reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        self.assertEqual(reopened.get_customer_language(1001), "en")
+        other = CustomerDataStore(self.path, tenant_id="bot-beta")
+        self.assertEqual(other.get_customer_language(1001), "fa")
+        with self.assertRaisesRegex(CustomerStoreError, "Unsupported customer language"):
+            self.store.set_customer_language(1001, "de")
+        self.assertEqual(self.store.get_customer_language(1001), "en")
+        with self.assertRaisesRegex(CustomerStoreError, "Invalid customer ID"):
+            self.store.get_customer_language(True)
+        with self.assertRaisesRegex(CustomerStoreError, "Customer not found"):
+            self.store.set_customer_language(9999, "fa")
+
     def test_notification_routes_support_group_topics_and_tenant_isolation(self):
         route = self.store.add_notification_route(event_key="support_ticket", chat_id=-1001234567890,
             topic_id=77, created_by=1001)

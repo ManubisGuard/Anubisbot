@@ -1204,6 +1204,36 @@ class CustomerDataStore:
                 (self.tenant_id, telegram_id, username[:128], first_name[:256]),
             )
 
+    def get_customer_language(self, telegram_id: int) -> str:
+        """Return the persisted language for this tenant's customer, defaulting safely to Farsi."""
+        if isinstance(telegram_id, bool) or not isinstance(telegram_id, int) or telegram_id <= 0:
+            raise CustomerStoreError("Invalid customer ID")
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT language FROM customer_users WHERE tenant_id=? AND telegram_id=?",
+                (self.tenant_id, telegram_id),
+            ).fetchone()
+        if not row:
+            return "fa"
+        language = str(row["language"] or "fa").strip().lower()
+        return language if language in {"fa", "en"} else "fa"
+
+    def set_customer_language(self, telegram_id: int, language: str) -> str:
+        """Persist one supported customer language without changing profile identity fields."""
+        if isinstance(telegram_id, bool) or not isinstance(telegram_id, int) or telegram_id <= 0:
+            raise CustomerStoreError("Invalid customer ID")
+        normalized = str(language).strip().lower() if isinstance(language, str) else ""
+        if normalized not in {"fa", "en"}:
+            raise CustomerStoreError("Unsupported customer language")
+        with self._connect() as db:
+            cur = db.execute(
+                "UPDATE customer_users SET language=?,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=? AND telegram_id=?",
+                (normalized, self.tenant_id, telegram_id),
+            )
+            if cur.rowcount != 1:
+                raise CustomerStoreError("Customer not found")
+        return normalized
+
     def put_category(self, *, category_id: str, title: str, description: str = "", enabled: bool = True) -> None:
         category_id = category_id.strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", category_id) or not title.strip():
