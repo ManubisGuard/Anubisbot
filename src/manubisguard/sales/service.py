@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import hashlib
 import uuid
 from typing import Callable, Any
 
 from manubisguard.customer_store import CustomerDataStore, CustomerStoreError
-from manubisguard.panels.contracts import PanelConnection, PanelError, UserCreate, PanelUser
+from manubisguard.panels.contracts import PanelConnection, PanelError, PanelUser, PanelUserNotFound, UserCreate
 from manubisguard.panels.registry import AdapterRegistry, default_registry
 
 
@@ -44,6 +45,300 @@ class CustomerPurchaseService:
             name=str(row["label"]), kind=str(row["provider"]), base_url=str(row["base_url"]),
             auth_mode=str(row["auth_mode"]), secret_ref=str(row["secret_ref"]),
             enabled=bool(row["enabled"]), verify_tls=True, metadata=metadata)
+
+    @staticmethod
+    def _provider_binding(connection: PanelConnection) -> dict[str, Any]:
+        metadata_json = json.dumps(connection.metadata or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return {
+            "panel_id": connection.id,
+            "provider_kind": connection.kind,
+            "base_url": connection.base_url.rstrip("/"),
+            "auth_mode": connection.auth_mode,
+            "secret_ref_sha256": hashlib.sha256(connection.secret_ref.encode("utf-8")).hexdigest(),
+            "metadata_sha256": hashlib.sha256(metadata_json.encode("utf-8")).hexdigest(),
+            "verify_tls": bool(connection.verify_tls),
+        }
+
+    def _connection_for_order(self, order: dict[str, Any]) -> PanelConnection:
+        snapshot = order.get("product_snapshot")
+        if not isinstance(snapshot, dict):
+            raise CustomerStoreError("Stored product snapshot is unavailable")
+        panel_id = str(snapshot.get("panel_id") or "")
+        if not panel_id:
+            raise CustomerStoreError("Stored order has no panel binding")
+        connection = self._connection(panel_id)
+        reseller_account_id = str(order.get("reseller_account_id") or "")
+        if reseller_account_id:
+            account = self.store.get_reseller_account(reseller_account_id, int(order["telegram_id"]))
+            if not account or str(account.get("panel_id") or "") != panel_id:
+                raise CustomerStoreError("Stored reseller account no longer matches the order panel")
+            if connection.kind == "rebecca" and account.get("provider_account_id") != "platform-managed":
+                raise CustomerStoreError("Native Rebecca reseller reconciliation is unsupported")
+            if connection.kind == "pasarguard" and account.get("provider_account_id") != "platform-managed":
+                metadata = dict(connection.metadata)
+                metadata["username"] = str(account.get("username") or "")
+                connection = PanelConnection(
+                    id=connection.id, tenant_id=connection.tenant_id, name=connection.name,
+                    kind=connection.kind, base_url=connection.base_url, auth_mode="username_password",
+                    secret_ref=f"vault:{reseller_account_id}", enabled=connection.enabled,
+                    verify_tls=True, metadata=metadata,
+                )
+        return connection
+
+    async def inspect_product_order_reconciliation(self, *, order_id: str) -> dict[str, Any]:
+        """Read-only inspection of a persisted ambiguous initial product provisioning attempt."""
+        order = self.store.get_product_order_reconciliation(order_id)
+        if not order:
+            raise CustomerStoreError("Product order not found")
+        base = {
+            "order_id": str(order["order_id"]), "telegram_id": int(order["telegram_id"]),
+            "product_id": str(order["product_id"]), "status": str(order["status"]),
+            "provider_reference": str(order.get("provider_reference") or ""),
+            "amount_minor": int(order["amount_minor"]), "currency": str(order["currency"]),
+        }
+        intent = order.get("reconciliation_intent")
+        if (order["status"] != "provisioning"
+                or not str(order.get("provider_reference") or "").startswith("reconcile_required:")):
+            raise CustomerStoreError("Order is not awaiting product provisioning reconciliation")
+        if not isinstance(intent, dict) or intent.get("version") != 1:
+            return {**base, "comparison": "intent_missing", "identity_verified": False,
+                    "reason_code": "StoredProvisioningIntentUnavailable"}
+        expected_username = str(intent.get("username") or "")
+        if not expected_username or len(expected_username) > 128:
+            return {**base, "comparison": "identity_missing", "identity_verified": False}
+        try:
+            connection = self._connection_for_order(order)
+        except Exception as exc:
+            return {**base, "comparison": "read_failed", "identity_verified": False,
+                    "reason_code": type(exc).__name__}
+        expected_binding = intent.get("provider_binding")
+        if not isinstance(expected_binding, dict) or self._provider_binding(connection) != expected_binding:
+            return {**base, "comparison": "binding_mismatch", "identity_verified": False}
+        if not connection.enabled:
+            return {**base, "comparison": "read_failed", "identity_verified": False,
+                    "reason_code": "PanelDisabled"}
+        try:
+            secret = self._secret_resolver(connection.secret_ref)
+            if not isinstance(secret, str) or not secret:
+                return {**base, "comparison": "read_failed", "identity_verified": False,
+                        "reason_code": "CredentialUnavailable"}
+            adapter = self.registry.get(connection.kind)
+            current: PanelUser = await adapter.get_user(connection, expected_username)
+        except PanelUserNotFound:
+            return {**base, "comparison": "not_found", "identity_verified": False,
+                    "username": expected_username}
+        except Exception as exc:
+            return {**base, "comparison": "read_failed", "identity_verified": False,
+                    "reason_code": type(exc).__name__, "username": expected_username}
+        if str(current.username or "") != expected_username:
+            return {**base, "comparison": "identity_mismatch", "identity_verified": False,
+                    "username": str(current.username or ""), "expected_username": expected_username}
+        provider_user_id = str(current.provider_user_id or "").strip()
+        if not provider_user_id:
+            return {**base, "comparison": "identity_missing", "identity_verified": False,
+                    "username": expected_username}
+        if str(current.status or "").strip().lower() not in {"active", "enabled", "true", "1"}:
+            status = str(current.status or "").strip().lower()
+            return {**base, "comparison": "observed_unknown" if status in {"", "unknown", "none"} else "different",
+                    "identity_verified": True, "username": expected_username,
+                    "provider_user_id": provider_user_id, "observed_status": status or None}
+        expected_limit = intent.get("data_limit_bytes")
+        observed_limit = current.data_limit_bytes
+        if expected_limit is None:
+            if observed_limit not in (None, 0):
+                return {**base, "comparison": "different", "identity_verified": True,
+                        "username": expected_username, "provider_user_id": provider_user_id,
+                        "observed_data_limit_bytes": observed_limit}
+        elif observed_limit is None:
+            return {**base, "comparison": "observed_unknown", "identity_verified": True,
+                    "username": expected_username, "provider_user_id": provider_user_id}
+        elif int(observed_limit) != int(expected_limit):
+            return {**base, "comparison": "different", "identity_verified": True,
+                    "username": expected_username, "provider_user_id": provider_user_id,
+                    "observed_data_limit_bytes": int(observed_limit)}
+        expected_expiry = intent.get("expire_at")
+        observed_expiry = current.expire_at
+        if expected_expiry is None:
+            if observed_expiry is not None:
+                return {**base, "comparison": "different", "identity_verified": True,
+                        "username": expected_username, "provider_user_id": provider_user_id,
+                        "observed_expire_at": observed_expiry.isoformat()}
+        elif observed_expiry is None:
+            return {**base, "comparison": "different", "identity_verified": True,
+                    "username": expected_username, "provider_user_id": provider_user_id,
+                    "observed_expire_at": None}
+        else:
+            try:
+                expected_dt = datetime.fromisoformat(str(expected_expiry))
+                observed_dt = observed_expiry
+                if not isinstance(observed_dt, datetime):
+                    raise ValueError("Observed provider expiry is not a datetime")
+                if expected_dt.tzinfo is None:
+                    expected_dt = expected_dt.replace(tzinfo=timezone.utc)
+                if observed_dt.tzinfo is None:
+                    observed_dt = observed_dt.replace(tzinfo=timezone.utc)
+                expected_norm = expected_dt.astimezone(timezone.utc).replace(microsecond=0)
+                observed_norm = observed_dt.astimezone(timezone.utc).replace(microsecond=0)
+            except (TypeError, ValueError, OverflowError):
+                return {**base, "comparison": "observed_unknown", "identity_verified": False,
+                        "username": expected_username, "reason_code": "InvalidExpirySnapshot"}
+            if expected_norm != observed_norm:
+                return {**base, "comparison": "different", "identity_verified": True,
+                        "username": expected_username, "provider_user_id": provider_user_id,
+                        "observed_expire_at": observed_norm.isoformat()}
+        metadata = current.metadata if isinstance(current.metadata, dict) else {}
+        expected_groups = sorted(int(x) for x in (intent.get("group_ids") or []))
+        if connection.kind == "pasarguard":
+            observed_groups = metadata.get("group_ids")
+            if not isinstance(observed_groups, list):
+                return {**base, "comparison": "observed_unknown", "identity_verified": True,
+                        "username": expected_username, "provider_user_id": provider_user_id,
+                        "reason_code": "ProviderGroupIDsUnavailable"}
+            try:
+                observed_groups = sorted(int(x) for x in observed_groups)
+            except (TypeError, ValueError, OverflowError):
+                return {**base, "comparison": "observed_unknown", "identity_verified": True,
+                        "username": expected_username, "provider_user_id": provider_user_id,
+                        "reason_code": "ProviderGroupIDsInvalid"}
+            if observed_groups != expected_groups:
+                return {**base, "comparison": "different", "identity_verified": True,
+                        "username": expected_username, "provider_user_id": provider_user_id,
+                        "observed_group_ids": observed_groups}
+        extra = intent.get("extra") if isinstance(intent.get("extra"), dict) else {}
+        if connection.kind == "rebecca":
+            wanted_service_id = extra.get("service_id")
+            if wanted_service_id is None or metadata.get("service_id") is None:
+                return {**base, "comparison": "observed_unknown", "identity_verified": True,
+                        "username": expected_username, "provider_user_id": provider_user_id,
+                        "reason_code": "ProviderServiceIDUnavailable"}
+            if str(metadata.get("service_id")) != str(wanted_service_id):
+                return {**base, "comparison": "different", "identity_verified": True,
+                        "username": expected_username, "provider_user_id": provider_user_id,
+                        "observed_service_id": metadata.get("service_id")}
+        if connection.kind == "sanaei":
+            wanted_uuid_hash = str(extra.get("uuid_sha256") or "")
+            observed_uuid = str(metadata.get("uuid") or "")
+            observed_uuid_hash = hashlib.sha256(observed_uuid.encode("utf-8")).hexdigest() if observed_uuid else ""
+            wanted_inbounds = sorted(int(x) for x in (extra.get("inbound_ids") or []))
+            observed_inbounds = metadata.get("inbound_ids")
+            if not wanted_uuid_hash or not observed_uuid_hash or not isinstance(observed_inbounds, list):
+                return {**base, "comparison": "observed_unknown", "identity_verified": True,
+                        "username": expected_username, "provider_user_id": provider_user_id,
+                        "reason_code": "ProviderClientIdentityUnavailable"}
+            try:
+                observed_inbounds = sorted(int(x) for x in observed_inbounds)
+            except (TypeError, ValueError, OverflowError):
+                return {**base, "comparison": "observed_unknown", "identity_verified": True,
+                        "username": expected_username, "provider_user_id": provider_user_id,
+                        "reason_code": "ProviderInboundIDsInvalid"}
+            if observed_uuid_hash != wanted_uuid_hash or observed_inbounds != wanted_inbounds:
+                return {**base, "comparison": "different", "identity_verified": True,
+                        "username": expected_username, "provider_user_id": provider_user_id,
+                        "observed_inbound_ids": observed_inbounds}
+            for field, metadata_field in (("sub_id", "sub_id"), ("ip_limit", "ip_limit"), ("flow", "flow")):
+                wanted = extra.get(field, "")
+                observed = metadata.get(metadata_field)
+                if field == "sub_id":
+                    wanted_hash = str(extra.get("sub_id_sha256") or "")
+                    observed_hash = hashlib.sha256(str(observed).encode("utf-8")).hexdigest() if observed not in (None, "") else ""
+                    if not wanted_hash and not observed_hash:
+                        continue
+                    if not wanted_hash or not observed_hash:
+                        return {**base, "comparison": "observed_unknown", "identity_verified": True,
+                                "username": expected_username, "provider_user_id": provider_user_id,
+                                "reason_code": "ProviderClientSettingsUnavailable"}
+                    if wanted_hash != observed_hash:
+                        return {**base, "comparison": "different", "identity_verified": True,
+                                "username": expected_username, "provider_user_id": provider_user_id}
+                    continue
+                if wanted in (None, "") and observed in (None, ""):
+                    continue
+                if observed is None:
+                    return {**base, "comparison": "observed_unknown", "identity_verified": True,
+                            "username": expected_username, "provider_user_id": provider_user_id,
+                            "reason_code": "ProviderClientSettingsUnavailable"}
+                if str(observed) != str(wanted):
+                    return {**base, "comparison": "different", "identity_verified": True,
+                            "username": expected_username, "provider_user_id": provider_user_id}
+        panel_id = str(intent.get("provider_binding", {}).get("panel_id") or "")
+        if self.store.is_product_provider_identity_claimed(
+                panel_id=panel_id, provider_user_id=provider_user_id, username=expected_username,
+                excluding_service_id=str(order_id)):
+            return {**base, "comparison": "identity_claimed", "identity_verified": True,
+                    "username": expected_username, "provider_user_id": provider_user_id}
+        subscription_url = current.subscription_url
+        if not subscription_url:
+            try:
+                capabilities = await adapter.capabilities(connection)
+                if capabilities.subscription_link:
+                    subscription_url = await adapter.get_subscription_url(connection, expected_username)
+            except Exception as exc:
+                return {**base, "comparison": "read_failed", "identity_verified": True,
+                        "reason_code": type(exc).__name__, "username": expected_username,
+                        "provider_user_id": provider_user_id}
+            if capabilities.subscription_link and not subscription_url:
+                return {**base, "comparison": "observed_unknown", "identity_verified": True,
+                        "reason_code": "SubscriptionLinkUnavailable", "username": expected_username,
+                        "provider_user_id": provider_user_id}
+        evidence = {
+            "panel_id": panel_id, "provider_kind": connection.kind,
+            "observed_status": str(current.status or ""),
+            "observed_data_limit_bytes": current.data_limit_bytes,
+            "observed_expire_at": (current.expire_at.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+                                   if current.expire_at and current.expire_at.tzinfo
+                                   else current.expire_at.replace(tzinfo=timezone.utc).replace(microsecond=0).isoformat()
+                                   if current.expire_at else None),
+            "observed_metadata": {
+                **{key: metadata.get(key) for key in (
+                    "group_ids", "service_id", "inbound_ids", "ip_limit", "flow", "protocol"
+                ) if key in metadata},
+                **({"uuid_sha256": hashlib.sha256(str(metadata["uuid"]).encode("utf-8")).hexdigest()}
+                   if metadata.get("uuid") else {}),
+                **({"sub_id_sha256": hashlib.sha256(str(metadata["sub_id"]).encode("utf-8")).hexdigest()}
+                   if metadata.get("sub_id") not in (None, "") else {}),
+            },
+        }
+        return {**base, "comparison": "target_present", "identity_verified": True,
+                "username": expected_username, "provider_user_id": provider_user_id,
+                "provider_kind": connection.kind, "panel_id": panel_id,
+                "observed_status": str(current.status or ""),
+                "observed_data_limit_bytes": current.data_limit_bytes,
+                "observed_expire_at": evidence["observed_expire_at"],
+                "observed_metadata": evidence["observed_metadata"],
+                "subscription_url": subscription_url, "evidence": evidence}
+
+    async def finalize_product_order_target_present(self, *, order_id: str, actor_telegram_id: int,
+                                                    reason: str) -> dict[str, Any]:
+        """Re-inspect live provider state immediately before one audited local finalization."""
+        reason = reason.strip()
+        if not 1 <= len(reason) <= 500:
+            raise CustomerStoreError("A decision reason of 1..500 characters is required")
+        prior_events = self.store.list_product_order_reconciliation_events(order_id)
+        if prior_events:
+            event = prior_events[0]
+            order = self.store.get_product_order_reconciliation(order_id)
+            service = self.store.get_customer_service(order_id)
+            if (int(event["actor_telegram_id"]) == int(actor_telegram_id)
+                    and str(event["reason"]) == reason
+                    and order is not None and order.get("status") == "active"
+                    and service is not None
+                    and str(service.get("provider_user_id") or "") == str(event["provider_user_id"])
+                    and str(service.get("username") or "") == str(event["username"])):
+                return {**event, "idempotent_replay": True}
+            raise CustomerStoreError("A final product-order reconciliation decision is already recorded")
+        observed = await self.inspect_product_order_reconciliation(order_id=order_id)
+        if observed.get("comparison") != "target_present" or observed.get("identity_verified") is not True:
+            raise CustomerStoreError(
+                f"Cannot finalize product order: fresh provider comparison is {observed.get('comparison', 'unknown')}"
+            )
+        return self.store.resolve_product_order_target_present(
+            order_id=order_id, actor_telegram_id=actor_telegram_id,
+            provider_kind=str(observed["provider_kind"]),
+            provider_user_id=str(observed["provider_user_id"]), username=str(observed["username"]),
+            subscription_url=observed.get("subscription_url"), evidence=observed["evidence"],
+            comparison=str(observed["comparison"]), identity_verified=True, reason=reason,
+            now=int(datetime.now(timezone.utc).timestamp()),
+        )
 
     async def buy_from_wallet(self, *, telegram_id: int, product_id: str,
                               idempotency_key: str, reseller_account_id: str | None = None,
@@ -157,13 +452,6 @@ class CustomerPurchaseService:
                 except (TypeError, ValueError): raise CustomerStoreError("PasarGuard product requires numeric group IDs") from None
             else:
                 provider_groups = ()
-            provider_create_started = True
-            created: PanelUser = await adapter.create_user(connection, UserCreate(
-                username=username, data_limit_bytes=data_limit, expire_at=expire_at,
-                group_ids=provider_groups, note=f"Anubis order {actual_order_id}", extra=extra))
-            subscription_url = created.subscription_url
-            if not subscription_url and caps.subscription_link:
-                subscription_url = await adapter.get_subscription_url(connection, created.username or username)
             snapshot = dict(order)
             snapshot["expires_at"] = expire_at.isoformat() if expire_at else None
             if reseller_account_id:
@@ -171,6 +459,32 @@ class CustomerPurchaseService:
                 if mode in {"hourly", "usage"}:
                     snapshot["pricing_mode"] = "unlimited"
                     snapshot["unit_price_minor"] = 0
+            intent = {
+                "version": 1,
+                "username": username,
+                "data_limit_bytes": data_limit,
+                "expire_at": expire_at.isoformat() if expire_at else None,
+                "group_ids": list(provider_groups),
+                "extra": {
+                    **{key: value for key, value in extra.items() if key not in {"uuid", "sub_id"}},
+                    **({"uuid_sha256": hashlib.sha256(str(extra["uuid"]).encode("utf-8")).hexdigest()}
+                       if extra.get("uuid") else {}),
+                    **({"sub_id_sha256": hashlib.sha256(str(extra["sub_id"]).encode("utf-8")).hexdigest()}
+                       if extra.get("sub_id") not in (None, "") else {}),
+                },
+                "note": f"Anubis order {actual_order_id}",
+                "provider_binding": self._provider_binding(connection),
+                "service_created_at": now,
+                "service_product": snapshot,
+            }
+            self.store.record_product_order_provisioning_intent(order_id=actual_order_id, intent=intent)
+            provider_create_started = True
+            created: PanelUser = await adapter.create_user(connection, UserCreate(
+                username=username, data_limit_bytes=data_limit, expire_at=expire_at,
+                group_ids=provider_groups, note=f"Anubis order {actual_order_id}", extra=extra))
+            subscription_url = created.subscription_url
+            if not subscription_url and caps.subscription_link:
+                subscription_url = await adapter.get_subscription_url(connection, created.username or username)
             self.store.create_metered_service(service_id=actual_order_id, telegram_id=telegram_id,
                 product=snapshot, provider_user_id=created.provider_user_id, username=created.username or username,
                 subscription_url=subscription_url, reseller_account_id=reseller_account_id or "", now=now)

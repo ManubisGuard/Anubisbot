@@ -858,6 +858,22 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("delivery_payload", payload["caption"])
         self.assertTrue(self.bot.api.send_text.await_args.args[1].startswith("🛍 فروشگاه"))
 
+    async def test_manual_product_scheduled_visibility_can_be_set_and_hidden_from_shop(self):
+        admin = {"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"}}
+        await self.bot._handle_message({**admin, "text":
+            "/manual-product add future-item | Future Item | 500 | IRR | manual |  | Scheduled description |  | 0 | 0 |  |  | 2099-01-01T00:00:00Z | 2100-01-01T00:00:00Z"})
+        product = self.bot.data.get_manual_product("future-item", enabled_only=False)
+        self.assertEqual(product["visible_from_utc"], "2099-01-01T00:00:00Z")
+        self.assertEqual(product["visible_until_utc"], "2100-01-01T00:00:00Z")
+        await self.bot._handle_message({**admin, "text": "/manual-product edit future-item | Future Item | 500 | IRR | manual |  | Updated description"})
+        self.assertEqual(self.bot.data.get_manual_product("future-item", enabled_only=False)["visible_from_utc"],
+                         "2099-01-01T00:00:00Z")
+        await self.bot._handle_callback({"id":"scheduled-shop", "from":{"id":999},
+            "message":{"chat":{"id":999,"type":"private"}}, "data":"customer:shop"})
+        body = self.bot.api.send_text.await_args.args[1]
+        self.assertNotIn("Future Item", body)
+        self.assertIsNone(self.bot.data.get_manual_product("future-item"))
+
     async def test_manual_product_image_send_failure_falls_back_to_text_listing(self):
         self.bot.data.put_manual_product(product_id="image-fallback", title="Fallback image", price_minor=500,
             delivery_mode="manual", description="Fallback description",
@@ -1636,6 +1652,214 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.purchase_service.buy_from_wallet.await_args.kwargs["discount_code"],"SAVE20")
         self.assertIn(":discount:SAVE20",self.bot.purchase_service.buy_from_wallet.await_args.kwargs["idempotency_key"])
         self.assertNotIn(999,self.bot._pending_purchase_discount)
+
+
+    async def test_manual_variant_selection_confirms_and_charges_variant_price(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="variant-bot-fund", amount_minor=3000, entry_type="deposit")
+        self.bot.data.put_manual_product(product_id="variant-bot", title="Variant item", price_minor=1200,
+            currency="IRR", delivery_mode="instant", delivery_payload="VARIANT-DELIVERY")
+        self.bot.data.put_manual_variant(product_id="variant-bot", variant_id="basic", title="Basic", price_minor=500)
+        self.bot.data.put_manual_variant(product_id="variant-bot", variant_id="pro", title="Pro", price_minor=900)
+        await self.bot._handle_callback({"id":"variant-select","from":{"id":999},
+            "message":{"message_id":700,"chat":{"id":999,"type":"private"}},
+            "data":"customer:manualbuy:variant-bot"})
+        body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("انتخاب", body)
+        keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        callbacks = [button["callback_data"] for row in keyboard for button in row]
+        self.assertIn("customer:manualbuy:variant-bot~basic", callbacks)
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"variant-confirm-screen","from":{"id":999},
+            "message":{"message_id":701,"chat":{"id":999,"type":"private"}},
+            "data":"customer:manualbuy:variant-bot~basic"})
+        body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("Variant item — Basic", body)
+        self.assertIn("500 IRR", body)
+        confirm_data = self.bot.api.send_text.await_args.args[2]["inline_keyboard"][0][0]["callback_data"]
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"variant-buy","from":{"id":999},
+            "message":{"message_id":702,"chat":{"id":999,"type":"private"}}, "data":confirm_data})
+        body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("Variant item — Basic", body)
+        self.assertIn("500 IRR", body)
+        self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 2500)
+        with self.bot.data._connect() as db:
+            row = db.execute("SELECT variant_id_snapshot,variant_title_snapshot,amount_minor FROM manual_product_orders WHERE tenant_id=?",
+                (self.bot.data.tenant_id,)).fetchone()
+        self.assertEqual(tuple(row), ("basic", "Basic", 500))
+
+
+    async def test_admin_can_manage_manual_product_variants_and_variant_inventory(self):
+        admin = {"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"}}
+        await self.bot._handle_message({**admin, "text":"/manual-product add variant-admin | Variant Admin | 1000 | IRR | inventory |  | Admin variant test"})
+        await self.bot._handle_message({**admin, "text":"/manual-variant add variant-admin | monthly | Monthly | 1200"})
+        variant = self.bot.data.get_manual_variant("variant-admin", "monthly")
+        self.assertEqual(variant["title"], "Monthly")
+        self.assertEqual(variant["price_minor"], 1200)
+        await self.bot._handle_message({**admin, "text":"/manual-key add variant-admin | VARIANT-KEY | monthly"})
+        self.assertEqual(self.bot.data.manual_inventory_count("variant-admin", "monthly"), 1)
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_message({**admin, "text":"/manual-variant list variant-admin"})
+        self.assertIn("Monthly", self.bot.api.send_text.await_args.args[1])
+        await self.bot._handle_message({**admin, "text":"/manual-variant edit variant-admin | monthly | Monthly Plus | 1500"})
+        self.assertEqual(self.bot.data.get_manual_variant("variant-admin", "monthly")["price_minor"], 1500)
+        await self.bot._handle_message({**admin, "text":"/manual-variant edit variant-admin | monthly | Monthly Plus | 1500 | instant | PRIVATE-VARIANT-PAYLOAD"})
+        variant = self.bot.data.get_manual_variant("variant-admin", "monthly")
+        self.assertEqual(variant["delivery_mode"], "instant")
+        self.assertEqual(self.bot.data.manual_variant_delivery("variant-admin", "monthly")["delivery_payload"], "PRIVATE-VARIANT-PAYLOAD")
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_message({**admin, "text":"/manual-variant list variant-admin"})
+        listing = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("خودکار", listing)
+        self.assertNotIn("PRIVATE-VARIANT-PAYLOAD", listing)
+        await self.bot._handle_message({**admin, "text":"/manual-variant archive variant-admin | monthly"})
+        archived = self.bot.data.get_manual_variant("variant-admin", "monthly", enabled_only=False)
+        self.assertEqual(archived["enabled"], 0)
+        self.assertEqual(self.bot.data.manual_inventory_count("variant-admin", "monthly"), 1)
+        self.assertEqual(self.bot.data.list_manual_variants("variant-admin"), [])
+
+
+    async def test_variant_inventory_override_controls_stock_button_and_delivery(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="variant-mode-ui-fund",
+                                        amount_minor=1500, entry_type="deposit")
+        self.bot.data.put_manual_product(product_id="variant-mode-ui", title="Mode UI", price_minor=1000,
+            currency="IRR", delivery_mode="instant", delivery_payload="PARENT-INSTANT")
+        self.bot.data.put_manual_variant(product_id="variant-mode-ui", variant_id="stock", title="Stock",
+            price_minor=500, delivery_mode="inventory", delivery_payload=None, delivery_config_provided=True)
+        self.bot.data.put_manual_variant(product_id="variant-mode-ui", variant_id="manual", title="Manual",
+            price_minor=600, delivery_mode="manual", delivery_payload=None, delivery_config_provided=True)
+        await self.bot._handle_callback({"id":"variant-mode-empty","from":{"id":999},
+            "message":{"message_id":900,"chat":{"id":999,"type":"private"}},
+            "data":"customer:manualbuy:variant-mode-ui"})
+        keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        callbacks = [button["callback_data"] for row in keyboard for button in row]
+        self.assertNotIn("customer:manualbuy:variant-mode-ui~stock", callbacks)
+        self.assertIn("customer:manualbuy:variant-mode-ui~manual", callbacks)
+        self.bot.data.add_manual_inventory_key(product_id="variant-mode-ui", variant_id="stock",
+                                               secret_payload="VARIANT-ONLY-KEY")
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"variant-mode-restocked","from":{"id":999},
+            "message":{"message_id":901,"chat":{"id":999,"type":"private"}},
+            "data":"customer:manualbuy:variant-mode-ui"})
+        keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        callbacks = [button["callback_data"] for row in keyboard for button in row]
+        self.assertIn("customer:manualbuy:variant-mode-ui~stock", callbacks)
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"variant-mode-confirm-screen","from":{"id":999},
+            "message":{"message_id":902,"chat":{"id":999,"type":"private"}},
+            "data":"customer:manualbuy:variant-mode-ui~stock"})
+        confirmation = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("خودکار پس از پرداخت", confirmation)
+        confirm_data = self.bot.api.send_text.await_args.args[2]["inline_keyboard"][0][0]["callback_data"]
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"variant-mode-buy","from":{"id":999},
+            "message":{"message_id":903,"chat":{"id":999,"type":"private"}}, "data":confirm_data})
+        body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("VARIANT-ONLY-KEY", body)
+        self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 1000)
+
+    async def test_manual_variant_confirmation_rejects_stale_price_without_debit(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="variant-stale-fund", amount_minor=2000, entry_type="deposit")
+        self.bot.data.put_manual_product(product_id="variant-stale", title="Stale quote", price_minor=1000,
+            currency="IRR", delivery_mode="instant", delivery_payload="SAFE")
+        self.bot.data.put_manual_variant(product_id="variant-stale", variant_id="monthly", title="Monthly", price_minor=500)
+        await self.bot._handle_callback({"id":"variant-stale-screen","from":{"id":999},
+            "message":{"message_id":810,"chat":{"id":999,"type":"private"}},
+            "data":"customer:manualbuy:variant-stale~monthly"})
+        confirm_data = self.bot.api.send_text.await_args.args[2]["inline_keyboard"][0][0]["callback_data"]
+        self.assertLessEqual(len(confirm_data.encode("utf-8")), 64)
+        self.assertTrue(confirm_data.startswith("customer:mv:"))
+        self.bot.data.put_manual_variant(product_id="variant-stale", variant_id="monthly", title="Monthly", price_minor=700)
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"variant-stale-buy","from":{"id":999},
+            "message":{"message_id":811,"chat":{"id":999,"type":"private"}}, "data":confirm_data})
+        self.assertIn("قیمت، نام یا شرایط", self.bot.api.send_text.await_args.args[1])
+        self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 2000)
+        with self.bot.data._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM manual_product_orders WHERE tenant_id=?", (self.bot.data.tenant_id,)).fetchone()[0], 0)
+
+
+
+    async def test_admin_product_order_read_only_check_and_finalize_commands_are_audited(self):
+        admin = {"from": {"id": 6883349141}, "chat": {"id": 6883349141, "type": "private"}}
+        secret_url = "https://sub.example/private-token"
+        observed = {
+            "order_id": "ambiguous-order", "telegram_id": 123, "status": "provisioning",
+            "comparison": "target_present", "identity_verified": True,
+            "username": "u123_abcd1234", "provider_user_id": "provider-safe-id",
+            "provider_kind": "pasarguard", "panel_id": "panel-a",
+            "observed_status": "active", "observed_data_limit_bytes": 1024,
+            "observed_expire_at": "2026-10-22T00:00:00+00:00",
+            "subscription_url": secret_url, "evidence": {"panel_id": "panel-a"},
+        }
+        with patch.object(customer_bot_module.CustomerPurchaseService,
+                          "inspect_product_order_reconciliation",
+                          new_callable=AsyncMock, return_value=observed) as inspect:
+            await self.bot._handle_message({**admin, "text": "/product-order-check ambiguous-order"})
+            inspect.assert_awaited_once_with(order_id="ambiguous-order")
+            body = self.bot.api.send_text.await_args.args[1]
+            self.assertIn("تطبیق دارد", body)
+            self.assertIn("u123_abcd1234", body)
+            self.assertNotIn(secret_url, body)
+            self.assertIn("/product-order-finalize", body)
+
+        self.bot.api.send_text.reset_mock()
+        with patch.object(customer_bot_module.CustomerPurchaseService,
+                          "finalize_product_order_target_present",
+                          new_callable=AsyncMock,
+                          return_value={"order_id": "ambiguous-order", "idempotent_replay": False}) as finalize:
+            await self.bot._handle_message({**admin,
+                "text": "/product-order-finalize ambiguous-order | verified target after read-only comparison"})
+            finalize.assert_awaited_once_with(order_id="ambiguous-order",
+                actor_telegram_id=6883349141, reason="verified target after read-only comparison")
+            body = self.bot.api.send_text.await_args.args[1]
+            self.assertIn("نهایی شد", body)
+            self.assertIn("هیچ ساخت مجدد", body)
+
+    async def test_admin_product_order_list_and_detail_do_not_dump_secrets(self):
+        admin = {"from": {"id": 6883349141}, "chat": {"id": 6883349141, "type": "private"}}
+        with patch.object(self.bot.data, "list_product_order_reconciliation", return_value=[{
+            "order_id": "ambiguous-order", "telegram_id": 123, "product_id": "basic",
+            "title": "Basic", "amount_minor": 1500, "currency": "IRR", "status": "provisioning",
+            "provider_reference": "reconcile_required:TimeoutError", "has_provisioning_intent": True,
+        }]) as listing:
+            await self.bot._handle_message({**admin, "text": "/product-orders reconcile_required"})
+            listing.assert_called_once_with(status="reconcile_required", limit=50)
+            body = self.bot.api.send_text.await_args.args[1]
+            self.assertIn("ambiguous-order", body)
+            self.assertIn("/product-order-check", body)
+
+        self.bot.api.send_text.reset_mock()
+        private_token = "https://sub.example/must-not-render"
+        with patch.object(self.bot.data, "get_product_order_reconciliation", return_value={
+            "order_id": "ambiguous-order", "telegram_id": 123, "product_id": "basic",
+            "amount_minor": 1500, "currency": "IRR", "status": "provisioning",
+            "provider_reference": "reconcile_required:TimeoutError",
+            "product_snapshot": {"title": "Basic", "panel_id": "panel-a",
+                "_provisioning_intent": {"version": 1, "username": "u123_abcd1234",
+                    "provider_binding": {"panel_id": "panel-a", "provider_kind": "pasarguard",
+                                         "secret_ref": "env:PANEL_KEY"},
+                    "private_url": private_token}},
+        }) as detail:
+            await self.bot._handle_message({**admin, "text": "/product-order ambiguous-order"})
+            detail.assert_called_once_with("ambiguous-order")
+            body = self.bot.api.send_text.await_args.args[1]
+            self.assertIn("u123_abcd1234", body)
+            self.assertIn("pasarguard", body)
+            self.assertNotIn(private_token, body)
+            self.assertNotIn("env:PANEL_KEY", body)
+
+    async def test_non_admin_cannot_read_or_finalize_product_order_reconciliation(self):
+        message = {"from": {"id": 999}, "chat": {"id": 999, "type": "private"},
+                   "text": "/product-order-finalize private-order | unauthorized"}
+        with patch.object(customer_bot_module.CustomerPurchaseService,
+                          "finalize_product_order_target_present", new_callable=AsyncMock) as finalize:
+            await self.bot._handle_message(message)
+            finalize.assert_not_awaited()
+        self.assertIn("فقط برای مدیر مجاز", self.bot.api.send_text.await_args.args[1])
 
 
 if __name__ == "__main__":

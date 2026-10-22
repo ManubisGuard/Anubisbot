@@ -12,6 +12,7 @@ import hashlib
 import sqlite3
 import uuid
 import time
+from datetime import datetime, timezone
 import ipaddress
 from urllib.parse import urlsplit
 from pathlib import Path
@@ -441,7 +442,7 @@ class CustomerDataStore:
                     int(row["version"])
                     for row in db.execute("SELECT version FROM schema_migrations").fetchall()
                 }
-                unknown_versions = sorted(version for version in applied if version > 14)
+                unknown_versions = sorted(version for version in applied if version > 18)
                 if unknown_versions:
                     raise CustomerStoreError(
                         "Database schema is newer than this application supports"
@@ -830,6 +831,70 @@ class CustomerDataStore:
                         db.execute("ALTER TABLE manual_products ADD COLUMN image_url TEXT NOT NULL DEFAULT ''")
                     db.execute("INSERT INTO schema_migrations(version,name) VALUES(14,?)", ("manual_product_image_url",))
                     applied.add(14)
+                # v15 adds optional UTC visibility bounds; empty bounds mean no schedule.
+                if 15 not in applied:
+                    product_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(manual_products)").fetchall()}
+                    for column in ("visible_from_utc", "visible_until_utc"):
+                        if column not in product_columns:
+                            db.execute(f"ALTER TABLE manual_products ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(15,?)", ("manual_product_visibility_schedule",))
+                    applied.add(15)
+                # v16 adds tenant-scoped product variants and immutable order snapshots.
+                if 16 not in applied:
+                    db.execute("""CREATE TABLE IF NOT EXISTS manual_product_variants (
+                        tenant_id TEXT NOT NULL, product_id TEXT NOT NULL, variant_id TEXT NOT NULL,
+                        title TEXT NOT NULL, price_minor INTEGER NOT NULL CHECK(price_minor > 0),
+                        enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY(tenant_id,product_id,variant_id),
+                        FOREIGN KEY(tenant_id,product_id) REFERENCES manual_products(tenant_id,product_id)
+                    )""")
+                    inventory_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(manual_product_inventory)").fetchall()}
+                    if "variant_id" not in inventory_columns:
+                        db.execute("ALTER TABLE manual_product_inventory ADD COLUMN variant_id TEXT NOT NULL DEFAULT ''")
+                    order_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(manual_product_orders)").fetchall()}
+                    for column, declaration in (("variant_id_snapshot", "TEXT NOT NULL DEFAULT ''"),
+                                                ("variant_title_snapshot", "TEXT NOT NULL DEFAULT ''")):
+                        if column not in order_columns:
+                            db.execute(f"ALTER TABLE manual_product_orders ADD COLUMN {column} {declaration}")
+                    db.execute("CREATE INDEX IF NOT EXISTS ix_manual_variants_catalog ON manual_product_variants(tenant_id,product_id,enabled,variant_id)")
+                    db.execute("CREATE INDEX IF NOT EXISTS ix_manual_inventory_variant ON manual_product_inventory(tenant_id,product_id,variant_id,status,inventory_id)")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(16,?)", ("manual_product_variants",))
+                    applied.add(16)
+                # v17 adds optional per-variant delivery overrides. NULL inherits the parent.
+                if 17 not in applied:
+                    variant_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(manual_product_variants)").fetchall()}
+                    if "delivery_mode" not in variant_columns:
+                        db.execute("ALTER TABLE manual_product_variants ADD COLUMN delivery_mode TEXT")
+                    if "delivery_payload" not in variant_columns:
+                        db.execute("ALTER TABLE manual_product_variants ADD COLUMN delivery_payload TEXT")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(17,?)", ("manual_variant_delivery_overrides",))
+                    applied.add(17)
+                # v18 records immutable operator decisions for ambiguous initial product provisioning.
+                if 18 not in applied:
+                    db.execute("""CREATE TABLE IF NOT EXISTS customer_product_order_reconciliation_events (
+                        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tenant_id TEXT NOT NULL, order_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL CHECK(event_type='operator_finalized_target_present'),
+                        actor_telegram_id INTEGER NOT NULL,
+                        provider_kind TEXT NOT NULL, provider_user_id TEXT NOT NULL, username TEXT NOT NULL,
+                        comparison TEXT NOT NULL CHECK(comparison='target_present'),
+                        evidence_json TEXT NOT NULL, reason TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(tenant_id,order_id),
+                        FOREIGN KEY(tenant_id,order_id) REFERENCES customer_orders(tenant_id,order_id)
+                    )""")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(18,?)",
+                               ("product_order_reconciliation_audit",))
+                    applied.add(18)
+                # Re-assert immutable audit triggers if an older database already has v18 recorded.
+                db.execute("""CREATE TRIGGER IF NOT EXISTS customer_product_order_reconciliation_events_no_update
+                    BEFORE UPDATE ON customer_product_order_reconciliation_events
+                    BEGIN SELECT RAISE(ABORT, 'product order reconciliation events are append-only'); END""")
+                db.execute("""CREATE TRIGGER IF NOT EXISTS customer_product_order_reconciliation_events_no_delete
+                    BEFORE DELETE ON customer_product_order_reconciliation_events
+                    BEGIN SELECT RAISE(ABORT, 'product order reconciliation events are append-only'); END""")
                 db.commit()
             except Exception:
                 db.rollback()
@@ -844,7 +909,8 @@ class CustomerDataStore:
                            delivery_payload: str = "", description: str = "", enabled: bool = True,
                            category_id: str = "", max_purchases_per_customer: int | None = None,
                            sort_order: int | None = None, terms_text: str = "",
-                           image_url: str | None = None) -> None:
+                           image_url: str | None = None, visible_from_utc: str | None = None,
+                           visible_until_utc: str | None = None) -> None:
         self._ensure_manual_shop_tables()
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", product_id.strip()) or not title.strip():
             raise CustomerStoreError("Manual product ID and title are required; ID must use ASCII letters, digits, _ or -")
@@ -893,7 +959,38 @@ class CustomerDataStore:
                 isinstance(sort_order, bool) or not isinstance(sort_order, int)
                 or not -(2**31) <= sort_order <= 2**31-1):
             raise CustomerStoreError("Sort order must be a signed 32-bit integer")
+        def normalize_schedule(value: str | None, label: str) -> str | None:
+            if value is None:
+                return None
+            if not isinstance(value, str):
+                raise CustomerStoreError(f"{label} must use UTC format YYYY-MM-DDTHH:MM:SSZ or -")
+            value = value.strip()
+            if value == "":
+                raise CustomerStoreError(f"{label} must use UTC format YYYY-MM-DDTHH:MM:SSZ or -")
+            if value == "-":
+                return ""
+            try:
+                parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            except ValueError:
+                raise CustomerStoreError(f"{label} must use UTC format YYYY-MM-DDTHH:MM:SSZ or -") from None
+            if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+                raise CustomerStoreError(f"{label} must use UTC format YYYY-MM-DDTHH:MM:SSZ or -")
+            return value
+        visible_from_utc = normalize_schedule(visible_from_utc, "Visibility start")
+        visible_until_utc = normalize_schedule(visible_until_utc, "Visibility end")
+        if visible_from_utc and visible_until_utc and visible_from_utc >= visible_until_utc:
+            raise CustomerStoreError("Visibility end must be later than visibility start")
         with self._connect() as db:
+            existing_schedule = db.execute(
+                "SELECT visible_from_utc,visible_until_utc FROM manual_products WHERE tenant_id=? AND product_id=?",
+                (self.tenant_id, product_id.strip()),
+            ).fetchone()
+            effective_from = (visible_from_utc if visible_from_utc is not None
+                              else (str(existing_schedule["visible_from_utc"] or "") if existing_schedule else ""))
+            effective_until = (visible_until_utc if visible_until_utc is not None
+                               else (str(existing_schedule["visible_until_utc"] or "") if existing_schedule else ""))
+            if effective_from and effective_until and effective_from >= effective_until:
+                raise CustomerStoreError("Visibility end must be later than visibility start")
             if category_id and not db.execute(
                 "SELECT 1 FROM customer_categories WHERE tenant_id=? AND category_id=?",
                 (self.tenant_id, category_id),
@@ -901,42 +998,173 @@ class CustomerDataStore:
                 raise CustomerStoreError("Manual product category does not exist")
             db.execute("""INSERT INTO manual_products
                 (tenant_id,product_id,category_id,title,description,price_minor,currency,delivery_mode,delivery_payload,enabled,
-                 max_purchases_per_customer,sort_order,terms_text,image_url)
-                VALUES(?,?,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,0),?,COALESCE(?,'' ))
+                 max_purchases_per_customer,sort_order,terms_text,image_url,visible_from_utc,visible_until_utc)
+                VALUES(?,?,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,0),?,COALESCE(?,''),COALESCE(?,''),COALESCE(?,'' ))
                 ON CONFLICT(tenant_id,product_id) DO UPDATE SET
                 category_id=excluded.category_id,title=excluded.title,description=excluded.description,
                 price_minor=excluded.price_minor,currency=excluded.currency,delivery_mode=excluded.delivery_mode,
                 delivery_payload=excluded.delivery_payload,enabled=excluded.enabled,terms_text=excluded.terms_text,
                 image_url=CASE WHEN ? IS NULL THEN manual_products.image_url ELSE excluded.image_url END,
+                visible_from_utc=CASE WHEN ? IS NULL THEN manual_products.visible_from_utc ELSE excluded.visible_from_utc END,
+                visible_until_utc=CASE WHEN ? IS NULL THEN manual_products.visible_until_utc ELSE excluded.visible_until_utc END,
                 max_purchases_per_customer=CASE WHEN ? IS NULL THEN manual_products.max_purchases_per_customer
                     ELSE excluded.max_purchases_per_customer END,
                 sort_order=CASE WHEN ? IS NULL THEN manual_products.sort_order ELSE excluded.sort_order END,
                 updated_at=CURRENT_TIMESTAMP""",
                 (self.tenant_id,product_id.strip(),category_id,title.strip()[:160],description[:4000],price_minor,currency,
                  delivery_mode,delivery_payload[:12000],int(enabled),max_purchases_per_customer,sort_order,terms_text.strip(),
-                 image_url,image_url,max_purchases_per_customer,sort_order))
+                 image_url,visible_from_utc,visible_until_utc,image_url,visible_from_utc,visible_until_utc,
+                 max_purchases_per_customer,sort_order))
 
-    def add_manual_inventory_key(self, *, product_id: str, secret_payload: str) -> int:
+    @staticmethod
+    def _effective_manual_variant_delivery(product: dict[str, Any], variant: dict[str, Any] | None = None) -> tuple[str, str]:
+        mode_value = variant.get("delivery_mode") if variant else None
+        payload_value = variant.get("delivery_payload") if variant else None
+        mode = str(mode_value or product["delivery_mode"])
+        payload = str(payload_value if payload_value is not None else (product.get("delivery_payload") or ""))
+        if mode not in {"instant", "manual", "inventory"}:
+            raise CustomerStoreError("Variant delivery mode is invalid")
+        if mode == "instant" and not payload.strip():
+            raise CustomerStoreError("Instant variant delivery requires a non-empty effective payload")
+        return mode, payload
+
+    def manual_variant_delivery(self, product_id: str, variant_id: str) -> dict[str, str]:
+        product = self.get_manual_product(product_id, enabled_only=False)
+        variant = self.get_manual_variant(product_id, variant_id, enabled_only=False)
+        if not product or not variant:
+            raise CustomerStoreError("Manual product variant not found")
+        mode, payload = self._effective_manual_variant_delivery(product, variant)
+        return {"delivery_mode": mode, "delivery_payload": payload}
+
+    @staticmethod
+    def _manual_variant_quote_hash(*, product_id: str, variant_id: str, product_title: str,
+                                   variant_title: str, price_minor: int, currency: str,
+                                   terms_text: str, delivery_mode: str,
+                                   delivery_payload: str) -> str:
+        # Bind confirmation to delivery configuration without exposing payload in callback data.
+        payload_digest = hashlib.sha256(delivery_payload.encode("utf-8")).hexdigest()
+        material = "\0".join((product_id, variant_id, product_title, variant_title,
+                                 str(price_minor), currency, terms_text.strip(),
+                                 delivery_mode, payload_digest))
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()[:10]
+
+    def manual_variant_quote_hash(self, product_id: str, variant_id: str) -> str:
+        product = self.get_manual_product(product_id, enabled_only=True)
+        variant = self.get_manual_variant(product_id, variant_id, enabled_only=True)
+        if not product or not variant:
+            raise CustomerStoreError("این نوع محصول دیگر در دسترس نیست")
+        delivery_mode, delivery_payload = self._effective_manual_variant_delivery(product, variant)
+        return self._manual_variant_quote_hash(product_id=product_id, variant_id=variant_id,
+            product_title=str(product["title"]), variant_title=str(variant["title"]),
+            price_minor=int(variant["price_minor"]), currency=str(product["currency"]),
+            terms_text=str(product.get("terms_text") or ""),
+            delivery_mode=delivery_mode, delivery_payload=delivery_payload)
+
+    def put_manual_variant(self, *, product_id: str, variant_id: str, title: str,
+                           price_minor: int, enabled: bool = True,
+                           delivery_mode: str | None = None, delivery_payload: str | None = None,
+                           delivery_config_provided: bool = False) -> None:
+        self._ensure_manual_shop_tables()
+        product_id, variant_id, title = product_id.strip(), variant_id.strip(), title.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", product_id) or not re.fullmatch(r"[A-Za-z0-9_-]{1,18}", variant_id):
+            raise CustomerStoreError("Product ID must be at most 20 characters and variant ID at most 18; use ASCII letters, digits, _ or -")
+        if not title or len(title) > 100:
+            raise CustomerStoreError("Variant title must contain 1–100 characters")
+        if isinstance(price_minor, bool) or not isinstance(price_minor, int) or not 0 < price_minor <= 2**63-1:
+            raise CustomerStoreError("Variant price must be a positive integer")
+        with self._connect() as db:
+            product_row = db.execute("SELECT * FROM manual_products WHERE tenant_id=? AND product_id=? AND enabled=1",
+                                     (self.tenant_id, product_id)).fetchone()
+            if not product_row:
+                raise CustomerStoreError("Active manual product not found")
+            product = dict(product_row)
+            existing_variant = db.execute("SELECT * FROM manual_product_variants WHERE tenant_id=? AND product_id=? AND variant_id=?",
+                                          (self.tenant_id, product_id, variant_id)).fetchone()
+            if delivery_config_provided:
+                if delivery_mode is not None and delivery_mode not in {"instant", "manual", "inventory"}:
+                    raise CustomerStoreError("Variant delivery mode must be instant, inventory, manual or inherited")
+                if delivery_payload is not None and (not isinstance(delivery_payload, str) or len(delivery_payload) > 12000):
+                    raise CustomerStoreError("Variant delivery payload must be text of at most 12000 characters")
+                mode_for_validation = delivery_mode or product["delivery_mode"]
+                payload_for_validation = delivery_payload if delivery_payload is not None else str(product.get("delivery_payload") or "")
+                if mode_for_validation == "instant" and not payload_for_validation.strip():
+                    raise CustomerStoreError("Instant variant delivery requires a non-empty effective payload")
+                stored_delivery_mode, stored_delivery_payload = delivery_mode, delivery_payload
+            elif existing_variant:
+                stored_delivery_mode = existing_variant["delivery_mode"]
+                stored_delivery_payload = existing_variant["delivery_payload"]
+            else:
+                stored_delivery_mode = stored_delivery_payload = None
+            if not existing_variant:
+                base_stock = int(db.execute("SELECT COUNT(*) FROM manual_product_inventory WHERE tenant_id=? AND product_id=? AND variant_id='' AND status='available'",
+                                            (self.tenant_id, product_id)).fetchone()[0])
+                if base_stock:
+                    raise CustomerStoreError("Sell or clear the existing unassigned inventory before adding variants; existing keys cannot be safely assigned to a variant automatically")
+            db.execute("""INSERT INTO manual_product_variants
+                (tenant_id,product_id,variant_id,title,price_minor,enabled,delivery_mode,delivery_payload)
+                VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(tenant_id,product_id,variant_id) DO UPDATE SET
+                title=excluded.title,price_minor=excluded.price_minor,enabled=excluded.enabled,
+                delivery_mode=excluded.delivery_mode,delivery_payload=excluded.delivery_payload,
+                updated_at=CURRENT_TIMESTAMP""",
+                (self.tenant_id, product_id, variant_id, title, price_minor, int(bool(enabled)),
+                 stored_delivery_mode, stored_delivery_payload))
+
+    def list_manual_variants(self, product_id: str, *, enabled_only: bool = True) -> list[dict[str, Any]]:
+        self._ensure_manual_shop_tables()
+        sql = "SELECT variant_id,product_id,title,price_minor,enabled,delivery_mode FROM manual_product_variants WHERE tenant_id=? AND product_id=?"
+        args: tuple[Any, ...] = (self.tenant_id, product_id)
+        if enabled_only:
+            sql += " AND enabled=1 AND EXISTS (SELECT 1 FROM manual_products p WHERE p.tenant_id=manual_product_variants.tenant_id AND p.product_id=manual_product_variants.product_id AND p.enabled=1)"
+        sql += " ORDER BY variant_id"
+        with self._connect() as db:
+            return [dict(row) for row in db.execute(sql, args).fetchall()]
+
+    def get_manual_variant(self, product_id: str, variant_id: str, *, enabled_only: bool = True) -> dict[str, Any] | None:
+        self._ensure_manual_shop_tables()
+        sql = "SELECT * FROM manual_product_variants WHERE tenant_id=? AND product_id=? AND variant_id=?"
+        args: tuple[Any, ...] = (self.tenant_id, product_id, variant_id)
+        if enabled_only:
+            sql += " AND enabled=1 AND EXISTS (SELECT 1 FROM manual_products p WHERE p.tenant_id=manual_product_variants.tenant_id AND p.product_id=manual_product_variants.product_id AND p.enabled=1)"
+        with self._connect() as db:
+            row = db.execute(sql, args).fetchone()
+        return dict(row) if row else None
+
+    def add_manual_inventory_key(self, *, product_id: str, secret_payload: str, variant_id: str = "") -> int:
         self._ensure_manual_shop_tables()
         if not secret_payload.strip() or len(secret_payload) > 12000:
             raise CustomerStoreError("Inventory key must be non-empty and at most 12000 characters")
+        variant_id = variant_id.strip()
         with self._connect() as db:
-            product=db.execute("SELECT delivery_mode FROM manual_products WHERE tenant_id=? AND product_id=? AND enabled=1",
-                               (self.tenant_id,product_id)).fetchone()
-            if not product: raise CustomerStoreError("Active manual product not found")
-            if product["delivery_mode"] != "inventory": raise CustomerStoreError("Product must use inventory delivery mode")
+            product_row=db.execute("SELECT * FROM manual_products WHERE tenant_id=? AND product_id=? AND enabled=1",
+                                   (self.tenant_id,product_id)).fetchone()
+            if not product_row: raise CustomerStoreError("Active manual product not found")
+            product = dict(product_row)
+            if variant_id:
+                variant_row = db.execute("SELECT * FROM manual_product_variants WHERE tenant_id=? AND product_id=? AND variant_id=? AND enabled=1",
+                                         (self.tenant_id, product_id, variant_id)).fetchone()
+                if not variant_row:
+                    raise CustomerStoreError("Active product variant not found")
+                mode, _ = self._effective_manual_variant_delivery(product, dict(variant_row))
+            else:
+                if db.execute("SELECT 1 FROM manual_product_variants WHERE tenant_id=? AND product_id=? AND enabled=1 LIMIT 1",
+                              (self.tenant_id, product_id)).fetchone():
+                    raise CustomerStoreError("Specify a variant ID when adding inventory to a product with variants")
+                mode = str(product["delivery_mode"])
+            if mode != "inventory":
+                raise CustomerStoreError("Selected product or variant must use inventory delivery mode")
             try:
-                cur=db.execute("INSERT INTO manual_product_inventory(tenant_id,product_id,secret_payload) VALUES(?,?,?)",
-                               (self.tenant_id,product_id,secret_payload.strip()))
+                cur=db.execute("INSERT INTO manual_product_inventory(tenant_id,product_id,secret_payload,variant_id) VALUES(?,?,?,?)",
+                               (self.tenant_id,product_id,secret_payload.strip(),variant_id))
             except sqlite3.IntegrityError:
                 raise CustomerStoreError("This key is already in inventory") from None
             return int(cur.lastrowid)
 
-    def manual_inventory_count(self, product_id: str) -> int:
+    def manual_inventory_count(self, product_id: str, variant_id: str = "") -> int:
         self._ensure_manual_shop_tables()
         with self._connect() as db:
-            return int(db.execute("SELECT COUNT(*) FROM manual_product_inventory WHERE tenant_id=? AND product_id=? AND status='available'",
-                                  (self.tenant_id,product_id)).fetchone()[0])
+            return int(db.execute("SELECT COUNT(*) FROM manual_product_inventory WHERE tenant_id=? AND product_id=? AND variant_id=? AND status='available'",
+                                  (self.tenant_id,product_id,variant_id)).fetchone()[0])
 
     def list_manual_products(self, *, enabled_only: bool = True,
                              category_id: str | None = None) -> list[dict[str, Any]]:
@@ -945,12 +1173,14 @@ class CustomerDataStore:
             category_id = category_id.strip()
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", category_id):
                 raise CustomerStoreError("Invalid manual product category ID")
-        sql="SELECT product_id,category_id,title,description,terms_text,image_url,price_minor,currency,delivery_mode,enabled,max_purchases_per_customer,sort_order FROM manual_products WHERE tenant_id=?"
+        sql="SELECT product_id,category_id,title,description,terms_text,image_url,visible_from_utc,visible_until_utc,price_minor,currency,delivery_mode,enabled,max_purchases_per_customer,sort_order FROM manual_products WHERE tenant_id=?"
         args: tuple[Any,...]=(self.tenant_id,)
         if enabled_only:
             sql += """ AND enabled=1 AND (category_id='' OR EXISTS (
                 SELECT 1 FROM customer_categories c WHERE c.tenant_id=manual_products.tenant_id
-                AND c.category_id=manual_products.category_id AND c.enabled=1))"""
+                AND c.category_id=manual_products.category_id AND c.enabled=1))
+                AND (visible_from_utc='' OR visible_from_utc<=strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                AND (visible_until_utc='' OR visible_until_utc>strftime('%Y-%m-%dT%H:%M:%SZ','now'))"""
         if category_id is not None:
             sql += " AND category_id=?"
             args += (category_id,)
@@ -964,13 +1194,16 @@ class CustomerDataStore:
         if enabled_only:
             sql += """ AND enabled=1 AND (category_id='' OR EXISTS (
                 SELECT 1 FROM customer_categories c WHERE c.tenant_id=manual_products.tenant_id
-                AND c.category_id=manual_products.category_id AND c.enabled=1))"""
+                AND c.category_id=manual_products.category_id AND c.enabled=1))
+                AND (visible_from_utc='' OR visible_from_utc<=strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                AND (visible_until_utc='' OR visible_until_utc>strftime('%Y-%m-%dT%H:%M:%SZ','now'))"""
         with self._connect() as db:
             row=db.execute(sql,args).fetchone()
         return dict(row) if row else None
 
     def buy_manual_product(self, *, telegram_id: int, product_id: str, idempotency_key: str,
-                           expected_terms_hash: str | None = None) -> dict[str, Any]:
+                           expected_terms_hash: str | None = None, variant_id: str = "",
+                           expected_variant_quote_hash: str | None = None) -> dict[str, Any]:
         self._ensure_manual_shop_tables()
         db=self._connect()
         try:
@@ -978,10 +1211,14 @@ class CustomerDataStore:
             prior=db.execute("SELECT * FROM manual_product_orders WHERE tenant_id=? AND idempotency_key=?",
                              (self.tenant_id,idempotency_key)).fetchone()
             if prior:
-                if int(prior["telegram_id"]) != telegram_id or prior["product_id"] != product_id:
+                if (int(prior["telegram_id"]) != telegram_id or prior["product_id"] != product_id
+                        or str(prior["variant_id_snapshot"] or "") != variant_id):
                     raise CustomerStoreError("Manual product idempotency key reused")
                 result = dict(prior)
-                result["title"] = result.get("product_title_snapshot") or result["product_id"]
+                base_title = result.get("product_title_snapshot") or result["product_id"]
+                variant_title = str(result.get("variant_title_snapshot") or "")
+                result["title"] = f"{base_title} — {variant_title}" if variant_title else base_title
+                result["variant_id"] = str(result.get("variant_id_snapshot") or "")
                 result["delivery_mode"] = result.get("delivery_mode_snapshot") or "manual"
                 result["idempotent_replay"] = True
                 db.commit()
@@ -989,12 +1226,33 @@ class CustomerDataStore:
             product=db.execute("""SELECT * FROM manual_products WHERE tenant_id=? AND product_id=? AND enabled=1
                 AND (category_id='' OR EXISTS (SELECT 1 FROM customer_categories c
                     WHERE c.tenant_id=manual_products.tenant_id
-                      AND c.category_id=manual_products.category_id AND c.enabled=1))""",
+                      AND c.category_id=manual_products.category_id AND c.enabled=1))
+                AND (visible_from_utc='' OR visible_from_utc<=strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                AND (visible_until_utc='' OR visible_until_utc>strftime('%Y-%m-%dT%H:%M:%SZ','now'))""",
                 (self.tenant_id,product_id)).fetchone()
             if not product: raise CustomerStoreError("Manual product is unavailable")
+            variant = None
+            if variant_id:
+                variant = db.execute("SELECT * FROM manual_product_variants WHERE tenant_id=? AND product_id=? AND variant_id=? AND enabled=1",
+                                     (self.tenant_id, product_id, variant_id)).fetchone()
+                if not variant:
+                    raise CustomerStoreError("این نوع محصول دیگر در دسترس نیست")
+            elif db.execute("SELECT 1 FROM manual_product_variants WHERE tenant_id=? AND product_id=? AND enabled=1 LIMIT 1",
+                            (self.tenant_id, product_id)).fetchone():
+                raise CustomerStoreError("لطفاً ابتدا یکی از انواع محصول را انتخاب کنید")
+            purchase_price = int(variant["price_minor"] if variant else product["price_minor"])
+            variant_title = str(variant["title"] if variant else "")
+            effective_mode, effective_payload = self._effective_manual_variant_delivery(dict(product), dict(variant) if variant else None)
             current_terms = str(product["terms_text"] or "").strip()
             current_terms_hash = hashlib.sha256(current_terms.encode("utf-8")).hexdigest()[:12]
-            if (current_terms or expected_terms_hash is not None) and expected_terms_hash != current_terms_hash:
+            if variant:
+                current_quote_hash = self._manual_variant_quote_hash(product_id=product_id, variant_id=variant_id,
+                    product_title=str(product["title"]), variant_title=variant_title,
+                    price_minor=purchase_price, currency=str(product["currency"]), terms_text=current_terms,
+                    delivery_mode=effective_mode, delivery_payload=effective_payload)
+                if not expected_variant_quote_hash or expected_variant_quote_hash != current_quote_hash:
+                    raise CustomerStoreError("قیمت، نام یا شرایط این نوع محصول تغییر کرده است؛ تأیید خرید را دوباره باز کنید")
+            elif (current_terms or expected_terms_hash is not None) and expected_terms_hash != current_terms_hash:
                 raise CustomerStoreError("شرایط خرید تغییر کرده یا تأیید نشده است؛ صفحه تأیید خرید را دوباره باز کنید")
             customer=db.execute("SELECT 1 FROM customer_users WHERE tenant_id=? AND telegram_id=?",
                                 (self.tenant_id,telegram_id)).fetchone()
@@ -1011,15 +1269,15 @@ class CustomerDataStore:
                     raise CustomerStoreError("Manual product purchase limit reached")
             balance=int(db.execute("SELECT COALESCE(SUM(amount_minor),0) FROM wallet_ledger WHERE tenant_id=? AND telegram_id=? AND currency=?",
                                    (self.tenant_id,telegram_id,product["currency"])).fetchone()[0])
-            if balance < int(product["price_minor"]): raise CustomerStoreError("Insufficient wallet balance")
+            if balance < purchase_price: raise CustomerStoreError("Insufficient wallet balance")
             order_id=uuid.uuid4().hex
-            mode=product["delivery_mode"]
+            mode=effective_mode
             status="pending_delivery" if mode=="manual" else "fulfilled"
-            payload=product["delivery_payload"] if mode=="instant" else ""
+            payload=effective_payload if mode=="instant" else ""
             inventory_id=None
             if mode == "inventory":
-                key_row=db.execute("SELECT inventory_id,secret_payload FROM manual_product_inventory WHERE tenant_id=? AND product_id=? AND status='available' ORDER BY inventory_id LIMIT 1",
-                                   (self.tenant_id,product_id)).fetchone()
+                key_row=db.execute("SELECT inventory_id,secret_payload FROM manual_product_inventory WHERE tenant_id=? AND product_id=? AND variant_id=? AND status='available' ORDER BY inventory_id LIMIT 1",
+                                   (self.tenant_id,product_id,variant_id)).fetchone()
                 if not key_row: raise CustomerStoreError("Manual product is out of stock; no wallet debit was made")
                 inventory_id=int(key_row["inventory_id"]); payload=str(key_row["secret_payload"])
                 cur=db.execute("UPDATE manual_product_inventory SET status='delivered',order_id=? WHERE tenant_id=? AND inventory_id=? AND status='available'",
@@ -1027,26 +1285,27 @@ class CustomerDataStore:
                 if cur.rowcount != 1: raise CustomerStoreError("Inventory key was already reserved")
             db.execute("""INSERT INTO manual_product_orders
                 (tenant_id,order_id,telegram_id,product_id,amount_minor,currency,status,idempotency_key,
-                 delivery_payload,product_title_snapshot,delivery_mode_snapshot,terms_snapshot)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (self.tenant_id,order_id,telegram_id,product_id,int(product["price_minor"]),product["currency"],
-                 status,idempotency_key,payload,product["title"],mode,current_terms))
+                 delivery_payload,product_title_snapshot,delivery_mode_snapshot,terms_snapshot,variant_id_snapshot,variant_title_snapshot)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (self.tenant_id,order_id,telegram_id,product_id,purchase_price,product["currency"],
+                 status,idempotency_key,payload,product["title"],mode,current_terms,variant_id,variant_title))
             db.execute("""INSERT INTO wallet_ledger(tenant_id,telegram_id,idempotency_key,amount_minor,currency,entry_type,reference,note)
                 VALUES(?,?,?,?,?,?,?,?)""",
-                (self.tenant_id,telegram_id,"manual-product:"+order_id,-int(product["price_minor"]),product["currency"],
+                (self.tenant_id,telegram_id,"manual-product:"+order_id,-purchase_price,product["currency"],
                  "purchase",order_id,"Manual digital product purchase"))
             self._enqueue_admin_notification_in_transaction(db, event_key="purchase",
                 idempotency_key=f"manual-order:{order_id}",
-                payload={"public_order_id": order_id[:20], "product_title": str(product["title"]),
-                         "amount_minor": int(product["price_minor"]), "currency": str(product["currency"]),
+                payload={"public_order_id": order_id[:20], "product_title": (str(product["title"]) + (" — " + variant_title if variant_title else "")),
+                         "amount_minor": purchase_price, "currency": str(product["currency"]),
                          "status": status, "customer_id": telegram_id})
             self._enqueue_admin_notification_in_transaction(db, event_key="wallet",
                 idempotency_key=f"manual-wallet:{order_id}",
-                payload={"amount_minor": -int(product["price_minor"]), "currency": str(product["currency"]),
+                payload={"amount_minor": -purchase_price, "currency": str(product["currency"]),
                          "entry_type": "purchase", "customer_id": telegram_id, "status": "debited"})
-            result={"order_id":order_id,"product_id":product_id,"amount_minor":int(product["price_minor"]),
+            display_title = str(product["title"]) + (" — " + variant_title if variant_title else "")
+            result={"order_id":order_id,"product_id":product_id,"variant_id":variant_id,"amount_minor":purchase_price,
                     "currency":product["currency"],"status":status,"delivery_mode":mode,
-                    "delivery_payload":payload,"title":product["title"],"idempotent_replay":False}
+                    "delivery_payload":payload,"title":display_title,"idempotent_replay":False}
             db.commit(); return result
         except Exception:
             db.rollback(); raise
@@ -1061,7 +1320,8 @@ class CustomerDataStore:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise CustomerStoreError("Manual order limit must be between 1 and 100")
         sql = """SELECT o.order_id,o.telegram_id,o.product_id,
-                        COALESCE(NULLIF(o.product_title_snapshot,''),p.title,o.product_id) AS title,
+                        COALESCE(NULLIF(o.product_title_snapshot,''),p.title,o.product_id) ||
+                            CASE WHEN COALESCE(o.variant_title_snapshot,'')='' THEN '' ELSE ' — ' || o.variant_title_snapshot END AS title,
                         o.amount_minor,o.currency,o.status,o.created_at
                  FROM manual_product_orders o LEFT JOIN manual_products p
                  ON p.tenant_id=o.tenant_id AND p.product_id=o.product_id
@@ -1131,7 +1391,9 @@ class CustomerDataStore:
                 WHERE tenant_id=? AND status='processing' AND claimed_at IS NOT NULL AND claimed_at<=?""",
                 (ts, self.tenant_id, ts - lease_seconds))
             rows = db.execute("""SELECT n.notification_id,n.tenant_id,n.order_id,n.attempts,
-                    o.telegram_id,o.product_id,o.delivery_payload,o.product_title_snapshot
+                    o.telegram_id,o.product_id,o.delivery_payload,
+                    COALESCE(NULLIF(o.product_title_snapshot,''),o.product_id) ||
+                        CASE WHEN COALESCE(o.variant_title_snapshot,'')='' THEN '' ELSE ' — ' || o.variant_title_snapshot END AS product_title_snapshot
                 FROM manual_delivery_notifications n
                 JOIN manual_product_orders o ON o.tenant_id=n.tenant_id AND o.order_id=n.order_id
                 WHERE n.tenant_id=? AND n.status='pending' AND n.available_at<=? AND o.status='fulfilled'
@@ -1335,6 +1597,136 @@ class CustomerDataStore:
             result.append(item)
         result.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("order_id") or "")), reverse=True)
         return result[:limit]
+
+    def get_product_order_reconciliation(self, order_id: str) -> dict[str, Any] | None:
+        """Read one tenant-scoped panel product order for recovery review."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM customer_orders WHERE tenant_id=? AND order_id=?",
+                (self.tenant_id, order_id),
+            ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        try:
+            snapshot = json.loads(result.get("product_snapshot_json") or "{}")
+        except (TypeError, ValueError):
+            snapshot = {}
+        result["product_snapshot"] = snapshot if isinstance(snapshot, dict) else {}
+        result["reconciliation_intent"] = result["product_snapshot"].get("_provisioning_intent")
+        return result
+
+    def list_product_order_reconciliation(self, *, status: str = "reconcile_required",
+                                          limit: int = 50) -> list[dict[str, Any]]:
+        """List ambiguous panel-backed product orders without returning private provisioning payloads."""
+        if status not in {"reconcile_required", "all"}:
+            raise CustomerStoreError("Unsupported product order filter")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise CustomerStoreError("Invalid product order list limit")
+        sql = """SELECT order_id,telegram_id,product_id,amount_minor,currency,status,provider_reference,
+                        product_snapshot_json,created_at,updated_at
+                 FROM customer_orders WHERE tenant_id=?
+                   AND provider_reference LIKE 'reconcile_required:%'"""
+        args: tuple[Any, ...] = (self.tenant_id,)
+        if status == "reconcile_required":
+            sql += " AND status='provisioning'"
+        sql += " ORDER BY updated_at,order_id LIMIT ?"
+        args += (limit,)
+        with self._connect() as db:
+            rows = db.execute(sql, args).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                snapshot = json.loads(item.pop("product_snapshot_json") or "{}")
+            except (TypeError, ValueError):
+                snapshot = {}
+            item["title"] = str(snapshot.get("title") or item["product_id"])
+            item["has_provisioning_intent"] = isinstance(snapshot.get("_provisioning_intent"), dict)
+            result.append(item)
+        return result
+
+    def list_product_order_reconciliation_events(self, order_id: str) -> list[dict[str, Any]]:
+        """Read tenant-scoped immutable operator evidence for one order."""
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT event_id,order_id,event_type,actor_telegram_id,provider_kind,
+                          provider_user_id,username,comparison,evidence_json,reason,created_at
+                   FROM customer_product_order_reconciliation_events
+                   WHERE tenant_id=? AND order_id=? ORDER BY event_id""",
+                (self.tenant_id, order_id),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+            except (TypeError, ValueError):
+                item["evidence"] = {}
+            result.append(item)
+        return result
+
+    def is_product_provider_identity_claimed(self, *, panel_id: str, provider_user_id: str,
+                                             username: str, excluding_service_id: str = "") -> bool:
+        """Avoid binding one provider identity to multiple local services in this tenant."""
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT 1 FROM customer_services
+                   WHERE tenant_id=? AND panel_id=?
+                     AND service_id<>?
+                     AND ((?<>'' AND provider_user_id=?) OR (?<>'' AND username=?))
+                   LIMIT 1""",
+                (self.tenant_id, panel_id, excluding_service_id,
+                 provider_user_id, provider_user_id, username, username),
+            ).fetchone()
+        return row is not None
+
+    def record_product_order_provisioning_intent(self, *, order_id: str,
+                                                  intent: dict[str, Any]) -> None:
+        """Persist exact create/service intent and mark the no-retry reconciliation boundary before provider I/O."""
+        if not isinstance(intent, dict) or intent.get("version") != 1:
+            raise CustomerStoreError("Invalid product provisioning intent")
+        username = intent.get("username")
+        binding = intent.get("provider_binding")
+        service_product = intent.get("service_product")
+        if (not isinstance(username, str) or not username or len(username) > 128
+                or not isinstance(binding, dict) or not isinstance(service_product, dict)):
+            raise CustomerStoreError("Product provisioning intent is incomplete")
+        encoded_intent = json.dumps(intent, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT status,provider_reference,product_snapshot_json FROM customer_orders WHERE tenant_id=? AND order_id=?",
+                (self.tenant_id, order_id),
+            ).fetchone()
+            if not row:
+                raise CustomerStoreError("Order not found")
+            if row["status"] != "provisioning":
+                raise CustomerStoreError("Order is not awaiting provider provisioning")
+            snapshot = json.loads(row["product_snapshot_json"] or "{}")
+            if not isinstance(snapshot, dict):
+                raise CustomerStoreError("Stored product snapshot is invalid")
+            prior_intent = snapshot.get("_provisioning_intent")
+            if prior_intent is not None:
+                prior_encoded = json.dumps(prior_intent, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                if prior_encoded != encoded_intent:
+                    raise CustomerStoreError("Provisioning intent is immutable once recorded")
+            elif str(row["provider_reference"] or "").strip():
+                raise CustomerStoreError("Order already contains a provider reconciliation marker")
+            snapshot["_provisioning_intent"] = intent
+            db.execute(
+                """UPDATE customer_orders SET product_snapshot_json=?,
+                   provider_reference='reconcile_required:provider_create_started',updated_at=CURRENT_TIMESTAMP
+                   WHERE tenant_id=? AND order_id=? AND status='provisioning'""",
+                (json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")), self.tenant_id, order_id),
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     def list_products(self, panel_id: str | None = None, category_id: str | None = None) -> list[dict[str, Any]]:
         sql = """SELECT p.product_id,p.category_id,p.title,p.description,p.price_minor,p.currency,p.duration_hours,
@@ -2886,6 +3278,233 @@ class CustomerDataStore:
             db.commit()
         except Exception:
             db.rollback(); raise
+        finally:
+            db.close()
+
+    def resolve_product_order_target_present(self, *, order_id: str, actor_telegram_id: int,
+                                             provider_kind: str, provider_user_id: str, username: str,
+                                             subscription_url: str | None, evidence: dict[str, Any],
+                                             comparison: str, identity_verified: bool, reason: str,
+                                             now: int) -> dict[str, Any]:
+        """Atomically attach a freshly inspected existing provider target to its reserved order."""
+        reason = reason.strip()
+        provider_kind = provider_kind.strip().lower()
+        provider_user_id = str(provider_user_id or "").strip()
+        username = str(username or "").strip()
+        if not 1 <= len(reason) <= 500:
+            raise CustomerStoreError("A decision reason of 1..500 characters is required")
+        if (isinstance(actor_telegram_id, bool) or not isinstance(actor_telegram_id, int)
+                or actor_telegram_id <= 0):
+            raise CustomerStoreError("A valid operator Telegram ID is required")
+        if provider_kind not in {"pasarguard", "rebecca", "sanaei"}:
+            raise CustomerStoreError("Unsupported provider for product-order reconciliation")
+        if (not provider_user_id or len(provider_user_id) > 256
+                or not username or len(username) > 128):
+            raise CustomerStoreError("Observed provider identity is incomplete")
+        if comparison != "target_present" or identity_verified is not True:
+            raise CustomerStoreError("Only a fresh identity-verified target_present result can be finalized")
+        if not isinstance(evidence, dict):
+            raise CustomerStoreError("Reconciliation evidence is invalid")
+        safe_evidence = dict(evidence)
+        # Never persist full subscription URLs, credential material, or arbitrary provider response bodies.
+        safe_evidence.pop("subscription_url", None)
+        evidence_json = json.dumps(safe_evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if subscription_url is not None and (
+            not isinstance(subscription_url, str) or len(subscription_url) > 4096
+            or any(ord(ch) < 32 for ch in subscription_url)
+        ):
+            raise CustomerStoreError("Observed subscription URL is invalid")
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            order = db.execute(
+                "SELECT * FROM customer_orders WHERE tenant_id=? AND order_id=?",
+                (self.tenant_id, order_id),
+            ).fetchone()
+            if not order:
+                raise CustomerStoreError("Product order not found")
+            prior_event = db.execute(
+                "SELECT * FROM customer_product_order_reconciliation_events WHERE tenant_id=? AND order_id=?",
+                (self.tenant_id, order_id),
+            ).fetchone()
+            if prior_event:
+                matches = (
+                    int(prior_event["actor_telegram_id"]) == actor_telegram_id
+                    and str(prior_event["provider_user_id"]) == provider_user_id
+                    and str(prior_event["username"]) == username
+                    and str(prior_event["reason"]) == reason
+                    and str(prior_event["evidence_json"]) == evidence_json
+                )
+                if matches and order["status"] == "active":
+                    existing = db.execute(
+                        "SELECT telegram_id,product_id,panel_id,provider_user_id,username FROM customer_services "
+                        "WHERE tenant_id=? AND service_id=?",
+                        (self.tenant_id, order_id),
+                    ).fetchone()
+                    if (existing and int(existing["telegram_id"]) == int(order["telegram_id"])
+                            and str(existing["product_id"]) == str(order["product_id"])
+                            and str(existing["provider_user_id"]) == provider_user_id
+                            and str(existing["username"]) == username):
+                        db.commit()
+                        return {"order_id": order_id, "event_type": "operator_finalized_target_present",
+                                "actor_telegram_id": actor_telegram_id, "provider_user_id": provider_user_id,
+                                "username": username, "comparison": comparison, "reason": reason,
+                                "idempotent_replay": True}
+                raise CustomerStoreError("A final product-order reconciliation decision is already recorded")
+            if (order["status"] != "provisioning"
+                    or not str(order["provider_reference"] or "").startswith("reconcile_required:")):
+                raise CustomerStoreError("Order is not awaiting product provisioning reconciliation")
+            try:
+                product_snapshot = json.loads(order["product_snapshot_json"] or "{}")
+            except (TypeError, ValueError):
+                product_snapshot = {}
+            intent = product_snapshot.get("_provisioning_intent") if isinstance(product_snapshot, dict) else None
+            if not isinstance(intent, dict) or intent.get("version") != 1:
+                raise CustomerStoreError("Order has no complete persisted provisioning intent; manual review is required")
+            binding = intent.get("provider_binding")
+            service_product = intent.get("service_product")
+            if not isinstance(binding, dict) or not isinstance(service_product, dict):
+                raise CustomerStoreError("Stored provisioning intent is incomplete")
+            expected_panel_id = str(service_product.get("panel_id") or "")
+            if (str(intent.get("username") or "") != username
+                    or str(binding.get("provider_kind") or "") != provider_kind
+                    or str(binding.get("panel_id") or "") != expected_panel_id
+                    or str(product_snapshot.get("panel_id") or "") != expected_panel_id):
+                raise CustomerStoreError("Observed provider identity or panel binding does not match the stored order")
+            if str(service_product.get("product_id") or "") != str(order["product_id"]):
+                raise CustomerStoreError("Stored service snapshot does not match the order product")
+            # Sanaei's normalized provider_user_id is the client username; the actual
+            # protocol UUID/password is exposed separately as metadata.uuid by the adapter.
+            expected_extra = intent.get("extra") if isinstance(intent.get("extra"), dict) else {}
+            observed_status = str(safe_evidence.get("observed_status") or "").strip().lower()
+            if observed_status not in {"active", "enabled", "true", "1"}:
+                raise CustomerStoreError("Observed provider status is not active")
+            expected_limit = intent.get("data_limit_bytes")
+            observed_limit = safe_evidence.get("observed_data_limit_bytes")
+            try:
+                if expected_limit is None:
+                    limit_matches = observed_limit in (None, 0)
+                else:
+                    limit_matches = observed_limit is not None and int(observed_limit) == int(expected_limit)
+            except (TypeError, ValueError, OverflowError):
+                limit_matches = False
+            if not limit_matches:
+                raise CustomerStoreError("Observed provider data limit does not match the stored create intent")
+            expected_expiry = intent.get("expire_at")
+            observed_expiry = safe_evidence.get("observed_expire_at")
+            if expected_expiry is None:
+                expiry_matches = observed_expiry is None
+            else:
+                from datetime import datetime, timezone
+                try:
+                    expected_dt = datetime.fromisoformat(str(expected_expiry))
+                    observed_dt = datetime.fromisoformat(str(observed_expiry))
+                    if expected_dt.tzinfo is None:
+                        expected_dt = expected_dt.replace(tzinfo=timezone.utc)
+                    if observed_dt.tzinfo is None:
+                        observed_dt = observed_dt.replace(tzinfo=timezone.utc)
+                    expiry_matches = (expected_dt.astimezone(timezone.utc).replace(microsecond=0)
+                                      == observed_dt.astimezone(timezone.utc).replace(microsecond=0))
+                except (TypeError, ValueError):
+                    expiry_matches = False
+            if not expiry_matches:
+                raise CustomerStoreError("Observed provider expiry does not match the stored create intent")
+            observed_metadata = safe_evidence.get("observed_metadata")
+            observed_metadata = observed_metadata if isinstance(observed_metadata, dict) else {}
+            if provider_kind == "sanaei":
+                if (not expected_extra.get("uuid_sha256")
+                        or str(observed_metadata.get("uuid_sha256") or "") != str(expected_extra.get("uuid_sha256") or "")):
+                    raise CustomerStoreError("Observed Sanaei client ID does not match the persisted create intent")
+                expected_sub_hash = str(expected_extra.get("sub_id_sha256") or "")
+                observed_sub_hash = str(observed_metadata.get("sub_id_sha256") or "")
+                if expected_sub_hash != observed_sub_hash:
+                    raise CustomerStoreError("Observed Sanaei subscription ID does not match the persisted create intent")
+            if provider_kind == "rebecca":
+                expected_service_id = expected_extra.get("service_id")
+                observed_service_id = observed_metadata.get("service_id")
+                if expected_service_id is None or str(observed_service_id) != str(expected_service_id):
+                    raise CustomerStoreError("Observed Rebecca service ID does not match the persisted create intent")
+            if provider_kind == "pasarguard":
+                expected_groups = sorted(int(x) for x in (intent.get("group_ids") or []))
+                observed_groups = observed_metadata.get("group_ids")
+                if not isinstance(observed_groups, list) or sorted(int(x) for x in observed_groups) != expected_groups:
+                    raise CustomerStoreError("Observed PasarGuard group IDs do not match the persisted create intent")
+            if provider_kind == "sanaei":
+                expected_inbounds = sorted(int(x) for x in (expected_extra.get("inbound_ids") or []))
+                observed_inbounds = observed_metadata.get("inbound_ids")
+                if not isinstance(observed_inbounds, list) or sorted(int(x) for x in observed_inbounds) != expected_inbounds:
+                    raise CustomerStoreError("Observed Sanaei inbound IDs do not match the persisted create intent")
+            claimed = db.execute(
+                """SELECT service_id FROM customer_services
+                   WHERE tenant_id=? AND panel_id=? AND service_id<>?
+                     AND ((provider_user_id<>'' AND provider_user_id=?) OR (username<>'' AND username=?))
+                   LIMIT 1""",
+                (self.tenant_id, expected_panel_id, order_id, provider_user_id, username),
+            ).fetchone()
+            if claimed:
+                raise CustomerStoreError("Provider identity is already attached to another local service")
+            if subscription_url is not None and not subscription_url.strip():
+                subscription_url = None
+            product = dict(service_product)
+            mode = str(product.get("pricing_mode", "fixed"))
+            billing_status = "active" if mode in {"hourly", "usage"} else "not_metered"
+            existing = db.execute(
+                """SELECT * FROM customer_services WHERE tenant_id=? AND service_id=?""",
+                (self.tenant_id, order_id),
+            ).fetchone()
+            if not existing:
+                db.execute(
+                    """INSERT INTO customer_services
+                       (tenant_id,service_id,telegram_id,product_id,panel_id,provider_user_id,username,
+                        subscription_url,reseller_account_id,status,expires_at,traffic_limit_bytes,
+                        traffic_used_bytes,pricing_mode,currency,unit_price_minor,billing_last_at,
+                        billed_traffic_bytes,fractional_carry,billing_status,provider_checked_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                    (self.tenant_id, order_id, int(order["telegram_id"]), str(product.get("product_id") or ""),
+                     expected_panel_id, provider_user_id, username, subscription_url or "",
+                     str(order["reseller_account_id"] or ""), product.get("expires_at"),
+                     int(product.get("traffic_bytes", 0) or 0), 0, mode, str(product.get("currency") or order["currency"]),
+                     int(product.get("unit_price_minor", 0) or 0), int(intent.get("service_created_at") or now),
+                     0, "0", billing_status),
+                )
+                existing = db.execute(
+                    "SELECT * FROM customer_services WHERE tenant_id=? AND service_id=?",
+                    (self.tenant_id, order_id),
+                ).fetchone()
+            if (not existing or int(existing["telegram_id"]) != int(order["telegram_id"])
+                    or str(existing["product_id"]) != str(order["product_id"])
+                    or str(existing["panel_id"] or "") != expected_panel_id
+                    or str(existing["provider_user_id"] or "") != provider_user_id
+                    or str(existing["username"] or "") != username
+                    or str(existing["reseller_account_id"] or "") != str(order["reseller_account_id"] or "")
+                    or str(existing["status"]) != "active"):
+                raise CustomerStoreError("Existing local service conflicts with the observed provider target")
+            db.execute(
+                """UPDATE customer_orders SET status='active',provider_reference=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE tenant_id=? AND order_id=? AND status='provisioning'""",
+                (provider_user_id[:256], self.tenant_id, order_id),
+            )
+            self._enqueue_trust_event_in_transaction(
+                db, event_type="new_subscription", idempotency_key=f"purchase:{order_id}",
+                payload={"public_order_id": order_id[:20], "amount_minor": int(order["amount_minor"]),
+                         "currency": str(order["currency"])},
+            )
+            db.execute(
+                """INSERT INTO customer_product_order_reconciliation_events
+                   (tenant_id,order_id,event_type,actor_telegram_id,provider_kind,provider_user_id,
+                    username,comparison,evidence_json,reason)
+                   VALUES(?,?,'operator_finalized_target_present',?,?,?,?, 'target_present',?,?)""",
+                (self.tenant_id, order_id, actor_telegram_id, provider_kind, provider_user_id,
+                 username, evidence_json, reason),
+            )
+            db.commit()
+            return {"order_id": order_id, "event_type": "operator_finalized_target_present",
+                    "actor_telegram_id": actor_telegram_id, "provider_user_id": provider_user_id,
+                    "username": username, "comparison": comparison, "reason": reason,
+                    "idempotent_replay": False}
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.close()
 

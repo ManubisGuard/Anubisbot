@@ -101,7 +101,9 @@ ADMIN_ONLY_COMMANDS = frozenset({
     "/wallet-credit", "/payment-events", "/trust-channel", "/trust-channel-status",
     "/panel", "/panel-enable", "/panels", "/panel-check", "/panel-roles",
     "/discount", "/category", "/categories", "/service-operations", "/service-operation",
-    "/service-operation-check", "/service-operation-finalize", "/backup-policy", "/notify-route",
+    "/service-operation-check", "/service-operation-finalize",
+    "/product-orders", "/product-order", "/product-order-check", "/product-order-finalize",
+    "/backup-policy", "/notify-route",
     "/admin-notifications", "/admin-notification-retry", "/ticket-notification-retry",
     "/manual-key", "/manual-orders", "/manual-fulfill", "/manual-notification-retry",
     "/manual-product", "/product", "/reseller-plan", "/reseller-plans",
@@ -785,6 +787,130 @@ class CustomerBot:
             except CustomerStoreError as exc:
                 await self.api.send_text(chat_id, f"نهایی‌سازی انجام نشد؛ عملیات و رزرو وجه حفظ شدند: {exc}", ADMIN_MENU)
             return
+        if is_admin and command == "/product-orders":
+            parts = text.split()
+            status_filter = parts[1].strip().lower() if len(parts) == 2 else "reconcile_required"
+            try:
+                orders = self.data.list_product_order_reconciliation(status=status_filter, limit=50)
+                lines = [f"🧾 سفارش‌های پنلی نیازمند تطبیق — فیلتر: {status_filter}"]
+                for order in orders:
+                    marker = str(order.get("provider_reference") or "")
+                    reason = marker.partition(":")[2] if marker.startswith("reconcile_required:") else marker
+                    intent_state = "intent ثبت‌شده" if order.get("has_provisioning_intent") else "بدون intent کامل؛ نهایی‌سازی خودکارمجاز نیست"
+                    lines.append(
+                        f"• {order['order_id']} — {order.get('title') or order['product_id']} — "
+                        f"کاربر {order['telegram_id']} — {int(order['amount_minor']):,} {order['currency']} — "
+                        f"{order['status']} — علت: {reason or 'نامشخص'} — {intent_state}"
+                    )
+                if not orders:
+                    lines.append("سفارش مبهمی برای بررسی پیدا نشد.")
+                lines.append("\nجزئیات: /product-order ORDER_ID")
+                lines.append("بررسی فقط‌خواندنی پنل: /product-order-check ORDER_ID")
+                lines.append("نهایی‌سازی پس از تطبیق تازه: /product-order-finalize ORDER_ID | دلیل تصمیم")
+                lines.append("هیچ ساخت مجددی در پنل یا بازپرداخت خودکار انجام نمی‌شود.")
+                await self.api.send_text(chat_id, "\n".join(lines), ADMIN_MENU)
+            except CustomerStoreError as exc:
+                await self.api.send_text(chat_id, f"فهرست سفارش‌های بازیابی خوانده نشد: {exc}", ADMIN_MENU)
+            return
+        if is_admin and command == "/product-order":
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2 or not parts[1].strip():
+                await self.api.send_text(chat_id, "فرمت: /product-order ORDER_ID", ADMIN_MENU)
+                return
+            order = self.data.get_product_order_reconciliation(parts[1].strip())
+            if not order:
+                await self.api.send_text(chat_id, "سفارش پیدا نشد.", ADMIN_MENU)
+                return
+            snapshot = order.get("product_snapshot") if isinstance(order.get("product_snapshot"), dict) else {}
+            intent = snapshot.get("_provisioning_intent") if isinstance(snapshot.get("_provisioning_intent"), dict) else {}
+            binding = intent.get("provider_binding") if isinstance(intent.get("provider_binding"), dict) else {}
+            lines = [
+                f"🧾 سفارش: {order['order_id']}",
+                f"محصول: {snapshot.get('title') or order['product_id']} ({order['product_id']})",
+                f"مشتری: {order['telegram_id']}",
+                f"وضعیت: {order['status']}",
+                f"مبلغ: {int(order['amount_minor']):,} {order['currency']}",
+                f"نشانگر بازیابی: {str(order.get('provider_reference') or 'ثبت نشده')}",
+                f"intent پایدار: {'بله' if intent.get('version') == 1 else 'خیر'}",
+            ]
+            if intent:
+                lines.extend([
+                    f"نام کاربری مورد انتظار: {intent.get('username') or 'نامشخص'}",
+                    f"پنل: {binding.get('panel_id') or 'نامشخص'}",
+                    f"نوع پنل: {binding.get('provider_kind') or 'نامشخص'}",
+                ])
+            lines.append("جزئیات ذخیره‌شده نمایش داده شد؛ برای وضعیت زنده پنل از /product-order-check استفاده کن.")
+            await self.api.send_text(chat_id, "\n".join(lines), ADMIN_MENU)
+            return
+        if is_admin and command == "/product-order-check":
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2 or not parts[1].strip():
+                await self.api.send_text(chat_id, "فرمت: /product-order-check ORDER_ID", ADMIN_MENU)
+                return
+            try:
+                checker = CustomerPurchaseService(
+                    self.data, secret_resolver=self._resolve_panel_secret, registry=self.registry)
+                result = await checker.inspect_product_order_reconciliation(order_id=parts[1].strip())
+                labels = {
+                    "target_present": "کاربر هدف با هویت و تنظیمات ذخیره‌شده تطبیق دارد.",
+                    "not_found": "خواندن پنل اعلام کرد کاربر پیدا نشد؛ ساخت مجدد خودکار ممنوع است.",
+                    "read_failed": f"خواندن پنل شکست خورد ({result.get('reason_code', 'unknown')}).",
+                    "binding_mismatch": "پیکربندی پنل با اتصال زمان خرید مطابقت ندارد.",
+                    "identity_mismatch": "نام کاربری یا شناسه پنل با سفارش مطابقت ندارد.",
+                    "identity_missing": "شناسه کافی برای تطبیق وجود ندارد.",
+                    "intent_missing": "intent زمان خرید ثبت نشده؛ نهایی‌سازی خودکار امکان‌پذیر نیست.",
+                    "different": "تنظیمات فعلی پنل با مقادیر مورد انتظار متفاوت است.",
+                    "observed_unknown": "پنل داده کافی برای اثبات وضعیت هدف برنگرداند.",
+                    "identity_claimed": "هویت پنل قبلاً به سرویس محلی دیگری متصل است.",
+                }
+                lines = [
+                    f"🔎 بررسی فقط‌خواندنی سفارش: {result['order_id']}",
+                    f"نتیجه: {labels.get(result.get('comparison'), str(result.get('comparison') or 'نامشخص'))}",
+                    f"مشتری: {result.get('telegram_id', 'نامشخص')} — سفارش: {result.get('status', 'نامشخص')}",
+                ]
+                if result.get("username"):
+                    lines.append(f"نام کاربری پنل: {result['username']}")
+                if result.get("provider_user_id"):
+                    lines.append(f"شناسه نرمال‌شده پنل: {result['provider_user_id']}")
+                if result.get("observed_status"):
+                    lines.append(f"وضعیت پنل: {result['observed_status']}")
+                if result.get("observed_data_limit_bytes") is not None:
+                    lines.append(f"سقف ترافیک پنل: {int(result['observed_data_limit_bytes']):,} بایت")
+                if result.get("observed_expire_at"):
+                    lines.append(f"انقضای پنل (UTC): {result['observed_expire_at']}")
+                lines.append("این فرمان فقط خواندن و مقایسه می‌کند؛ هیچ تغییری در پنل/کیف پول یا سفارش انجام نمی‌دهد.")
+                if result.get("comparison") == "target_present":
+                    lines.append("برای تصمیم ثبت‌شده با کنترل تازه و audit: /product-order-finalize ORDER_ID | دلیل")
+                await self.api.send_text(chat_id, "\n".join(lines), ADMIN_MENU)
+            except CustomerStoreError as exc:
+                await self.api.send_text(chat_id, f"بررسی سفارش انجام نشد: {exc}", ADMIN_MENU)
+            return
+        if is_admin and command == "/product-order-finalize":
+            fields = text.partition(" ")[2].split("|", 1)
+            if len(fields) != 2 or not fields[0].strip() or not fields[1].strip():
+                await self.api.send_text(chat_id,
+                    "فرمت: /product-order-finalize ORDER_ID | دلیل تصمیم", ADMIN_MENU)
+                return
+            order_id, reason = fields[0].strip(), fields[1].strip()
+            try:
+                checker = CustomerPurchaseService(
+                    self.data, secret_resolver=self._resolve_panel_secret, registry=self.registry)
+                result = await checker.finalize_product_order_target_present(
+                    order_id=order_id, actor_telegram_id=int(uid), reason=reason)
+                replay = " (درخواست تکراریِ بی‌اثر)" if result.get("idempotent_replay") else ""
+                await self.api.send_text(
+                    chat_id,
+                    f"ثبت شد{replay}: سفارش {order_id} پس از خواندن تازه و تطبیق هویت/تنظیمات پنل نهایی شد. "
+                    f"مدیر: {uid}. دلیل: {reason}. هیچ ساخت مجدد در پنل، برداشت دوباره یا بازپرداخت انجام نشد.",
+                    ADMIN_MENU,
+                )
+            except CustomerStoreError as exc:
+                await self.api.send_text(
+                    chat_id,
+                    f"نهایی‌سازی انجام نشد؛ سفارش و وجه رزروشده حفظ شدند: {exc}",
+                    ADMIN_MENU,
+                )
+            return
         if is_admin and command == "/backup-policy":
             payload = text.partition(" ")[2].strip()
             parts = payload.split(maxsplit=1)
@@ -961,13 +1087,56 @@ class CustomerBot:
         if is_admin and command == "/manual-key":
             fields = [x.strip() for x in text.partition(" ")[2].split("|")]
             try:
-                if len(fields) != 2 or not fields[0].startswith("add "):
-                    raise ValueError("فرمت: /manual-key add PRODUCT_ID | KEY_OR_DELIVERY_TEXT")
+                if len(fields) not in {2, 3} or not fields[0].startswith("add "):
+                    raise ValueError("فرمت: /manual-key add PRODUCT_ID | KEY_OR_DELIVERY_TEXT | VARIANT_ID اختیاری")
                 product_id = fields[0][4:].strip()
-                self.data.add_manual_inventory_key(product_id=product_id, secret_payload=fields[1])
-                await self.api.send_text(chat_id, f"کلید به موجودی محصول {product_id} اضافه شد. تعداد موجودی: {self.data.manual_inventory_count(product_id)}", ADMIN_MENU)
+                variant_id = fields[2] if len(fields) == 3 else ""
+                self.data.add_manual_inventory_key(product_id=product_id, secret_payload=fields[1], variant_id=variant_id)
+                count = self.data.manual_inventory_count(product_id, variant_id)
+                label = f" نوع {variant_id}" if variant_id else ""
+                await self.api.send_text(chat_id, f"کلید به موجودی محصول {product_id}{label} اضافه شد. موجودی همین انتخاب: {count}", ADMIN_MENU)
             except (ValueError, CustomerStoreError) as exc:
                 await self.api.send_text(chat_id, f"کلید ذخیره نشد: {exc}", ADMIN_MENU)
+            return
+        if is_admin and command == "/manual-variant":
+            payload = text.partition(" ")[2].strip()
+            try:
+                if payload.startswith("list "):
+                    product_id = payload[5:].strip()
+                    variants = self.data.list_manual_variants(product_id, enabled_only=False)
+                    lines = [f"انواع محصول {product_id}:"]
+                    parent_product = self.data.get_manual_product(product_id, enabled_only=False) or {}
+                    for item in variants:
+                        delivery = self.data.manual_variant_delivery(product_id, item["variant_id"])
+                        stock = self.data.manual_inventory_count(product_id, item["variant_id"]) if delivery["delivery_mode"] == "inventory" else None
+                        delivery_label = {"instant":"خودکار", "manual":"دستی", "inventory":"کلید موجودی"}[delivery["delivery_mode"]]
+                        override_label = "مستقل" if item.get("delivery_mode") else "ارث‌بری از محصول"
+                        lines.append(f"• {item['variant_id']} — {item['title']} — {int(item['price_minor']):,} {parent_product.get('currency','')} — تحویل: {delivery_label} ({override_label}) — {'فعال' if item['enabled'] else 'غیرفعال'}" + (f" — موجودی: {stock}" if stock is not None else ""))
+                    await self.api.send_text(chat_id, "\n".join(lines), ADMIN_MENU)
+                    return
+                if payload.startswith("archive "):
+                    parts = [x.strip() for x in payload[8:].split("|")]
+                    if len(parts) != 2: raise ValueError("فرمت: /manual-variant archive PRODUCT_ID | VARIANT_ID")
+                    product_id, variant_id = parts
+                    variant = self.data.get_manual_variant(product_id, variant_id, enabled_only=False)
+                    if not variant: raise ValueError("نوع محصول پیدا نشد")
+                    self.data.put_manual_variant(product_id=product_id, variant_id=variant_id, title=variant["title"], price_minor=int(variant["price_minor"]), enabled=False)
+                    await self.api.send_text(chat_id, f"نوع {variant_id} آرشیو شد؛ سفارش‌های قبلی و موجودی ثبت‌شده حذف نشدند.", ADMIN_MENU)
+                    return
+                fields = [x.strip() for x in payload.split("|")]
+                if len(fields) not in {4, 6} or not (fields[0].startswith("add ") or fields[0].startswith("edit ")):
+                    raise ValueError("فرمت: /manual-variant add/edit PRODUCT_ID | VARIANT_ID | عنوان | قیمت [| instant/manual/inventory/- | DELIVERY_PAYLOAD/-]")
+                action, product_id = fields[0].split(maxsplit=1)
+                delivery_config_provided = len(fields) == 6
+                delivery_mode = (None if fields[4] == "-" else fields[4]) if delivery_config_provided else None
+                delivery_payload = (None if fields[5] == "-" else fields[5]) if delivery_config_provided else None
+                self.data.put_manual_variant(product_id=product_id, variant_id=fields[1], title=fields[2],
+                    price_minor=int(fields[3]), enabled=True, delivery_mode=delivery_mode,
+                    delivery_payload=delivery_payload, delivery_config_provided=delivery_config_provided)
+                delivery_note = "روش/محتوای تحویل به‌روزرسانی شد." if delivery_config_provided else "روش تحویل از محصول اصلی به ارث می‌رسد."
+                await self.api.send_text(chat_id, f"نوع محصول {fields[1]} ذخیره شد. قیمت مستقل این نوع: {int(fields[3]):,}. {delivery_note}", ADMIN_MENU)
+            except (ValueError, CustomerStoreError) as exc:
+                await self.api.send_text(chat_id, f"نوع محصول ذخیره نشد: {exc}", ADMIN_MENU)
             return
         if is_admin and command == "/manual-orders":
             parts = text.split()
@@ -1032,22 +1201,31 @@ class CustomerBot:
         if is_admin and command == "/manual-product":
             payload = text.partition(" ")[2].strip()
             help_text = ("مدیریت محصول دستی:\n"
-                "/manual-product add ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح | category_id اختیاری | سقف خرید اختیاری | sort_order اختیاری | شرایط خرید اختیاری | image_url اختیاری\n"
-                "/manual-product edit ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح | category_id اختیاری | سقف خرید اختیاری | sort_order اختیاری | شرایط خرید اختیاری | image_url اختیاری\n"
+                "/manual-product add ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح | category_id اختیاری | سقف خرید اختیاری | sort_order اختیاری | شرایط خرید اختیاری | image_url اختیاری | visible_from_utc اختیاری | visible_until_utc اختیاری\n"
+                "/manual-product edit ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح | category_id اختیاری | سقف خرید اختیاری | sort_order اختیاری | شرایط خرید اختیاری | image_url اختیاری | visible_from_utc اختیاری | visible_until_utc اختیاری\n"
                 "/manual-product archive ID\n/manual-product list\n"
-                "instant: متن ثابت ارسال می‌شود؛ inventory: یک کلید یکتا از موجودی تحویل می‌شود؛ "
-                "manual: سفارش در انتظار تحویل مدیر می‌ماند. برای موجودی: /manual-key add PRODUCT_ID | KEY")
+                "/manual-variant add PRODUCT_ID | VARIANT_ID | عنوان | قیمت [| instant/manual/inventory/- | DELIVERY_PAYLOAD/-]\n"
+                "/manual-variant edit PRODUCT_ID | VARIANT_ID | عنوان | قیمت [| instant/manual/inventory/- | DELIVERY_PAYLOAD/-]\n"
+                "/manual-variant archive PRODUCT_ID | VARIANT_ID\n/manual-variant list PRODUCT_ID\n"
+                "برای موجودی محصول ساده: /manual-key add PRODUCT_ID | KEY؛ برای موجودی یک نوع: /manual-key add PRODUCT_ID | KEY | VARIANT_ID. "
+                "اگر محصول نوع فعال داشته باشد، خرید باید با انتخاب یک نوع انجام شود.")
             if payload == "list":
                 products = self.data.list_manual_products(enabled_only=False)
                 lines = []
                 for item in products[:50]:
                     status = "فعال" if item["enabled"] else "آرشیو"
-                    stock = f" — موجودی: {self.data.manual_inventory_count(item['product_id'])}" if item["delivery_mode"] == "inventory" and item["enabled"] else ""
+                    variants = self.data.list_manual_variants(item["product_id"])
+                    stock_count = (sum(self.data.manual_inventory_count(item["product_id"], v["variant_id"]) for v in variants)
+                                   if variants else self.data.manual_inventory_count(item["product_id"]))
+                    stock = f" — موجودی: {stock_count}" if item["delivery_mode"] == "inventory" and item["enabled"] else ""
                     category_label = item.get("category_id") or "بدون دسته"
                     purchase_cap = int(item.get("max_purchases_per_customer") or 0)
                     cap_label = f" — سقف خرید: {purchase_cap}" if purchase_cap else ""
                     image_label = " — تصویر دارد" if str(item.get("image_url") or "").strip() else ""
-                    lines.append(f"• {item['product_id']} — {item['title']} — {item['price_minor']} {item['currency']} — {item['delivery_mode']} — {category_label} — ترتیب: {int(item.get('sort_order') or 0)} — {status}{stock}{cap_label}{image_label}")
+                    schedule_label = " — از " + str(item.get("visible_from_utc")) if item.get("visible_from_utc") else ""
+                    if item.get("visible_until_utc"):
+                        schedule_label += " — تا " + str(item.get("visible_until_utc"))
+                    lines.append(f"• {item['product_id']} — {item['title']} — {item['price_minor']} {item['currency']} — {item['delivery_mode']} — {category_label} — ترتیب: {int(item.get('sort_order') or 0)} — {status}{stock}{cap_label}{image_label}{schedule_label}")
                 await self.api.send_text(chat_id, "\n".join(lines) if lines else "محصول دستی ثبت نشده است.", ADMIN_MENU)
                 return
             if payload.startswith("archive "):
@@ -1065,7 +1243,9 @@ class CustomerBot:
                         description=existing["description"], enabled=False, category_id=existing.get("category_id", ""),
                         max_purchases_per_customer=int(existing.get("max_purchases_per_customer") or 0),
                         sort_order=int(existing.get("sort_order") or 0), terms_text=str(existing.get("terms_text") or ""),
-                        image_url=str(existing.get("image_url") or ""))
+                        image_url=str(existing.get("image_url") or ""),
+                        visible_from_utc=str(existing.get("visible_from_utc") or "-"),
+                        visible_until_utc=str(existing.get("visible_until_utc") or "-"))
                 except (ValueError, CustomerStoreError) as exc:
                     await self.api.send_text(chat_id, f"آرشیو محصول انجام نشد: {exc}", ADMIN_MENU)
                     return
@@ -1074,8 +1254,8 @@ class CustomerBot:
             if payload.startswith("edit "):
                 fields = [x.strip() for x in payload[5:].split("|")]
                 try:
-                    if len(fields) not in {7, 8, 9, 10, 11, 12}:
-                        raise ValueError("۷ فیلد لازم است؛ دسته‌بندی، سقف خرید، ترتیب، شرایط و تصویر اختیاری‌اند.")
+                    if len(fields) not in {7, 8, 9, 10, 11, 12, 13, 14}:
+                        raise ValueError("۷ فیلد لازم است؛ دسته‌بندی، سقف خرید، ترتیب، شرایط، تصویر و زمان‌بندی اختیاری‌اند.")
                     product_id, title, price_raw, currency, delivery_mode, delivery_payload, description = fields[:7]
                     existing = self.data.get_manual_product(product_id, enabled_only=False)
                     if not existing or not existing["enabled"]:
@@ -1085,11 +1265,13 @@ class CustomerBot:
                     sort_order = int(fields[9]) if len(fields) >= 10 else int(existing.get("sort_order") or 0)
                     terms_text = fields[10] if len(fields) >= 11 else str(existing.get("terms_text") or "")
                     image_url = (fields[11] if fields[11] != "-" else "") if len(fields) >= 12 else None
+                    visible_from_utc = (fields[12] if fields[12] != "-" else "") if len(fields) >= 13 else None
+                    visible_until_utc = (fields[13] if fields[13] != "-" else "") if len(fields) >= 14 else None
                     self.data.put_manual_product(product_id=product_id, title=title, price_minor=int(price_raw),
                         currency=currency, delivery_mode=delivery_mode.lower(), delivery_payload=delivery_payload,
                         description=description, category_id=category_id,
                         max_purchases_per_customer=purchase_cap, sort_order=sort_order, terms_text=terms_text,
-                        image_url=image_url)
+                        image_url=image_url, visible_from_utc=visible_from_utc, visible_until_utc=visible_until_utc)
                 except (ValueError, CustomerStoreError) as exc:
                     await self.api.send_text(chat_id, f"ویرایش محصول دستی انجام نشد: {exc}", ADMIN_MENU)
                     return
@@ -1100,19 +1282,21 @@ class CustomerBot:
                 return
             fields = [x.strip() for x in payload[4:].split("|")]
             try:
-                if len(fields) not in {7, 8, 9, 10, 11, 12}:
-                    raise ValueError("۷ فیلد لازم است؛ دسته‌بندی، سقف خرید، ترتیب، شرایط و تصویر اختیاری‌اند.")
+                if len(fields) not in {7, 8, 9, 10, 11, 12, 13, 14}:
+                    raise ValueError("۷ فیلد لازم است؛ دسته‌بندی، سقف خرید، ترتیب، شرایط، تصویر و زمان‌بندی اختیاری‌اند.")
                 product_id, title, price_raw, currency, delivery_mode, delivery_payload, description = fields[:7]
                 category_id = fields[7] if len(fields) >= 8 else ""
                 purchase_cap = int(fields[8]) if len(fields) >= 9 else 0
                 sort_order = int(fields[9]) if len(fields) >= 10 else 0
                 terms_text = fields[10] if len(fields) >= 11 else ""
                 image_url = (fields[11] if fields[11] != "-" else "") if len(fields) >= 12 else None
+                visible_from_utc = (fields[12] if fields[12] != "-" else "") if len(fields) >= 13 else None
+                visible_until_utc = (fields[13] if fields[13] != "-" else "") if len(fields) >= 14 else None
                 self.data.put_manual_product(product_id=product_id, title=title, price_minor=int(price_raw),
                     currency=currency, delivery_mode=delivery_mode.lower(), delivery_payload=delivery_payload,
                     description=description, category_id=category_id,
                     max_purchases_per_customer=purchase_cap, sort_order=sort_order, terms_text=terms_text,
-                    image_url=image_url)
+                    image_url=image_url, visible_from_utc=visible_from_utc, visible_until_utc=visible_until_utc)
             except (ValueError, CustomerStoreError) as exc:
                 await self.api.send_text(chat_id, f"محصول دستی ذخیره نشد: {exc}", ADMIN_MENU)
                 return
@@ -1799,9 +1983,29 @@ class CustomerBot:
         for item in manual_products[:30]:
             cap = int(item.get("max_purchases_per_customer") or 0)
             cap_text = f" — سقف خرید هر مشتری: {cap}" if cap else ""
-            is_out_of_stock = item["delivery_mode"] == "inventory" and self.data.manual_inventory_count(item["product_id"]) == 0
-            stock_text = " — ناموجود" if is_out_of_stock else (" — موجود" if item["delivery_mode"] == "inventory" else "")
-            delivery_text = "تحویل خودکار" if item["delivery_mode"] == "instant" else ("تحویل کلید یکتا از موجودی" if item["delivery_mode"] == "inventory" else "تحویل توسط پشتیبانی")
+            variants = self.data.list_manual_variants(item["product_id"])
+            variant_modes = []
+            variant_inventory_total = 0
+            for variant_item in variants:
+                variant_delivery = self.data.manual_variant_delivery(item["product_id"], variant_item["variant_id"])
+                variant_mode = variant_delivery["delivery_mode"]
+                variant_modes.append(variant_mode)
+                if variant_mode == "inventory":
+                    variant_inventory_total += self.data.manual_inventory_count(item["product_id"], variant_item["variant_id"])
+            if variants:
+                is_out_of_stock = bool(variant_modes) and all(
+                    mode == "inventory" and self.data.manual_inventory_count(item["product_id"], v["variant_id"]) == 0
+                    for v, mode in zip(variants, variant_modes)
+                )
+                stock_count = variant_inventory_total if "inventory" in variant_modes else None
+                delivery_text = ({"instant":"تحویل خودکار", "manual":"تحویل توسط پشتیبانی", "inventory":"تحویل کلید یکتا از موجودی"}[variant_modes[0]]
+                                 if len(set(variant_modes)) == 1 else "روش تحویل بر اساس نوع انتخابی")
+                stock_text = " — ناموجود" if is_out_of_stock else (f" — موجودی انواع انباردار: {stock_count}" if stock_count is not None else "")
+            else:
+                is_out_of_stock = item["delivery_mode"] == "inventory" and self.data.manual_inventory_count(item["product_id"]) == 0
+                stock_count = self.data.manual_inventory_count(item["product_id"]) if item["delivery_mode"] == "inventory" else None
+                stock_text = " — ناموجود" if is_out_of_stock else (" — موجود" if item["delivery_mode"] == "inventory" else "")
+                delivery_text = "تحویل خودکار" if item["delivery_mode"] == "instant" else ("تحویل کلید یکتا از موجودی" if item["delivery_mode"] == "inventory" else "تحویل توسط پشتیبانی")
             description = str(item.get("description") or "").strip()
             summary = description if len(description) <= 180 else description[:177].rstrip() + "..."
             image_url = str(item.get("image_url") or "").strip()
@@ -2241,8 +2445,8 @@ class CustomerBot:
                 body = "برای بررسی فقط‌خواندنی اجرا کن: /panel-check PANEL_ID"
             elif section == "products":
                 body = ("🛍 مدیریت فروشگاه\nمحصولات پنلی: /product add ...\n"
-                        "محصول دستی: /manual-product add ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح | category_id | سقف خرید | ترتیب | شرایط خرید | image_url HTTPS\n"
-                        "ویرایش: /manual-product edit ID | عنوان | قیمت | ارز | حالت | متن-تحویل | توضیح | category_id | سقف خرید | ترتیب | شرایط خرید | image_url؛ برای حذف تصویر مقدار -؛ آرشیو: /manual-product archive ID؛ فهرست: /manual-product list\n"
+                        "محصول دستی: /manual-product add ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح | category_id | سقف خرید | ترتیب | شرایط خرید | image_url HTTPS | visible_from_utc | visible_until_utc\n"
+                        "ویرایش: /manual-product edit ID | عنوان | قیمت | ارز | حالت | متن-تحویل | توضیح | category_id | سقف خرید | ترتیب | شرایط خرید | image_url | visible_from_utc | visible_until_utc؛ برای حذف تصویر/زمان مقدار -؛ زمان UTC به قالب YYYY-MM-DDTHH:MM:SSZ؛ آرشیو: /manual-product archive ID؛ فهرست: /manual-product list\n"
                         "فهرست محصولات پنلی: /products\n\n"
                         "📦 سفارش‌های تحویل دستی: /manual-orders [pending_delivery|fulfilled|all]\n"
                         "تحویل سفارش: /manual-fulfill ORDER_ID | متن تحویل")
@@ -2411,15 +2615,41 @@ class CustomerBot:
             await self.api.send_text(chat_id, "🧪 قابلیت تست/اشتراک آزمایشی هنوز پیاده‌سازی نشده و فعلاً در دسترس نیست. این گزینه تا زمان اتصال جریان واقعی فعال نخواهد شد.", BACK_MENU)
             return
         if key.startswith("manualbuy:") and not key.startswith("manualbuy_confirm:"):
-            product_id = key.partition(":")[2]
+            selection = key.partition(":")[2]
+            product_id, separator, variant_id = selection.partition("~")
             product = self.data.get_manual_product(product_id)
             if not product:
                 await self.api.send_text(chat_id, "این محصول دیگر در دسترس نیست.", BACK_MENU)
                 return
-            if product["delivery_mode"] == "inventory" and self.data.manual_inventory_count(product_id) == 0:
-                await self.api.send_text(chat_id, "این محصول فعلاً ناموجود است؛ پس از شارژ موجودی دوباره در دسترس قرار می‌گیرد.", BACK_MENU)
+            variants = self.data.list_manual_variants(product_id)
+            if variants and not separator:
+                rows = []
+                for variant in variants[:20]:
+                    variant_delivery = self.data.manual_variant_delivery(product_id, variant["variant_id"])
+                    stock = self.data.manual_inventory_count(product_id, variant["variant_id"]) if variant_delivery["delivery_mode"] == "inventory" else None
+                    unavailable = stock == 0
+                    label = f"{variant['title'][:22]} — {int(variant['price_minor']):,} {product['currency']}"
+                    if stock is not None: label += f" — موجودی {stock}"
+                    if unavailable: label += " — ناموجود"
+                    if not unavailable:
+                        rows.append([{"text": label[:60], "callback_data": f"customer:manualbuy:{product_id}~{variant['variant_id']}"}])
+                rows.append([{"text":"بازگشت به فروشگاه","callback_data":"customer:shop"}])
+                await self.api.send_text(chat_id, f"یک نوع از «{product['title']}» را انتخاب کن. قیمت و موجودی مربوط به همان انتخاب است:", {"inline_keyboard":rows})
                 return
-            delivery_label = "خودکار پس از پرداخت" if product["delivery_mode"] in {"instant", "inventory"} else "دستی توسط پشتیبانی"
+            selected_variant = self.data.get_manual_variant(product_id, variant_id) if separator else None
+            if separator and not selected_variant:
+                await self.api.send_text(chat_id, "این نوع محصول دیگر در دسترس نیست.", BACK_MENU)
+                return
+            inventory_variant = variant_id if separator else ""
+            selected_delivery = self.data.manual_variant_delivery(product_id, variant_id) if separator else {
+                "delivery_mode": str(product["delivery_mode"]), "delivery_payload": str(product.get("delivery_payload") or "")}
+            selected_mode = selected_delivery["delivery_mode"]
+            if selected_mode == "inventory" and self.data.manual_inventory_count(product_id, inventory_variant) == 0:
+                await self.api.send_text(chat_id, "این انتخاب فعلاً ناموجود است؛ پس از شارژ همین موجودی دوباره در دسترس قرار می‌گیرد.", BACK_MENU)
+                return
+            price = int(selected_variant["price_minor"] if selected_variant else product["price_minor"])
+            display_title = str(product["title"]) + (" — " + str(selected_variant["title"]) if selected_variant else "")
+            delivery_label = "خودکار پس از پرداخت" if selected_mode in {"instant", "inventory"} else "دستی توسط پشتیبانی"
             cap = int(product.get("max_purchases_per_customer") or 0)
             cap_text = f"\nسقف خرید هر مشتری: {cap}" if cap else "\nسقف خرید: نامحدود"
             description = str(product.get("description") or "").strip()
@@ -2427,27 +2657,37 @@ class CustomerBot:
             terms_text = str(product.get("terms_text") or "").strip()
             terms_hash = hashlib.sha256(terms_text.encode("utf-8")).hexdigest()[:12] if terms_text else ""
             terms_display = "\n\nشرایط خرید:\n" + terms_text if terms_text else ""
-            callback_data = f"customer:manualbuy_confirm:{product_id}:{terms_hash}" if terms_hash else f"customer:manualbuy_confirm:{product_id}"
+            selected_key = product_id + ("~" + variant_id if separator else "")
+            if separator:
+                # Bind the confirmation to the exact variant title, price, terms and effective delivery configuration.
+                quote_hash = self.data.manual_variant_quote_hash(product_id, variant_id)
+                callback_data = f"customer:mv:{selected_key}:{quote_hash}"
+            else:
+                callback_data = f"customer:manualbuy_confirm:{selected_key}:{terms_hash}" if terms_hash else f"customer:manualbuy_confirm:{selected_key}"
             confirm_label = "می‌پذیرم و خرید" if terms_text else "تأیید خرید"
-            await self.api.send_text(chat_id, f"تأیید خرید «{product['title']}»\nقیمت: {int(product['price_minor']):,} {product['currency']}{description_text}{terms_display}\nموجودی: {self.data.wallet_balance(uid, product['currency']):,} {product['currency']}{cap_text}\nتحویل: {delivery_label}",
+            await self.api.send_text(chat_id, f"تأیید خرید «{display_title}»\nقیمت نهایی: {price:,} {product['currency']}{description_text}{terms_display}\nموجودی کیف پول: {self.data.wallet_balance(uid, product['currency']):,} {product['currency']}{cap_text}\nتحویل: {delivery_label}",
                 {"inline_keyboard":[[{"text":confirm_label,"callback_data":callback_data,"style":"success"}],[{"text":"بازگشت به فروشگاه","callback_data":"customer:shop"}]]})
             return
-        if key.startswith("manualbuy_confirm:"):
+        if key.startswith("manualbuy_confirm:") or key.startswith("mv:"):
             confirmation = key.partition(":")[2]
-            product_id, sep, accepted_terms_hash = confirmation.partition(":")
+            selection, sep, accepted_hash = confirmation.partition(":")
+            product_id, variant_sep, variant_id = selection.partition("~")
+            is_variant_confirmation = key.startswith("mv:")
             try:
                 result = self.data.buy_manual_product(telegram_id=uid, product_id=product_id,
-                    idempotency_key=f"manual-buy:{uid}:{message.get('message_id') or 0}:{product_id}",
-                    expected_terms_hash=accepted_terms_hash if sep else None)
+                    variant_id=variant_id if variant_sep else "",
+                    idempotency_key=f"manual-buy:{uid}:{message.get('message_id') or 0}:{product_id}:{variant_id if variant_sep else 'base'}",
+                    expected_terms_hash=accepted_hash if sep and not is_variant_confirmation else None,
+                    expected_variant_quote_hash=accepted_hash if sep and is_variant_confirmation else None)
                 already_processed = bool(result.get("idempotent_replay"))
                 purchase_label = "این خرید قبلاً ثبت شده است" if already_processed else "خرید انجام شد"
                 if result["delivery_mode"] in {"instant", "inventory"}:
-                    body = f"✅ {purchase_label}\nمحصول: {result['title']}\nشناسه سفارش: {result['order_id']}\n\nاطلاعات محصول:\n{result['delivery_payload']}"
+                    body = f"✅ {purchase_label}\nمحصول: {result['title']}\nمبلغ: {int(result['amount_minor']):,} {result['currency']}\nشناسه سفارش: {result['order_id']}\n\nاطلاعات محصول:\n{result['delivery_payload']}"
                 elif result.get("status") == "fulfilled" and result.get("delivery_payload"):
                     body = f"✅ این سفارش قبلاً تحویل شده است.\nمحصول: {result['title']}\nشناسه سفارش: {result['order_id']}\n\nاطلاعات تحویل:\n{result['delivery_payload']}"
                 else:
                     status_text = "این سفارش قبلاً ثبت شده و در انتظار تحویل است." if already_processed else "سفارش ثبت شد و مبلغ کسر شد."
-                    body = f"✅ {status_text}\nمحصول: {result['title']}\nشناسه سفارش: {result['order_id']}\nتحویل توسط مدیر/پشتیبانی انجام می‌شود."
+                    body = f"✅ {status_text}\nمحصول: {result['title']}\nمبلغ: {int(result['amount_minor']):,} {result['currency']}\nشناسه سفارش: {result['order_id']}\nتحویل توسط مدیر/پشتیبانی انجام می‌شود."
                 await self.api.send_text(chat_id, body, BACK_MENU)
             except CustomerStoreError as exc:
                 await self.api.send_text(chat_id, f"خرید انجام نشد: {exc}", BACK_MENU)
