@@ -384,6 +384,31 @@ class CustomerDataStoreTests(unittest.TestCase):
             )
         self.assertEqual(self.store.wallet_balance(1001), 5000)
 
+    def test_customer_order_history_includes_manual_orders_and_remains_owner_scoped(self):
+        self.store.ensure_customer(1002, "bob", "Bob")
+        self.store.put_manual_product(product_id="history-manual", title="Manual History Product",
+            price_minor=250, currency="IRR", delivery_mode="manual", delivery_payload="")
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="history-fund-alice",
+            amount_minor=1000, currency="IRR", entry_type="deposit")
+        self.store.post_wallet_entry(telegram_id=1002, idempotency_key="history-fund-bob",
+            amount_minor=1000, currency="IRR", entry_type="deposit")
+        alice_order = self.store.buy_manual_product(telegram_id=1001, product_id="history-manual",
+            idempotency_key="history-order-alice")
+        bob_order = self.store.buy_manual_product(telegram_id=1002, product_id="history-manual",
+            idempotency_key="history-order-bob")
+
+        alice_history = self.store.list_customer_orders(1001)
+        self.assertEqual(len(alice_history), 1)
+        self.assertEqual(alice_history[0]["order_id"], alice_order["order_id"])
+        self.assertEqual(alice_history[0]["title"], "Manual History Product")
+        self.assertEqual(alice_history[0]["amount_minor"], 250)
+        self.assertEqual(alice_history[0]["status"], "pending_delivery")
+        self.assertEqual(alice_history[0]["order_kind"], "manual")
+        self.assertNotEqual(alice_history[0]["order_id"], bob_order["order_id"])
+
+        other_tenant = CustomerDataStore(self.path, tenant_id="bot-beta")
+        self.assertEqual(other_tenant.list_customer_orders(1001), [])
+
     def test_order_snapshots_price_and_is_idempotent(self):
         self.store.put_product(product_id="basic", title="Basic", price_minor=5000, currency="IRR")
         first = self.store.create_order(order_id="order-1", telegram_id=1001,

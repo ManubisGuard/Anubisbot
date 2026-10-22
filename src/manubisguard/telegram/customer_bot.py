@@ -2367,7 +2367,8 @@ class CustomerBot:
             page_count = max(1, (len(orders) + page_size - 1) // page_size)
             page = min(page, page_count - 1)
             status_labels = {
-                "pending_payment": "در انتظار پرداخت", "awaiting_payment": "در انتظار پرداخت",
+                "pending": "در انتظار پرداخت", "pending_payment": "در انتظار پرداخت",
+                "awaiting_payment": "در انتظار پرداخت",
                 "paid": "پرداخت‌شده", "fulfilling": "در حال تحویل", "fulfilled": "تحویل‌شده",
                 "failed": "ناموفق", "cancelled": "لغوشده", "refunded": "بازپرداخت‌شده",
                 "reconcile_required": "نیازمند بررسی مدیر", "pending_delivery": "در انتظار تحویل",

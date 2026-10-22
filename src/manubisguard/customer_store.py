@@ -1257,13 +1257,13 @@ class CustomerDataStore:
         return result
 
     def list_customer_orders(self, telegram_id: int, *, limit: int = 50) -> list[dict[str, Any]]:
-        """Return a minimal, tenant- and customer-scoped order history without internal references."""
+        """Return a minimal, tenant- and customer-scoped history across panel and manual orders."""
         if isinstance(telegram_id, bool) or not isinstance(telegram_id, int) or telegram_id <= 0:
             raise CustomerStoreError("Invalid customer ID")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise CustomerStoreError("Invalid order history limit")
         with self._connect() as db:
-            rows = db.execute(
+            panel_rows = db.execute(
                 """SELECT o.order_id,o.product_id,o.amount_minor,o.currency,o.status,o.created_at,o.updated_at,
                           o.discount_code,o.discount_amount_minor,o.product_snapshot_json,p.title AS current_title
                    FROM customer_orders o LEFT JOIN customer_products p
@@ -1272,8 +1272,16 @@ class CustomerDataStore:
                    ORDER BY o.created_at DESC,o.order_id DESC LIMIT ?""",
                 (self.tenant_id, telegram_id, limit),
             ).fetchall()
-        result = []
-        for row in rows:
+            manual_rows = db.execute(
+                """SELECT order_id,product_id,amount_minor,currency,status,created_at,
+                          product_title_snapshot
+                   FROM manual_product_orders
+                   WHERE tenant_id=? AND telegram_id=?
+                   ORDER BY created_at DESC,order_id DESC LIMIT ?""",
+                (self.tenant_id, telegram_id, limit),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in panel_rows:
             item = dict(row)
             try:
                 snapshot = json.loads(item.pop("product_snapshot_json") or "{}")
@@ -1284,8 +1292,19 @@ class CustomerDataStore:
             item["amount_minor"] = int(item["amount_minor"])
             item["discount_amount_minor"] = int(item.get("discount_amount_minor") or 0)
             item["discount_code"] = str(item.get("discount_code") or "")
+            item["order_kind"] = "panel"
             result.append(item)
-        return result
+        for row in manual_rows:
+            item = dict(row)
+            item["title"] = str(item.pop("product_title_snapshot", "") or item["product_id"])
+            item["amount_minor"] = int(item["amount_minor"])
+            item["discount_amount_minor"] = 0
+            item["discount_code"] = ""
+            item["updated_at"] = str(item.get("created_at") or "")
+            item["order_kind"] = "manual"
+            result.append(item)
+        result.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("order_id") or "")), reverse=True)
+        return result[:limit]
 
     def list_products(self, panel_id: str | None = None, category_id: str | None = None) -> list[dict[str, Any]]:
         sql = """SELECT p.product_id,p.category_id,p.title,p.description,p.price_minor,p.currency,p.duration_hours,
