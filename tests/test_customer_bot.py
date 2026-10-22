@@ -498,6 +498,13 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
             ("menu_services_enabled", "customer:services:0"),
             ("menu_support_enabled", "customer:support:list:0"),
             ("menu_shop_enabled", "customer:shop"),
+            ("menu_shop_enabled", "customer:shop_page:1"),
+            ("menu_shop_enabled", "customer:category_page:category-1:1"),
+            ("menu_shop_enabled", "customer:category_menu_page:all:1"),
+            ("menu_shop_enabled", "customer:manualbuy_variants:product-1:1"),
+            ("menu_shop_enabled", "customer:mp:product-1:quote"),
+            ("menu_shop_enabled", "customer:file_retry:order-1"),
+            ("menu_wallet_enabled", "customer:wallet:payments"),
             ("menu_shop_enabled", "customer:buy_confirm:product-1"),
             ("menu_shop_enabled", "customer:manualbuy:product-1~variant-1"),
             ("menu_shop_enabled", "customer:manualbuy_confirm:product-1"),
@@ -1859,6 +1866,82 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
             "caption":"/manual-file file-denied", "document":{"file_id":"not-authorized"}})
         self.assertEqual(self.bot.data.get_manual_product("file-denied")["delivery_mode"], "manual")
         self.assertNotEqual(self.bot.data.get_manual_product("file-denied")["delivery_payload"], "not-authorized")
+
+    async def test_manual_shop_products_are_paginated_without_hiding_later_products(self):
+        for index in range(25):
+            self.bot.data.put_manual_product(product_id=f"page-{index:02d}", title=f"Product {index:02d}",
+                price_minor=100+index, currency="IRR", delivery_mode="manual")
+        query = {"from":{"id":999},"message":{"message_id":780,"chat":{"id":999,"type":"private"}}}
+        await self.bot._handle_callback({**query,"id":"shop-page-0","data":"customer:shop"})
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        first_ids = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
+                     if button.get("callback_data", "").startswith("customer:manualbuy:page-")]
+        self.assertEqual(len(first_ids), 10)
+        self.assertIn("صفحه محصولات 1 از 3", body)
+        next_callback = next(button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
+                             if button.get("callback_data") == "customer:shop_page:1")
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({**query,"id":"shop-page-1","data":next_callback})
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        second_ids = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
+                      if button.get("callback_data", "").startswith("customer:manualbuy:page-")]
+        self.assertEqual(len(second_ids), 10)
+        self.assertIn("صفحه محصولات 2 از 3", body)
+        self.assertTrue(set(first_ids).isdisjoint(second_ids))
+        next_callback = next(button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
+                             if button.get("callback_data") == "customer:shop_page:2")
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({**query,"id":"shop-page-2","data":next_callback})
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        last_ids = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
+                    if button.get("callback_data", "").startswith("customer:manualbuy:page-")]
+        self.assertEqual(len(last_ids), 5)
+        self.assertIn("صفحه محصولات 3 از 3", body)
+        self.assertIn("customer:manualbuy:page-24", last_ids)
+
+    async def test_shop_category_list_paginates_past_twenty_four_categories(self):
+        for index in range(27):
+            self.bot.data.put_category(category_id=f"cat-{index:02d}", title=f"Category {index:02d}")
+        query = {"from":{"id":999},"message":{"message_id":782,"chat":{"id":999,"type":"private"}}}
+        await self.bot._handle_callback({**query,"id":"category-menu-page-0","data":"customer:shop"})
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        first_categories = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
+            if button.get("callback_data", "").startswith("customer:category:cat-")]
+        self.assertEqual(len(first_categories), 20)
+        self.assertIn("صفحه دسته‌بندی‌ها 1 از 2", body)
+        next_callback = next(button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
+            if button.get("callback_data") == "customer:category_menu_page:all:1")
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({**query,"id":"category-menu-page-1","data":next_callback})
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        last_categories = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
+            if button.get("callback_data", "").startswith("customer:category:cat-")]
+        self.assertEqual(len(last_categories), 7)
+        self.assertIn("customer:category:cat-26", last_categories)
+        self.assertTrue(set(first_categories).isdisjoint(last_categories))
+        self.assertIn("صفحه دسته‌بندی‌ها 2 از 2", body)
+
+    async def test_manual_product_variant_picker_paginates_past_twenty_variants(self):
+        self.bot.data.put_manual_product(product_id="variant-pages", title="Many options", price_minor=1000,
+            currency="IRR", delivery_mode="manual")
+        for index in range(25):
+            self.bot.data.put_manual_variant(product_id="variant-pages", variant_id=f"v{index:02d}",
+                title=f"Variant {index:02d}", price_minor=100+index)
+        query = {"from":{"id":999},"message":{"message_id":781,"chat":{"id":999,"type":"private"}}}
+        await self.bot._handle_callback({**query,"id":"variant-page-0","data":"customer:manualbuy:variant-pages"})
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        first_ids = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
+                     if button.get("callback_data", "").startswith("customer:manualbuy:variant-pages~")]
+        self.assertEqual(len(first_ids), 8)
+        self.assertIn("صفحه 1 از 4", body)
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({**query,"id":"variant-page-3","data":"customer:manualbuy_variants:variant-pages:3"})
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        last_ids = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
+                    if button.get("callback_data", "").startswith("customer:manualbuy:variant-pages~")]
+        self.assertEqual(last_ids, ["customer:manualbuy:variant-pages~v24"])
+        self.assertIn("صفحه 4 از 4", body)
+        self.assertTrue(set(first_ids).isdisjoint(last_ids))
 
     async def test_manual_variant_selection_confirms_and_charges_variant_price(self):
         self.bot.data.ensure_customer(999, first_name="Buyer")
