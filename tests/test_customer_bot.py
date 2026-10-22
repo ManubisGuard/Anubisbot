@@ -889,7 +889,6 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("customer:manualbuy:image-fallback", callbacks)
 
     async def test_manual_product_terms_are_shown_and_callback_binds_accepted_version(self):
-        import hashlib
         self.bot.data.ensure_customer(999, first_name="Buyer")
         self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="terms-bot-wallet", amount_minor=1000, entry_type="deposit")
         self.bot.data.put_manual_product(product_id="terms-bot", title="Terms bot item", price_minor=500,
@@ -903,7 +902,7 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("شرایط نسخه یک", body)
         confirm = keyboard["inline_keyboard"][0][0]
         self.assertEqual(confirm["text"], "می‌پذیرم و خرید")
-        self.assertIn(hashlib.sha256("شرایط نسخه یک".encode()).hexdigest()[:12], confirm["callback_data"])
+        self.assertTrue(confirm["callback_data"].startswith("customer:mp:terms-bot:"))
         self.bot.data.put_manual_product(product_id="terms-bot", title="Terms bot item", price_minor=500,
             currency="IRR", delivery_mode="instant", delivery_payload="SAFE-DELIVERY", terms_text="شرایط نسخه دو")
         self.bot.api.send_text.reset_mock()
@@ -911,7 +910,7 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
             "message":{"message_id":701,"chat":{"id":999,"type":"private"}},
             "data":confirm["callback_data"]})
         body = self.bot.api.send_text.await_args.args[1]
-        self.assertIn("شرایط خرید تغییر کرده", body)
+        self.assertIn("تغییر کرده است", body)
         self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 1000)
 
     async def test_manual_product_confirmation_shows_bounded_description_not_delivery_payload(self):
@@ -1653,6 +1652,108 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(":discount:SAVE20",self.bot.purchase_service.buy_from_wallet.await_args.kwargs["idempotency_key"])
         self.assertNotIn(999,self.bot._pending_purchase_discount)
 
+
+    async def test_admin_attaches_file_and_customer_receives_replayable_document_without_second_charge(self):
+        self.bot.api.call = AsyncMock(return_value={"ok": True})
+        admin = {"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"}}
+        self.bot.data.put_manual_product(product_id="file-ui", title="Download pack", price_minor=700,
+            currency="IRR", delivery_mode="manual")
+        await self.bot._handle_message({**admin, "caption":"/manual-file file-ui",
+            "document":{"file_id":"telegram-file-ui-id","file_name":"pack.zip"}})
+        self.assertEqual(self.bot.data.get_manual_product("file-ui")["delivery_mode"], "file")
+        self.bot.data.put_manual_product(product_id="file-variant-ui", title="Variant download", price_minor=1000,
+            currency="IRR", delivery_mode="manual")
+        self.bot.data.put_manual_variant(product_id="file-variant-ui", variant_id="plus", title="Plus", price_minor=900)
+        await self.bot._handle_message({**admin, "caption":"/manual-file file-variant-ui | plus",
+            "document":{"file_id":"telegram-variant-ui-id","file_name":"plus.zip"}})
+        self.assertEqual(self.bot.data.manual_variant_delivery("file-variant-ui", "plus"),
+            {"delivery_mode":"file", "delivery_payload":"telegram-variant-ui-id"})
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="file-ui-fund", amount_minor=2000, entry_type="deposit")
+        await self.bot._handle_callback({"id":"file-ui-select","from":{"id":999},
+            "message":{"message_id":720,"chat":{"id":999,"type":"private"}},
+            "data":"customer:manualbuy:file-ui"})
+        confirm_data = self.bot.api.send_text.await_args.args[2]["inline_keyboard"][0][0]["callback_data"]
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"file-ui-buy","from":{"id":999},
+            "message":{"message_id":721,"chat":{"id":999,"type":"private"}}, "data":confirm_data})
+        self.bot.api.call.assert_awaited_once()
+        method, payload = self.bot.api.call.await_args.args
+        self.assertEqual(method, "sendDocument")
+        self.assertEqual(payload["document"], "telegram-file-ui-id")
+        self.assertTrue(payload["protect_content"])
+        order_id = self.bot.data.list_manual_orders(status="all")[0]["order_id"]
+        self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 1300)
+        self.bot.api.call.reset_mock()
+        await self.bot._handle_callback({"id":"file-ui-retry","from":{"id":999},
+            "message":{"message_id":722,"chat":{"id":999,"type":"private"}},
+            "data":f"customer:file_retry:{order_id}"})
+        self.bot.api.call.assert_awaited_once()
+        self.assertEqual(self.bot.api.call.await_args.args[1]["document"], "telegram-file-ui-id")
+        self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 1300)
+        self.bot.api.call.reset_mock()
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"file-ui-other-owner","from":{"id":1000},
+            "message":{"message_id":723,"chat":{"id":1000,"type":"private"}},
+            "data":f"customer:file_retry:{order_id}"})
+        self.bot.api.call.assert_not_awaited()
+        self.assertIn("متعلق به حساب شما نیست", self.bot.api.send_text.await_args.args[1])
+
+    async def test_base_file_quote_rejects_changed_price_or_file_before_debit(self):
+        self.bot.api.call = AsyncMock(return_value={"ok": True})
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="file-stale-fund", amount_minor=2000, entry_type="deposit")
+        self.bot.data.put_manual_product(product_id="file-stale", title="Stale file", price_minor=500,
+            currency="IRR", delivery_mode="manual")
+        self.bot.data.set_manual_product_file(product_id="file-stale", file_id="telegram-file-old")
+        await self.bot._handle_callback({"id":"file-stale-screen","from":{"id":999},
+            "message":{"message_id":740,"chat":{"id":999,"type":"private"}},
+            "data":"customer:manualbuy:file-stale"})
+        confirm_data = self.bot.api.send_text.await_args.args[2]["inline_keyboard"][0][0]["callback_data"]
+        self.assertTrue(confirm_data.startswith("customer:mp:file-stale:"))
+        self.bot.data.put_manual_product(product_id="file-stale", title="Stale file", price_minor=600,
+            currency="IRR", delivery_mode="file", delivery_payload="telegram-file-new")
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"file-stale-buy","from":{"id":999},
+            "message":{"message_id":741,"chat":{"id":999,"type":"private"}}, "data":confirm_data})
+        self.assertIn("فایل این محصول تغییر کرده است", self.bot.api.send_text.await_args.args[1])
+        self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 2000)
+        self.assertEqual(self.bot.data.list_manual_orders(status="all"), [])
+        self.bot.api.call.assert_not_awaited()
+
+    async def test_file_delivery_failure_offers_retry_without_recharging(self):
+        self.bot.api.call = AsyncMock(side_effect=[RuntimeError("transport detail must not leak"), {"ok": True}])
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="file-retry-fund", amount_minor=1500, entry_type="deposit")
+        self.bot.data.put_manual_product(product_id="file-retry", title="Retry file", price_minor=500,
+            currency="IRR", delivery_mode="manual")
+        self.bot.data.set_manual_product_file(product_id="file-retry", file_id="telegram-file-retry-id")
+        await self.bot._handle_callback({"id":"file-retry-select","from":{"id":999},
+            "message":{"message_id":730,"chat":{"id":999,"type":"private"}},
+            "data":"customer:manualbuy:file-retry"})
+        confirm_data = self.bot.api.send_text.await_args.args[2]["inline_keyboard"][0][0]["callback_data"]
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"file-retry-buy","from":{"id":999},
+            "message":{"message_id":731,"chat":{"id":999,"type":"private"}}, "data":confirm_data})
+        self.assertIn("مبلغ دوباره کسر نمی‌شود", self.bot.api.send_text.await_args.args[1])
+        self.assertNotIn("transport detail", self.bot.api.send_text.await_args.args[1])
+        self.assertNotIn("telegram-file-retry-id", self.bot.api.send_text.await_args.args[1])
+        retry_data = self.bot.api.send_text.await_args.args[2]["inline_keyboard"][0][0]["callback_data"]
+        self.assertTrue(retry_data.startswith("customer:file_retry:"))
+        self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 1000)
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"file-retry-again","from":{"id":999},
+            "message":{"message_id":732,"chat":{"id":999,"type":"private"}}, "data":retry_data})
+        self.assertEqual(self.bot.api.call.await_count, 2)
+        self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 1000)
+
+    async def test_non_admin_cannot_attach_manual_product_file(self):
+        self.bot.data.put_manual_product(product_id="file-denied", title="Private file", price_minor=500,
+            currency="IRR", delivery_mode="manual")
+        await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},
+            "caption":"/manual-file file-denied", "document":{"file_id":"not-authorized"}})
+        self.assertEqual(self.bot.data.get_manual_product("file-denied")["delivery_mode"], "manual")
+        self.assertNotEqual(self.bot.data.get_manual_product("file-denied")["delivery_payload"], "not-authorized")
 
     async def test_manual_variant_selection_confirms_and_charges_variant_price(self):
         self.bot.data.ensure_customer(999, first_name="Buyer")

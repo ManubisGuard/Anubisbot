@@ -998,7 +998,7 @@ class CustomerDataStoreTests(unittest.TestCase):
                 "SELECT version, name FROM schema_migrations ORDER BY version"
             ).fetchall()
             self.assertEqual([(row["version"], row["name"]) for row in versions],
-                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"), (10, "manual_product_category_binding"), (11, "manual_product_customer_purchase_limit"), (12, "manual_product_sort_order"), (13, "manual_product_terms_snapshot"), (14, "manual_product_image_url"), (15, "manual_product_visibility_schedule"), (16, "manual_product_variants"), (17, "manual_variant_delivery_overrides"), (18, "product_order_reconciliation_audit")])
+                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"), (10, "manual_product_category_binding"), (11, "manual_product_customer_purchase_limit"), (12, "manual_product_sort_order"), (13, "manual_product_terms_snapshot"), (14, "manual_product_image_url"), (15, "manual_product_visibility_schedule"), (16, "manual_product_variants"), (17, "manual_variant_delivery_overrides"), (18, "product_order_reconciliation_audit"), (19, "manual_product_telegram_file_delivery")])
 
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         with reopened._connect() as db:
@@ -1006,7 +1006,7 @@ class CustomerDataStoreTests(unittest.TestCase):
                 "SELECT version, name FROM schema_migrations ORDER BY version"
             ).fetchall()
             self.assertEqual([(row["version"], row["name"]) for row in versions],
-                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"), (10, "manual_product_category_binding"), (11, "manual_product_customer_purchase_limit"), (12, "manual_product_sort_order"), (13, "manual_product_terms_snapshot"), (14, "manual_product_image_url"), (15, "manual_product_visibility_schedule"), (16, "manual_product_variants"), (17, "manual_variant_delivery_overrides"), (18, "product_order_reconciliation_audit")])
+                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"), (10, "manual_product_category_binding"), (11, "manual_product_customer_purchase_limit"), (12, "manual_product_sort_order"), (13, "manual_product_terms_snapshot"), (14, "manual_product_image_url"), (15, "manual_product_visibility_schedule"), (16, "manual_product_variants"), (17, "manual_variant_delivery_overrides"), (18, "product_order_reconciliation_audit"), (19, "manual_product_telegram_file_delivery")])
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_representative_unversioned_legacy_database_preserves_business_rows(self):
@@ -1069,7 +1069,7 @@ class CustomerDataStoreTests(unittest.TestCase):
                  (11, "manual_product_customer_purchase_limit"),
                  (12, "manual_product_sort_order"),
                  (13, "manual_product_terms_snapshot"), (14, "manual_product_image_url"),
-                 (15, "manual_product_visibility_schedule"), (16, "manual_product_variants"), (17, "manual_variant_delivery_overrides"), (18, "product_order_reconciliation_audit")],
+                 (15, "manual_product_visibility_schedule"), (16, "manual_product_variants"), (17, "manual_variant_delivery_overrides"), (18, "product_order_reconciliation_audit"), (19, "manual_product_telegram_file_delivery")],
             )
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertIn("category_id", {
@@ -1140,7 +1140,7 @@ class CustomerDataStoreTests(unittest.TestCase):
         # A second open must not reapply or duplicate either migration.
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         with reopened._connect() as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 18)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 19)
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_v11_manual_purchase_cap_migration_preserves_legacy_products_and_reopens_idempotently(self):
@@ -1162,7 +1162,7 @@ class CustomerDataStoreTests(unittest.TestCase):
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         self.assertEqual(reopened.get_manual_product("legacy-cap-item")["max_purchases_per_customer"], 0)
         with reopened._connect() as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 18)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 19)
 
     def test_v12_manual_product_sort_order_migration_preserves_legacy_rows(self):
         self.store.put_manual_product(product_id="legacy-sort-item", title="Legacy sort item", price_minor=500,
@@ -1182,7 +1182,7 @@ class CustomerDataStoreTests(unittest.TestCase):
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         self.assertEqual(reopened.get_manual_product("legacy-sort-item")["sort_order"], 0)
         with reopened._connect() as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 18)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 19)
 
     def test_manual_product_image_url_validation_and_edit_preservation(self):
         self.store.put_manual_product(product_id="image-item", title="Image item", price_minor=500,
@@ -1220,7 +1220,7 @@ class CustomerDataStoreTests(unittest.TestCase):
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         self.assertEqual(reopened.get_manual_product("legacy-image")["image_url"], "")
         with reopened._connect() as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 18)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 19)
 
     def test_manual_product_schedule_filters_catalog_and_purchase_and_preserves_on_edit(self):
         self.store.ensure_customer(1001, first_name="Buyer")
@@ -1287,7 +1287,7 @@ class CustomerDataStoreTests(unittest.TestCase):
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         self.assertEqual(reopened.get_manual_product("legacy-schedule", enabled_only=False)["visible_from_utc"], "")
         with reopened._connect() as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 18)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 19)
 
     def test_manual_product_terms_are_snapshotted_and_changed_terms_require_reconfirmation(self):
         import hashlib
@@ -1809,6 +1809,69 @@ class CustomerDataStoreTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=5").fetchone()[0], 1)
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
+
+    def test_manual_file_delivery_is_snapshotted_replayable_and_owner_scoped(self):
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="file-fund", amount_minor=2000, entry_type="deposit")
+        self.store.put_manual_product(product_id="file-product", title="Download pack", price_minor=700,
+            currency="IRR", delivery_mode="manual")
+        self.store.set_manual_product_file(product_id="file-product", file_id="telegram-file-id-001")
+        order = self.store.buy_manual_product(telegram_id=1001, product_id="file-product",
+            idempotency_key="file-product-order")
+        self.assertEqual((order["delivery_mode"], order["delivery_payload"], order["status"]),
+                         ("file", "telegram-file-id-001", "fulfilled"))
+        visible_product = self.store.list_manual_products()[0]
+        self.assertEqual(visible_product["delivery_mode"], "file")
+        self.assertNotIn("delivery_payload", visible_product)
+        editable = self.store.get_manual_product("file-product")
+        self.store.put_manual_product(product_id="file-product", title="Download pack v2", price_minor=700,
+            currency="IRR", delivery_mode=editable["delivery_mode"], delivery_payload=editable["delivery_payload"])
+        self.assertEqual(self.store.get_manual_product("file-product")["delivery_payload"], "telegram-file-id-001")
+        self.assertEqual(self.store.wallet_balance(1001, "IRR"), 1300)
+        replay = self.store.buy_manual_product(telegram_id=1001, product_id="file-product",
+            idempotency_key="file-product-order")
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["delivery_payload"], "telegram-file-id-001")
+        self.assertEqual(self.store.wallet_balance(1001, "IRR"), 1300)
+        owned = self.store.get_manual_order_delivery(order_id=order["order_id"], telegram_id=1001)
+        self.assertEqual(owned["delivery_payload"], "telegram-file-id-001")
+        self.assertIsNone(self.store.get_manual_order_delivery(order_id=order["order_id"], telegram_id=1002))
+        self.assertNotIn("delivery_payload", self.store.list_manual_orders(status="all")[0])
+        with self.assertRaisesRegex(CustomerStoreError, "file_id"):
+            self.store.set_manual_product_file(product_id="file-product", file_id="")
+
+    def test_manual_variant_inherits_parent_file_and_v19_migration_preserves_products(self):
+        self.store.put_manual_product(product_id="parent-file", title="Parent file", price_minor=800,
+            currency="IRR", delivery_mode="manual")
+        self.store.set_manual_product_file(product_id="parent-file", file_id="parent-telegram-file")
+        self.store.put_manual_variant(product_id="parent-file", variant_id="inherited", title="Inherited", price_minor=600)
+        self.assertEqual(self.store.manual_variant_delivery("parent-file", "inherited"),
+                         {"delivery_mode": "file", "delivery_payload": "parent-telegram-file"})
+        with self.store._connect() as db:
+            db.execute("ALTER TABLE manual_products DROP COLUMN delivery_file_id")
+            db.execute("DELETE FROM schema_migrations WHERE version=19")
+        migrated = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        product = migrated.get_manual_product("parent-file", enabled_only=False)
+        self.assertEqual(product["title"], "Parent file")
+        self.assertEqual(product["delivery_mode"], "instant")
+        with migrated._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=19 AND name='manual_product_telegram_file_delivery'").fetchone()[0], 1)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_manual_variant_file_delivery_uses_variant_snapshot_and_owner_scope(self):
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="variant-file-fund", amount_minor=1000, entry_type="deposit")
+        self.store.put_manual_product(product_id="variant-file", title="Course", price_minor=900,
+            currency="IRR", delivery_mode="manual")
+        self.store.put_manual_variant(product_id="variant-file", variant_id="basic", title="Basic", price_minor=500)
+        self.store.set_manual_variant_file(product_id="variant-file", variant_id="basic", file_id="telegram-variant-file-id")
+        quote = self.store.manual_variant_quote_hash("variant-file", "basic")
+        order = self.store.buy_manual_product(telegram_id=1001, product_id="variant-file", variant_id="basic",
+            idempotency_key="variant-file-order", expected_variant_quote_hash=quote)
+        self.assertEqual((order["title"], order["delivery_mode"], order["delivery_payload"]),
+                         ("Course — Basic", "file", "telegram-variant-file-id"))
+        self.assertEqual(self.store.get_manual_order_delivery(order_id=order["order_id"], telegram_id=1001)["title"],
+                         "Course — Basic")
+        other = CustomerDataStore(self.path, tenant_id="bot-beta")
+        self.assertIsNone(other.get_manual_order_delivery(order_id=order["order_id"], telegram_id=1001))
 
     def test_manual_product_variants_snapshot_price_and_reserve_variant_stock(self):
         self.store.ensure_customer(1001, "alice", "Alice")

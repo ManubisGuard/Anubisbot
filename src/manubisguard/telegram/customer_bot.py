@@ -105,8 +105,8 @@ ADMIN_ONLY_COMMANDS = frozenset({
     "/product-orders", "/product-order", "/product-order-check", "/product-order-finalize",
     "/backup-policy", "/notify-route",
     "/admin-notifications", "/admin-notification-retry", "/ticket-notification-retry",
-    "/manual-key", "/manual-orders", "/manual-fulfill", "/manual-notification-retry",
-    "/manual-product", "/product", "/reseller-plan", "/reseller-plans",
+    "/manual-key", "/manual-file", "/manual-orders", "/manual-fulfill", "/manual-notification-retry",
+    "/manual-product", "/manual-variant", "/product", "/reseller-plan", "/reseller-plans",
     "/reseller-plan-enable", "/products", "/resellers", "/tickets", "/reply", "/admin",
 })
 
@@ -1098,6 +1098,25 @@ class CustomerBot:
             except (ValueError, CustomerStoreError) as exc:
                 await self.api.send_text(chat_id, f"کلید ذخیره نشد: {exc}", ADMIN_MENU)
             return
+        if is_admin and command == "/manual-file":
+            payload = text.partition(" ")[2].strip()
+            document = message.get("document") or {}
+            file_id = str(document.get("file_id") or "").strip()
+            try:
+                if not file_id:
+                    raise ValueError("یک فایل را به‌صورت Document همراه کپشن /manual-file PRODUCT_ID [| VARIANT_ID] ارسال کن.")
+                fields = [part.strip() for part in payload.split("|")]
+                if len(fields) == 1 and fields[0]:
+                    self.data.set_manual_product_file(product_id=fields[0], file_id=file_id)
+                    await self.api.send_text(chat_id, "فایل محصول ذخیره شد. خریدهای بعدی این محصول فایل را پس از پرداخت دریافت می‌کنند.", ADMIN_MENU)
+                elif len(fields) == 2 and all(fields):
+                    self.data.set_manual_variant_file(product_id=fields[0], variant_id=fields[1], file_id=file_id)
+                    await self.api.send_text(chat_id, "فایل این نوع محصول ذخیره شد. فایل فقط پس از خرید موفق همان نوع ارسال می‌شود.", ADMIN_MENU)
+                else:
+                    raise ValueError("فرمت: ارسال Document با کپشن /manual-file PRODUCT_ID یا /manual-file PRODUCT_ID | VARIANT_ID")
+            except (ValueError, CustomerStoreError) as exc:
+                await self.api.send_text(chat_id, f"فایل محصول ذخیره نشد: {exc}", ADMIN_MENU)
+            return
         if is_admin and command == "/manual-variant":
             payload = text.partition(" ")[2].strip()
             try:
@@ -1207,6 +1226,7 @@ class CustomerBot:
                 "/manual-variant add PRODUCT_ID | VARIANT_ID | عنوان | قیمت [| instant/manual/inventory/- | DELIVERY_PAYLOAD/-]\n"
                 "/manual-variant edit PRODUCT_ID | VARIANT_ID | عنوان | قیمت [| instant/manual/inventory/- | DELIVERY_PAYLOAD/-]\n"
                 "/manual-variant archive PRODUCT_ID | VARIANT_ID\n/manual-variant list PRODUCT_ID\n"
+                "فایل محصول: ارسال Document با کپشن /manual-file PRODUCT_ID؛ فایل یک نوع: /manual-file PRODUCT_ID | VARIANT_ID\n"
                 "برای موجودی محصول ساده: /manual-key add PRODUCT_ID | KEY؛ برای موجودی یک نوع: /manual-key add PRODUCT_ID | KEY | VARIANT_ID. "
                 "اگر محصول نوع فعال داشته باشد، خرید باید با انتخاب یک نوع انجام شود.")
             if payload == "list":
@@ -1998,14 +2018,16 @@ class CustomerBot:
                     for v, mode in zip(variants, variant_modes)
                 )
                 stock_count = variant_inventory_total if "inventory" in variant_modes else None
-                delivery_text = ({"instant":"تحویل خودکار", "manual":"تحویل توسط پشتیبانی", "inventory":"تحویل کلید یکتا از موجودی"}[variant_modes[0]]
+                delivery_text = ({"instant":"تحویل خودکار", "manual":"تحویل توسط پشتیبانی", "inventory":"تحویل کلید یکتا از موجودی", "file":"ارسال فایل پس از خرید"}[variant_modes[0]]
                                  if len(set(variant_modes)) == 1 else "روش تحویل بر اساس نوع انتخابی")
                 stock_text = " — ناموجود" if is_out_of_stock else (f" — موجودی انواع انباردار: {stock_count}" if stock_count is not None else "")
             else:
                 is_out_of_stock = item["delivery_mode"] == "inventory" and self.data.manual_inventory_count(item["product_id"]) == 0
                 stock_count = self.data.manual_inventory_count(item["product_id"]) if item["delivery_mode"] == "inventory" else None
                 stock_text = " — ناموجود" if is_out_of_stock else (" — موجود" if item["delivery_mode"] == "inventory" else "")
-                delivery_text = "تحویل خودکار" if item["delivery_mode"] == "instant" else ("تحویل کلید یکتا از موجودی" if item["delivery_mode"] == "inventory" else "تحویل توسط پشتیبانی")
+                delivery_text = ("تحویل خودکار" if item["delivery_mode"] == "instant" else
+                    "تحویل کلید یکتا از موجودی" if item["delivery_mode"] == "inventory" else
+                    "ارسال فایل پس از خرید" if item["delivery_mode"] == "file" else "تحویل توسط پشتیبانی")
             description = str(item.get("description") or "").strip()
             summary = description if len(description) <= 180 else description[:177].rstrip() + "..."
             image_url = str(item.get("image_url") or "").strip()
@@ -2156,6 +2178,20 @@ class CustomerBot:
         except Exception as exc:
             LOG.warning("Security alert enqueue failed (%s)", type(exc).__name__)
 
+    async def _send_manual_file_delivery(self, chat_id: int, order: dict[str, Any]) -> None:
+        order_id = str(order.get("order_id") or "")
+        caption = (f"✅ سفارش {order_id[:20]}\nمحصول: {str(order.get('title') or '')[:180]}\n"
+                   f"مبلغ: {int(order.get('amount_minor') or 0):,} {order.get('currency') or ''}")[:1024]
+        keyboard = {"inline_keyboard": [[{"text": "📥 دریافت دوباره فایل", "callback_data": f"customer:file_retry:{order_id}"}],
+                                         [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}]]}
+        try:
+            await self.api.call("sendDocument", {"chat_id": chat_id, "document": str(order["delivery_payload"]),
+                "caption": caption, "protect_content": True, "reply_markup": keyboard})
+        except Exception as exc:
+            LOG.warning("Manual file delivery failed for order %s (%s)", order_id[:20], type(exc).__name__)
+            await self.api.send_text(chat_id,
+                f"خرید ثبت شده و مبلغ دوباره کسر نمی‌شود؛ ارسال فایل ناموفق بود. با دکمه زیر دوباره تلاش کن.\nشناسه سفارش: {order_id}", keyboard)
+
     async def _handle_callback(self, query: dict[str, Any]) -> None:
         callback_id = query.get("id")
         message = query.get("message") or {}
@@ -2189,6 +2225,8 @@ class CustomerBot:
             ("customer:manualbuy", "menu_shop_enabled"),
             ("customer:manualbuy_confirm", "menu_shop_enabled"),
             ("customer:mv", "menu_shop_enabled"),
+            ("customer:mp", "menu_shop_enabled"),
+            ("customer:file_retry", "menu_shop_enabled"),
             ("customer:category", "menu_shop_enabled"),
             ("customer:buy", "menu_shop_enabled"),
             ("customer:buy_confirm", "menu_shop_enabled"),
@@ -2614,6 +2652,14 @@ class CustomerBot:
         if key == "trials":
             await self.api.send_text(chat_id, "🧪 قابلیت تست/اشتراک آزمایشی هنوز پیاده‌سازی نشده و فعلاً در دسترس نیست. این گزینه تا زمان اتصال جریان واقعی فعال نخواهد شد.", BACK_MENU)
             return
+        if key.startswith("file_retry:"):
+            order_id = key.partition(":")[2].strip()
+            order = self.data.get_manual_order_delivery(order_id=order_id, telegram_id=uid) if order_id else None
+            if not order:
+                await self.api.send_text(chat_id, "فایل این سفارش در دسترس نیست یا سفارش متعلق به حساب شما نیست.", BACK_MENU)
+                return
+            await self._send_manual_file_delivery(chat_id, order)
+            return
         if key.startswith("manualbuy:") and not key.startswith("manualbuy_confirm:"):
             selection = key.partition(":")[2]
             product_id, separator, variant_id = selection.partition("~")
@@ -2649,7 +2695,8 @@ class CustomerBot:
                 return
             price = int(selected_variant["price_minor"] if selected_variant else product["price_minor"])
             display_title = str(product["title"]) + (" — " + str(selected_variant["title"]) if selected_variant else "")
-            delivery_label = "خودکار پس از پرداخت" if selected_mode in {"instant", "inventory"} else "دستی توسط پشتیبانی"
+            delivery_label = ("خودکار پس از پرداخت" if selected_mode in {"instant", "inventory"} else
+                "ارسال فایل تلگرام پس از پرداخت" if selected_mode == "file" else "دستی توسط پشتیبانی")
             cap = int(product.get("max_purchases_per_customer") or 0)
             cap_text = f"\nسقف خرید هر مشتری: {cap}" if cap else "\nسقف خرید: نامحدود"
             description = str(product.get("description") or "").strip()
@@ -2663,24 +2710,31 @@ class CustomerBot:
                 quote_hash = self.data.manual_variant_quote_hash(product_id, variant_id)
                 callback_data = f"customer:mv:{selected_key}:{quote_hash}"
             else:
-                callback_data = f"customer:manualbuy_confirm:{selected_key}:{terms_hash}" if terms_hash else f"customer:manualbuy_confirm:{selected_key}"
+                # Base products also bind the final confirmation to price and delivery config.
+                quote_hash = self.data.manual_product_quote_hash(product_id)
+                callback_data = f"customer:mp:{product_id}:{quote_hash}"
             confirm_label = "می‌پذیرم و خرید" if terms_text else "تأیید خرید"
             await self.api.send_text(chat_id, f"تأیید خرید «{display_title}»\nقیمت نهایی: {price:,} {product['currency']}{description_text}{terms_display}\nموجودی کیف پول: {self.data.wallet_balance(uid, product['currency']):,} {product['currency']}{cap_text}\nتحویل: {delivery_label}",
                 {"inline_keyboard":[[{"text":confirm_label,"callback_data":callback_data,"style":"success"}],[{"text":"بازگشت به فروشگاه","callback_data":"customer:shop"}]]})
             return
-        if key.startswith("manualbuy_confirm:") or key.startswith("mv:"):
+        if key.startswith(("manualbuy_confirm:", "mv:", "mp:")):
             confirmation = key.partition(":")[2]
             selection, sep, accepted_hash = confirmation.partition(":")
             product_id, variant_sep, variant_id = selection.partition("~")
             is_variant_confirmation = key.startswith("mv:")
+            is_product_quote_confirmation = key.startswith("mp:")
             try:
                 result = self.data.buy_manual_product(telegram_id=uid, product_id=product_id,
                     variant_id=variant_id if variant_sep else "",
                     idempotency_key=f"manual-buy:{uid}:{message.get('message_id') or 0}:{product_id}:{variant_id if variant_sep else 'base'}",
-                    expected_terms_hash=accepted_hash if sep and not is_variant_confirmation else None,
-                    expected_variant_quote_hash=accepted_hash if sep and is_variant_confirmation else None)
+                    expected_terms_hash=accepted_hash if sep and not is_variant_confirmation and not is_product_quote_confirmation else None,
+                    expected_variant_quote_hash=accepted_hash if sep and is_variant_confirmation else None,
+                    expected_manual_quote_hash=accepted_hash if sep and is_product_quote_confirmation else None)
                 already_processed = bool(result.get("idempotent_replay"))
                 purchase_label = "این خرید قبلاً ثبت شده است" if already_processed else "خرید انجام شد"
+                if result["delivery_mode"] == "file":
+                    await self._send_manual_file_delivery(chat_id, result)
+                    return
                 if result["delivery_mode"] in {"instant", "inventory"}:
                     body = f"✅ {purchase_label}\nمحصول: {result['title']}\nمبلغ: {int(result['amount_minor']):,} {result['currency']}\nشناسه سفارش: {result['order_id']}\n\nاطلاعات محصول:\n{result['delivery_payload']}"
                 elif result.get("status") == "fulfilled" and result.get("delivery_payload"):

@@ -442,7 +442,7 @@ class CustomerDataStore:
                     int(row["version"])
                     for row in db.execute("SELECT version FROM schema_migrations").fetchall()
                 }
-                unknown_versions = sorted(version for version in applied if version > 18)
+                unknown_versions = sorted(version for version in applied if version > 19)
                 if unknown_versions:
                     raise CustomerStoreError(
                         "Database schema is newer than this application supports"
@@ -895,6 +895,15 @@ class CustomerDataStore:
                 db.execute("""CREATE TRIGGER IF NOT EXISTS customer_product_order_reconciliation_events_no_delete
                     BEFORE DELETE ON customer_product_order_reconciliation_events
                     BEGIN SELECT RAISE(ABORT, 'product order reconciliation events are append-only'); END""")
+                # v19 adds a separate Telegram file ID column, preserving the legacy
+                # delivery_mode CHECK constraint and all existing product rows.
+                if 19 not in applied:
+                    product_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(manual_products)").fetchall()}
+                    if "delivery_file_id" not in product_columns:
+                        db.execute("ALTER TABLE manual_products ADD COLUMN delivery_file_id TEXT NOT NULL DEFAULT ''")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(19,?)",
+                               ("manual_product_telegram_file_delivery",))
+                    applied.add(19)
                 db.commit()
             except Exception:
                 db.rollback()
@@ -922,10 +931,15 @@ class CustomerDataStore:
         currency = currency.upper()
         if len(currency) != 3 or not currency.isascii() or not currency.isalpha():
             raise CustomerStoreError("Currency must be a three-letter ASCII code")
-        if delivery_mode not in {"instant", "manual", "inventory"}:
-            raise CustomerStoreError("Delivery mode must be instant, inventory or manual")
+        if delivery_mode not in {"instant", "manual", "inventory", "file"}:
+            raise CustomerStoreError("Delivery mode must be instant, inventory, manual or file")
         if delivery_mode == "instant" and not delivery_payload.strip():
             raise CustomerStoreError("Instant text delivery requires a non-empty delivery payload")
+        if delivery_mode == "file" and (not delivery_payload.strip() or len(delivery_payload) > 512):
+            raise CustomerStoreError("File delivery requires a valid Telegram document file_id; attach the document with /manual-file")
+        stored_delivery_mode = "instant" if delivery_mode == "file" else delivery_mode
+        stored_delivery_payload = "" if delivery_mode == "file" else delivery_payload
+        delivery_file_id = delivery_payload.strip() if delivery_mode == "file" else ""
         if max_purchases_per_customer is not None and (
                 isinstance(max_purchases_per_customer, bool)
                 or not isinstance(max_purchases_per_customer, int)
@@ -998,12 +1012,12 @@ class CustomerDataStore:
                 raise CustomerStoreError("Manual product category does not exist")
             db.execute("""INSERT INTO manual_products
                 (tenant_id,product_id,category_id,title,description,price_minor,currency,delivery_mode,delivery_payload,enabled,
-                 max_purchases_per_customer,sort_order,terms_text,image_url,visible_from_utc,visible_until_utc)
-                VALUES(?,?,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,0),?,COALESCE(?,''),COALESCE(?,''),COALESCE(?,'' ))
+                 max_purchases_per_customer,sort_order,terms_text,image_url,visible_from_utc,visible_until_utc,delivery_file_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,0),?,COALESCE(?,''),COALESCE(?,''),COALESCE(?,''),COALESCE(?,''))
                 ON CONFLICT(tenant_id,product_id) DO UPDATE SET
                 category_id=excluded.category_id,title=excluded.title,description=excluded.description,
                 price_minor=excluded.price_minor,currency=excluded.currency,delivery_mode=excluded.delivery_mode,
-                delivery_payload=excluded.delivery_payload,enabled=excluded.enabled,terms_text=excluded.terms_text,
+                delivery_payload=excluded.delivery_payload,delivery_file_id=excluded.delivery_file_id,enabled=excluded.enabled,terms_text=excluded.terms_text,
                 image_url=CASE WHEN ? IS NULL THEN manual_products.image_url ELSE excluded.image_url END,
                 visible_from_utc=CASE WHEN ? IS NULL THEN manual_products.visible_from_utc ELSE excluded.visible_from_utc END,
                 visible_until_utc=CASE WHEN ? IS NULL THEN manual_products.visible_until_utc ELSE excluded.visible_until_utc END,
@@ -1012,20 +1026,27 @@ class CustomerDataStore:
                 sort_order=CASE WHEN ? IS NULL THEN manual_products.sort_order ELSE excluded.sort_order END,
                 updated_at=CURRENT_TIMESTAMP""",
                 (self.tenant_id,product_id.strip(),category_id,title.strip()[:160],description[:4000],price_minor,currency,
-                 delivery_mode,delivery_payload[:12000],int(enabled),max_purchases_per_customer,sort_order,terms_text.strip(),
-                 image_url,visible_from_utc,visible_until_utc,image_url,visible_from_utc,visible_until_utc,
+                 stored_delivery_mode,stored_delivery_payload[:12000],int(enabled),max_purchases_per_customer,sort_order,terms_text.strip(),
+                 image_url,visible_from_utc,visible_until_utc,delivery_file_id,image_url,visible_from_utc,visible_until_utc,
                  max_purchases_per_customer,sort_order))
 
     @staticmethod
     def _effective_manual_variant_delivery(product: dict[str, Any], variant: dict[str, Any] | None = None) -> tuple[str, str]:
         mode_value = variant.get("delivery_mode") if variant else None
         payload_value = variant.get("delivery_payload") if variant else None
-        mode = str(mode_value or product["delivery_mode"])
-        payload = str(payload_value if payload_value is not None else (product.get("delivery_payload") or ""))
-        if mode not in {"instant", "manual", "inventory"}:
+        inherited_file_id = str(product.get("delivery_file_id") or
+                                (product.get("delivery_payload") if product.get("delivery_mode") == "file" else "") or "")
+        if mode_value is None and inherited_file_id:
+            mode, payload = "file", inherited_file_id
+        else:
+            mode = str(mode_value or product["delivery_mode"])
+            payload = str(payload_value if payload_value is not None else (product.get("delivery_payload") or ""))
+        if mode not in {"instant", "manual", "inventory", "file"}:
             raise CustomerStoreError("Variant delivery mode is invalid")
         if mode == "instant" and not payload.strip():
             raise CustomerStoreError("Instant variant delivery requires a non-empty effective payload")
+        if mode == "file" and (not payload.strip() or len(payload) > 512):
+            raise CustomerStoreError("File variant delivery requires a Telegram document file_id")
         return mode, payload
 
     def manual_variant_delivery(self, product_id: str, variant_id: str) -> dict[str, str]:
@@ -1047,6 +1068,18 @@ class CustomerDataStore:
                                  str(price_minor), currency, terms_text.strip(),
                                  delivery_mode, payload_digest))
         return hashlib.sha256(material.encode("utf-8")).hexdigest()[:10]
+
+    def manual_product_quote_hash(self, product_id: str) -> str:
+        """Bind a base-product confirmation to its current price, terms and delivery configuration."""
+        product = self.get_manual_product(product_id, enabled_only=True)
+        if not product:
+            raise CustomerStoreError("این محصول دیگر در دسترس نیست")
+        mode, payload = self._effective_manual_variant_delivery(product, None)
+        return self._manual_variant_quote_hash(product_id=product_id, variant_id="",
+            product_title=str(product["title"]), variant_title="",
+            price_minor=int(product["price_minor"]), currency=str(product["currency"]),
+            terms_text=str(product.get("terms_text") or ""), delivery_mode=mode,
+            delivery_payload=payload)
 
     def manual_variant_quote_hash(self, product_id: str, variant_id: str) -> str:
         product = self.get_manual_product(product_id, enabled_only=True)
@@ -1081,14 +1114,17 @@ class CustomerDataStore:
             existing_variant = db.execute("SELECT * FROM manual_product_variants WHERE tenant_id=? AND product_id=? AND variant_id=?",
                                           (self.tenant_id, product_id, variant_id)).fetchone()
             if delivery_config_provided:
-                if delivery_mode is not None and delivery_mode not in {"instant", "manual", "inventory"}:
-                    raise CustomerStoreError("Variant delivery mode must be instant, inventory, manual or inherited")
+                if delivery_mode is not None and delivery_mode not in {"instant", "manual", "inventory", "file"}:
+                    raise CustomerStoreError("Variant delivery mode must be instant, inventory, manual, file or inherited")
                 if delivery_payload is not None and (not isinstance(delivery_payload, str) or len(delivery_payload) > 12000):
                     raise CustomerStoreError("Variant delivery payload must be text of at most 12000 characters")
-                mode_for_validation = delivery_mode or product["delivery_mode"]
-                payload_for_validation = delivery_payload if delivery_payload is not None else str(product.get("delivery_payload") or "")
+                mode_for_validation = delivery_mode or ("file" if product.get("delivery_file_id") else product["delivery_mode"])
+                payload_for_validation = (delivery_payload if delivery_payload is not None else
+                    str(product.get("delivery_file_id") or product.get("delivery_payload") or ""))
                 if mode_for_validation == "instant" and not payload_for_validation.strip():
                     raise CustomerStoreError("Instant variant delivery requires a non-empty effective payload")
+                if mode_for_validation == "file" and (not payload_for_validation.strip() or len(payload_for_validation) > 512):
+                    raise CustomerStoreError("File variant delivery requires a Telegram document file_id; attach it with /manual-file")
                 stored_delivery_mode, stored_delivery_payload = delivery_mode, delivery_payload
             elif existing_variant:
                 stored_delivery_mode = existing_variant["delivery_mode"]
@@ -1109,6 +1145,60 @@ class CustomerDataStore:
                 updated_at=CURRENT_TIMESTAMP""",
                 (self.tenant_id, product_id, variant_id, title, price_minor, int(bool(enabled)),
                  stored_delivery_mode, stored_delivery_payload))
+
+    @staticmethod
+    def _validate_telegram_document_file_id(file_id: str) -> str:
+        if not isinstance(file_id, str):
+            raise CustomerStoreError("Telegram document file_id is invalid")
+        value = file_id.strip()
+        if not value or len(value) > 512 or any(ord(ch) < 32 for ch in value):
+            raise CustomerStoreError("Telegram document file_id is invalid")
+        return value
+
+    def set_manual_product_file(self, *, product_id: str, file_id: str) -> None:
+        """Attach a Telegram document to a base manual product; only the file ID is stored."""
+        product_id = str(product_id).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", product_id):
+            raise CustomerStoreError("Invalid manual product ID")
+        file_id = self._validate_telegram_document_file_id(file_id)
+        with self._connect() as db:
+            cur = db.execute(
+                "UPDATE manual_products SET delivery_mode='instant',delivery_payload='',delivery_file_id=?,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=? AND product_id=?",
+                (file_id, self.tenant_id, product_id),
+            )
+            if cur.rowcount != 1:
+                raise CustomerStoreError("Manual product not found")
+
+    def set_manual_variant_file(self, *, product_id: str, variant_id: str, file_id: str) -> None:
+        """Attach a Telegram document to one tenant-scoped product variant."""
+        product_id, variant_id = str(product_id).strip(), str(variant_id).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", product_id) or not re.fullmatch(r"[A-Za-z0-9_-]{1,18}", variant_id):
+            raise CustomerStoreError("Invalid manual product or variant ID")
+        file_id = self._validate_telegram_document_file_id(file_id)
+        with self._connect() as db:
+            cur = db.execute(
+                "UPDATE manual_product_variants SET delivery_mode='file',delivery_payload=?,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=? AND product_id=? AND variant_id=?",
+                (file_id, self.tenant_id, product_id, variant_id),
+            )
+            if cur.rowcount != 1:
+                raise CustomerStoreError("Manual product variant not found")
+
+    def get_manual_order_delivery(self, *, order_id: str, telegram_id: int) -> dict[str, Any] | None:
+        """Return a file delivery only to its owning customer and only for a fulfilled file order."""
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT o.order_id,o.telegram_id,o.product_id,o.amount_minor,o.currency,o.status,
+                          o.delivery_mode_snapshot,o.delivery_payload,
+                          COALESCE(NULLIF(o.product_title_snapshot,''),p.title,o.product_id) ||
+                            CASE WHEN COALESCE(o.variant_title_snapshot,'')='' THEN '' ELSE ' — ' || o.variant_title_snapshot END AS title
+                   FROM manual_product_orders o LEFT JOIN manual_products p
+                     ON p.tenant_id=o.tenant_id AND p.product_id=o.product_id
+                   WHERE o.tenant_id=? AND o.order_id=? AND o.telegram_id=?""",
+                (self.tenant_id, str(order_id), int(telegram_id)),
+            ).fetchone()
+        if not row or row["status"] != "fulfilled" or row["delivery_mode_snapshot"] != "file" or not row["delivery_payload"]:
+            return None
+        return dict(row)
 
     def list_manual_variants(self, product_id: str, *, enabled_only: bool = True) -> list[dict[str, Any]]:
         self._ensure_manual_shop_tables()
@@ -1173,7 +1263,7 @@ class CustomerDataStore:
             category_id = category_id.strip()
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", category_id):
                 raise CustomerStoreError("Invalid manual product category ID")
-        sql="SELECT product_id,category_id,title,description,terms_text,image_url,visible_from_utc,visible_until_utc,price_minor,currency,delivery_mode,enabled,max_purchases_per_customer,sort_order FROM manual_products WHERE tenant_id=?"
+        sql="SELECT product_id,category_id,title,description,terms_text,image_url,visible_from_utc,visible_until_utc,price_minor,currency,delivery_mode,delivery_file_id,enabled,max_purchases_per_customer,sort_order FROM manual_products WHERE tenant_id=?"
         args: tuple[Any,...]=(self.tenant_id,)
         if enabled_only:
             sql += """ AND enabled=1 AND (category_id='' OR EXISTS (
@@ -1185,7 +1275,13 @@ class CustomerDataStore:
             sql += " AND category_id=?"
             args += (category_id,)
         sql += " ORDER BY sort_order,created_at,product_id"
-        with self._connect() as db: return [dict(r) for r in db.execute(sql,args).fetchall()]
+        with self._connect() as db:
+            products = [dict(r) for r in db.execute(sql,args).fetchall()]
+        for product in products:
+            file_id = str(product.pop("delivery_file_id", "") or "")
+            if file_id:
+                product["delivery_mode"] = "file"
+        return products
 
     def get_manual_product(self, product_id: str, *, enabled_only: bool = True) -> dict[str, Any] | None:
         self._ensure_manual_shop_tables()
@@ -1199,11 +1295,19 @@ class CustomerDataStore:
                 AND (visible_until_utc='' OR visible_until_utc>strftime('%Y-%m-%dT%H:%M:%SZ','now'))"""
         with self._connect() as db:
             row=db.execute(sql,args).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        product = dict(row)
+        file_id = str(product.pop("delivery_file_id", "") or "")
+        if file_id:
+            product["delivery_mode"] = "file"
+            product["delivery_payload"] = file_id
+        return product
 
     def buy_manual_product(self, *, telegram_id: int, product_id: str, idempotency_key: str,
                            expected_terms_hash: str | None = None, variant_id: str = "",
-                           expected_variant_quote_hash: str | None = None) -> dict[str, Any]:
+                           expected_variant_quote_hash: str | None = None,
+                           expected_manual_quote_hash: str | None = None) -> dict[str, Any]:
         self._ensure_manual_shop_tables()
         db=self._connect()
         try:
@@ -1252,6 +1356,13 @@ class CustomerDataStore:
                     delivery_mode=effective_mode, delivery_payload=effective_payload)
                 if not expected_variant_quote_hash or expected_variant_quote_hash != current_quote_hash:
                     raise CustomerStoreError("قیمت، نام یا شرایط این نوع محصول تغییر کرده است؛ تأیید خرید را دوباره باز کنید")
+            elif expected_manual_quote_hash is not None:
+                current_quote_hash = self._manual_variant_quote_hash(product_id=product_id, variant_id="",
+                    product_title=str(product["title"]), variant_title="", price_minor=purchase_price,
+                    currency=str(product["currency"]), terms_text=current_terms,
+                    delivery_mode=effective_mode, delivery_payload=effective_payload)
+                if expected_manual_quote_hash != current_quote_hash:
+                    raise CustomerStoreError("قیمت، نام، شرایط یا فایل این محصول تغییر کرده است؛ تأیید خرید را دوباره باز کنید")
             elif (current_terms or expected_terms_hash is not None) and expected_terms_hash != current_terms_hash:
                 raise CustomerStoreError("شرایط خرید تغییر کرده یا تأیید نشده است؛ صفحه تأیید خرید را دوباره باز کنید")
             customer=db.execute("SELECT 1 FROM customer_users WHERE tenant_id=? AND telegram_id=?",
@@ -1273,7 +1384,7 @@ class CustomerDataStore:
             order_id=uuid.uuid4().hex
             mode=effective_mode
             status="pending_delivery" if mode=="manual" else "fulfilled"
-            payload=effective_payload if mode=="instant" else ""
+            payload=effective_payload if mode in {"instant", "file"} else ""
             inventory_id=None
             if mode == "inventory":
                 key_row=db.execute("SELECT inventory_id,secret_payload FROM manual_product_inventory WHERE tenant_id=? AND product_id=? AND variant_id=? AND status='available' ORDER BY inventory_id LIMIT 1",
