@@ -1844,7 +1844,7 @@ class CustomerBot:
             f"تخفیف: {int(discount['percentage'])}٪\nمبلغ نهایی: {final:,} {product['currency']}\n"
             "قیمت و سهمیه هنگام تأیید دوباره در پایگاه داده بررسی می‌شود.",
             {"inline_keyboard":[
-                [{"text":"تأیید خرید با تخفیف","callback_data":f"customer:buy_discount_confirm:{product_id}:{quote_hash}"}],
+                [{"text":"تأیید خرید با تخفیف","callback_data":f"customer:bd:{product_id}:{quote_hash}"}],
                 [{"text":"لغو","callback_data":"customer:discount_cancel"}]
             ]})
 
@@ -2376,6 +2376,8 @@ class CustomerBot:
             ("customer:buy", "menu_shop_enabled"),
             ("customer:buy_confirm", "menu_shop_enabled"),
             ("customer:buy_discount", "menu_shop_enabled"),
+            ("customer:buy_discount_confirm", "menu_shop_enabled"),
+            ("customer:bd", "menu_shop_enabled"),
             ("customer:buy_discount_confirm", "menu_shop_enabled"),
             ("customer:discount_cancel", "menu_shop_enabled"),
             ("customer:services", "menu_services_enabled"),
@@ -2968,8 +2970,8 @@ class CustomerBot:
             self._pending_purchase_discount[uid] = {"product_id": product_id, "discount_code": ""}
             await self.api.send_text(chat_id, f"کد تخفیف محصول «{product['title']}» را در پیام بعدی بفرست. برای لغو /cancel را بزن.")
             return
-        if key.startswith("buy_discount_confirm:"):
-            confirmation = key.removeprefix("buy_discount_confirm:")
+        if key.startswith("bd:") or key.startswith("buy_discount_confirm:"):
+            confirmation = key.removeprefix("bd:") if key.startswith("bd:") else key.removeprefix("buy_discount_confirm:")
             product_id, separator, accepted_hash = confirmation.partition(":")
             pending = self._pending_purchase_discount.get(uid) or {}
             if (not separator or not accepted_hash or pending.get("product_id") != product_id

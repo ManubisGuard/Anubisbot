@@ -510,6 +510,8 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
             ("menu_shop_enabled", "customer:manualbuy_confirm:product-1"),
             ("menu_shop_enabled", "customer:mv:product-1~variant-1:quote"),
             ("menu_shop_enabled", "customer:buy_discount_confirm:product-1"),
+            ("menu_shop_enabled", "customer:buy_discount_confirm:product-1:quote"),
+            ("menu_shop_enabled", "customer:bd:product-1:quote"),
             ("menu_services_enabled", "customer:service_detail:service-1"),
             ("menu_services_enabled", "customer:renew_confirm:service-1"),
             ("menu_services_enabled", "customer:topup_execute:service-1"),
@@ -1752,9 +1754,10 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("2,000",quote)
         keyboard=self.bot.api.send_text.await_args.args[2]
         discount_confirm_callback = keyboard["inline_keyboard"][0][0]["callback_data"]
-        self.assertTrue(discount_confirm_callback.startswith("customer:buy_discount_confirm:basic:"))
+        self.assertTrue(discount_confirm_callback.startswith("customer:bd:basic:"))
         quote_hash = discount_confirm_callback.rsplit(":", 1)[1]
         self.assertEqual(len(quote_hash), 20)
+        self.assertLessEqual(len(discount_confirm_callback.encode("utf-8")), 64)
         self.bot.purchase_service.buy_from_wallet=AsyncMock(return_value=PurchaseOutcome(
             order_id="order123",service_id="order123",status="active",amount_minor=2000,
             currency="IRR",username="u999_order123"))
