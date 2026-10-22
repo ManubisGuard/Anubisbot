@@ -72,6 +72,58 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.bot.api.send_text = AsyncMock()
         self.bot.api.answer_callback = AsyncMock()
 
+    async def test_customer_wallet_exposes_manual_deposit_and_private_transaction_history(self):
+        self.bot.data.ensure_customer(999, username="wallet_owner", first_name="Wallet")
+        self.bot.data.ensure_customer(1000, username="other_wallet", first_name="Other")
+        self.bot.data.set_manual_deposit_details(
+            card_number="4111-1111-1111-1111", account_holder="Wallet Test", bank_name="Test Bank")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="wallet-history-own-1",
+            amount_minor=4321, currency="IRR", entry_type="deposit", note="PRIVATE_INTERNAL_NOTE")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="wallet-history-own-2",
+            amount_minor=222, currency="IRR", entry_type="deposit")
+        self.bot.data.post_wallet_entry(telegram_id=1000, idempotency_key="wallet-history-other",
+            amount_minor=987654, currency="IRR", entry_type="deposit")
+
+        query = {"from": {"id": 999}, "message": {"message_id": 17,
+            "chat": {"id": 999, "type": "private"}}}
+        await self.bot._handle_callback({**query, "id": "wallet-home", "data": "customer:wallet"})
+        wallet_text = self.bot.api.send_text.await_args.args[1]
+        wallet_keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        wallet_callbacks = {b.get("callback_data") for row in wallet_keyboard for b in row}
+        self.assertIn("customer:wallet:deposit", wallet_callbacks)
+        self.assertIn("customer:wallet:history", wallet_callbacks)
+        self.assertIn("موجودی کیف پول", wallet_text)
+
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({**query, "id": "wallet-deposit", "data": "customer:wallet:deposit"})
+        deposit_text = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("4111111111111111", deposit_text)
+        self.assertIn("/deposit 250000 IRR", deposit_text)
+        self.assertIn("فقط بعد از بررسی مدیر", deposit_text)
+
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({**query, "id": "wallet-history", "data": "customer:wallet:history"})
+        history_text = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("4,321 IRR", history_text)
+        self.assertIn("222 IRR", history_text)
+        self.assertNotIn("987,654", history_text)
+        self.assertNotIn("PRIVATE_INTERNAL_NOTE", history_text)
+        history_callbacks = {b.get("callback_data") for row in self.bot.api.send_text.await_args.args[2]["inline_keyboard"] for b in row}
+        self.assertIn("customer:wallet:deposit", history_callbacks)
+        self.assertIn("customer:home", history_callbacks)
+
+    async def test_customer_wallet_deposit_hides_card_details_when_not_configured(self):
+        query = {"id": "wallet-no-card", "from": {"id": 999},
+            "message": {"message_id": 18, "chat": {"id": 999, "type": "private"}},
+            "data": "customer:wallet:deposit"}
+        await self.bot._handle_callback(query)
+        body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("اطلاعات کارت‌به‌کارت توسط مدیر تنظیم نشده", body)
+        self.assertNotIn("شماره کارت:", body)
+        callbacks = {b.get("callback_data") for row in self.bot.api.send_text.await_args.args[2]["inline_keyboard"] for b in row}
+        self.assertIn("customer:support", callbacks)
+        self.assertIn("customer:wallet", callbacks)
+
     async def test_customer_menu_exposes_order_history_and_empty_history_has_safe_navigation(self):
         menu = self.bot._customer_menu(customer_id=1001)
         callbacks = [button.get("callback_data") for row in menu["inline_keyboard"] for button in row]

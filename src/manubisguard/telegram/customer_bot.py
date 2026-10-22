@@ -2709,7 +2709,54 @@ class CustomerBot:
             debt_lines = [f"• {currency}: {amount:,}" for currency, amount in debts.items()] or ["• بدون بدهی معوق"]
             await self.api.send_text(chat_id, "💳 موجودی کیف پول:\n" + "\n".join(balance_lines) +
                 "\n\n⏳ بدهی ساعتی/مصرفی:\n" + "\n".join(debt_lines) +
-                "\n\nدرگاه خودکار هنوز متصل نیست؛ شارژ دستی فقط پس از تأیید پرداخت توسط مدیر ثبت می‌شود.", BACK_MENU)
+                "\n\nدرگاه خودکار متصل نیست؛ شارژ دستی فقط پس از بررسی و تأیید مدیر به موجودی اضافه می‌شود.",
+                {"inline_keyboard": [
+                    [{"text": "➕ شارژ دستی کیف پول", "callback_data": "customer:wallet:deposit"}],
+                    [{"text": "📜 گردش حساب", "callback_data": "customer:wallet:history"}],
+                    [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
+                ]})
+            return
+        if key == "wallet:deposit":
+            details = self.data.get_manual_deposit_details()
+            if not details:
+                await self.api.send_text(chat_id,
+                    "فعلاً اطلاعات کارت‌به‌کارت توسط مدیر تنظیم نشده است. پیش از واریز با پشتیبانی هماهنگ کن.",
+                    {"inline_keyboard": [
+                        [{"text": "🎫 پشتیبانی", "callback_data": "customer:support"}],
+                        [{"text": "⬅️ بازگشت به کیف پول", "callback_data": "customer:wallet"}],
+                    ]})
+                return
+            await self.api.send_text(chat_id,
+                f"➕ شارژ دستی کیف پول\n\nبانک: {details['bank_name'] or '—'}\n"
+                f"شماره کارت: {details['card_number']}\nبه نام: {details['account_holder']}\n\n"
+                "برای ساخت درخواست شارژ، مبلغ را به کوچک‌ترین واحد ارز وارد کن؛ برای ریال نمونه: /deposit 250000 IRR\n"
+                "پس از ساخت درخواست، شناسه پرداخت و دستور ثبت رسید نمایش داده می‌شود. موجودی فقط بعد از بررسی مدیر افزایش می‌یابد.",
+                {"inline_keyboard": [
+                    [{"text": "📜 گردش حساب", "callback_data": "customer:wallet:history"}],
+                    [{"text": "⬅️ بازگشت به کیف پول", "callback_data": "customer:wallet"}],
+                    [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
+                ]})
+            return
+        if key == "wallet:history":
+            entries = self.data.list_wallet_transactions(uid, limit=10)
+            labels = {
+                "deposit": "واریز", "deposit_verified": "شارژ تأییدشده", "purchase": "خرید",
+                "refund": "بازپرداخت", "debit": "برداشت", "adjustment": "اصلاح موجودی",
+                "service_charge": "هزینه سرویس", "renewal": "تمدید", "traffic_topup": "افزایش حجم",
+            }
+            lines = ["📜 گردش حساب کیف پول (۱۰ تراکنش اخیر)"]
+            for entry in entries:
+                amount = int(entry["amount_minor"])
+                sign = "+" if amount > 0 else ""
+                lines.append(f"\n• {labels.get(entry['entry_type'], 'تراکنش')} | {sign}{amount:,} {entry['currency']}\n"
+                             f"شناسه: {entry['entry_id']} | زمان: {entry['created_at']}")
+            if not entries:
+                lines.append("\nهنوز تراکنشی برای این حساب ثبت نشده است.")
+            await self.api.send_text(chat_id, "\n".join(lines), {"inline_keyboard": [
+                [{"text": "➕ شارژ دستی کیف پول", "callback_data": "customer:wallet:deposit"}],
+                [{"text": "⬅️ بازگشت به کیف پول", "callback_data": "customer:wallet"}],
+                [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
+            ]})
             return
         if key in PAGES:
             title, description = PAGES[key]
