@@ -989,6 +989,10 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_message(command)
         self.assertEqual(self.bot.data.wallet_balance(999),2500)
         self.assertEqual(self.bot.data.get_payment_attempt(payment_id)["status"],"verified")
+        customer_approval_messages = [call for call in self.bot.api.send_text.await_args_list
+            if call.args[0] == 999 and "شارژ کیف پول تأیید شد" in call.args[1]]
+        self.assertEqual(len(customer_approval_messages), 1)
+        self.assertEqual(self.bot.data.get_customer_payment_notification(payment_id, "verified")["status"], "sent")
         events = self.bot.data.list_payment_attempt_events(payment_id)
         self.assertEqual([event["event_type"] for event in events], ["created", "verified"])
         self.assertEqual(events[-1]["actor_telegram_id"], 6883349141)
@@ -998,6 +1002,59 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("سابقه تغییرناپذیر پرداخت", history)
         self.assertIn("bank-ref-12345", history)
         self.assertIn("6883349141", history)
+
+    async def test_customer_payment_notification_worker_retries_send_failure_without_leaking_details(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.create_payment_attempt(payment_id="pay-notify-retry", telegram_id=999,
+            provider="manual", amount_minor=1900, currency="IRR", idempotency_key="intent-notify-retry")
+        self.bot.data.settle_verified_wallet_deposit(payment_id="pay-notify-retry", verified_amount_minor=1900,
+            verified_currency="IRR", external_reference="bank-notify-retry", verified_by=6883349141)
+        self.bot.api.send_text = AsyncMock(side_effect=[RuntimeError("private transport details"), None])
+        first = await self.bot._deliver_customer_payment_notifications(now=time.time()+10)
+        self.assertEqual(first["retry"], 1)
+        self.assertEqual(self.bot.data.get_customer_payment_notification("pay-notify-retry", "verified")["status"], "pending")
+        self.assertEqual(self.bot.data.wallet_balance(999), 1900)
+        second = await self.bot._deliver_customer_payment_notifications(now=time.time()+20)
+        self.assertEqual(second["sent"], 1)
+        self.assertEqual(self.bot.data.get_customer_payment_notification("pay-notify-retry", "verified")["status"], "sent")
+        delivered_body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("1,900 IRR", delivered_body)
+        self.assertNotIn("private transport details", delivered_body)
+        self.assertEqual(self.bot.data.wallet_balance(999), 1900)
+
+    async def test_manual_deposit_rejection_notifies_customer_through_durable_outbox(self):
+        await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},
+            "message_id":149,"text":"/deposit 1700 IRR"})
+        payment_id=self.bot.api.send_text.await_args.args[1].split("شناسه پرداخت: ")[1].splitlines()[0]
+        await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},
+            "text":f"/deposit-receipt {payment_id} | bank-reject-149"})
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":f"/wallet-reject {payment_id} | receipt_invalid"})
+        self.assertEqual(self.bot.data.wallet_balance(999), 0)
+        self.assertEqual(self.bot.data.get_payment_attempt(payment_id)["status"], "failed")
+        self.assertEqual(self.bot.data.get_customer_payment_notification(payment_id, "rejected")["status"], "sent")
+        rejected = [call for call in self.bot.api.send_text.await_args_list
+            if call.args[0] == 999 and "رسید واریز تأیید نشد" in call.args[1]]
+        self.assertEqual(len(rejected), 1)
+
+    async def test_admin_can_retry_dead_customer_payment_notification(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.create_payment_attempt(payment_id="pay-notify-dead", telegram_id=999,
+            provider="manual", amount_minor=1100, currency="IRR", idempotency_key="intent-notify-dead")
+        self.bot.data.settle_verified_wallet_deposit(payment_id="pay-notify-dead", verified_amount_minor=1100,
+            verified_currency="IRR", external_reference="bank-notify-dead", verified_by=6883349141)
+        claimed = self.bot.data.claim_customer_payment_notifications(now=time.time()+5)
+        self.assertEqual(len(claimed), 1)
+        self.bot.data.retry_customer_payment_notification(claimed[0]["notification_id"], attempt=8,
+            error_code="runtimeerror", now=time.time()+5, max_attempts=8)
+        self.assertEqual(self.bot.data.get_customer_payment_notification("pay-notify-dead")["status"], "dead")
+        self.bot.api.send_text = AsyncMock(return_value=None)
+        await self.bot._handle_message({"from":{"id":6883349141},"chat":{"id":6883349141,"type":"private"},
+            "text":"/payment-notification-retry pay-notify-dead"})
+        self.assertEqual(self.bot.data.get_customer_payment_notification("pay-notify-dead")["status"], "sent")
+        self.assertTrue(any(call.args[0] == 999 and "1,100 IRR" in call.args[1]
+                            for call in self.bot.api.send_text.await_args_list))
+        self.assertEqual(self.bot.data.wallet_balance(999), 1100)
 
     async def test_manual_deposit_amount_mismatch_never_credits_wallet(self):
         await self.bot._handle_message({

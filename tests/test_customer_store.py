@@ -493,6 +493,86 @@ class CustomerDataStoreTests(unittest.TestCase):
         self.assertEqual(stored["provider_user_id"], "provider-user-original")
         self.assertEqual(stored["subscription_url"], "https://sub.example/original")
 
+    def test_verified_payment_queues_customer_notification_atomically_and_replay_does_not_duplicate(self):
+        self.store.create_payment_attempt(payment_id="pay-customer-outbox", telegram_id=1001,
+            provider="manual", amount_minor=2500, currency="IRR", idempotency_key="intent-customer-outbox")
+        self.store.submit_manual_deposit_receipt(payment_id="pay-customer-outbox", telegram_id=1001,
+            transfer_reference="tracking-outbox-1")
+        with self.store._connect() as db:
+            admin_notice = db.execute("SELECT COUNT(*) FROM customer_admin_notifications WHERE tenant_id=? AND event_key='payment' AND idempotency_key=?",
+                (self.store.tenant_id, "payment-receipt:pay-customer-outbox")).fetchone()[0]
+        self.assertEqual(admin_notice, 1)
+        ledger_id = self.store.settle_verified_wallet_deposit(payment_id="pay-customer-outbox",
+            verified_amount_minor=2500, verified_currency="IRR", external_reference="tracking-outbox-1", verified_by=9001)
+        notice = self.store.get_customer_payment_notification("pay-customer-outbox", "verified")
+        self.assertEqual((notice["status"], notice["telegram_id"], notice["amount_minor"], notice["currency"]),
+                         ("pending", 1001, 2500, "IRR"))
+        claim = self.store.claim_customer_payment_notifications(now=time.time()+2)
+        self.assertEqual(len(claim), 1)
+        self.assertEqual(claim[0]["notification_id"], notice["notification_id"])
+        self.store.mark_customer_payment_notification_sent(notice["notification_id"], now=time.time()+3)
+        replay_ledger = self.store.settle_verified_wallet_deposit(payment_id="pay-customer-outbox",
+            verified_amount_minor=2500, verified_currency="IRR", external_reference="tracking-outbox-1", verified_by=9001)
+        self.assertEqual(ledger_id, replay_ledger)
+        self.assertEqual(self.store.get_customer_payment_notification("pay-customer-outbox", "verified")["status"], "sent")
+        self.assertEqual(self.store.wallet_balance(1001), 2500)
+        with self.store._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM customer_payment_notifications WHERE tenant_id=? AND payment_id=?",
+                (self.store.tenant_id, "pay-customer-outbox")).fetchone()[0], 1)
+
+    def test_rejected_manual_receipt_queues_customer_notification_without_wallet_credit(self):
+        self.store.create_payment_attempt(payment_id="pay-customer-reject", telegram_id=1001,
+            provider="manual", amount_minor=1800, currency="IRR", idempotency_key="intent-customer-reject")
+        self.store.submit_manual_deposit_receipt(payment_id="pay-customer-reject", telegram_id=1001,
+            transfer_reference="tracking-reject-outbox")
+        self.store.reject_manual_deposit_receipt(payment_id="pay-customer-reject", admin_id=9001, reason="receipt_invalid")
+        notice = self.store.get_customer_payment_notification("pay-customer-reject", "rejected")
+        self.assertEqual((notice["status"], notice["telegram_id"], notice["amount_minor"]), ("pending", 1001, 1800))
+        self.assertEqual(self.store.get_payment_attempt("pay-customer-reject")["status"], "failed")
+        self.assertEqual(self.store.wallet_balance(1001), 0)
+        self.assertIsNone(CustomerDataStore(self.path, tenant_id="bot-beta").get_customer_payment_notification("pay-customer-reject"))
+
+    def test_customer_payment_notification_retry_backoff_dead_letter_and_stale_claim_recovery(self):
+        self.store.create_payment_attempt(payment_id="pay-customer-retry", telegram_id=1001,
+            provider="manual", amount_minor=900, currency="IRR", idempotency_key="intent-customer-retry")
+        self.store.settle_verified_wallet_deposit(payment_id="pay-customer-retry", verified_amount_minor=900,
+            verified_currency="IRR", external_reference="tracking-customer-retry")
+        now = time.time()+5
+        first = self.store.claim_customer_payment_notifications(now=now)
+        self.assertEqual(first[0]["attempts"], 1)
+        self.assertEqual(self.store.retry_customer_payment_notification(first[0]["notification_id"],
+            attempt=1, error_code="runtimeerror", now=now, max_attempts=2), "pending")
+        self.assertEqual(self.store.claim_customer_payment_notifications(now=now+3)[0]["attempts"], 2)
+        second = self.store.claim_customer_payment_notifications(now=now+3)
+        self.assertEqual(second, [])
+        # The second claim is currently processing; failing it at the cap dead-letters it.
+        claimed = self.store.claim_customer_payment_notifications(now=now+130)
+        self.assertEqual(claimed[0]["attempts"], 3)
+        self.assertEqual(self.store.retry_customer_payment_notification(claimed[0]["notification_id"],
+            attempt=3, error_code="runtimeerror", now=now+130, max_attempts=2), "dead")
+        self.assertTrue(self.store.retry_customer_payment_notification_now("pay-customer-retry"))
+        reset = self.store.get_customer_payment_notification("pay-customer-retry")
+        self.assertEqual((reset["status"], reset["attempts"]), ("pending", 0))
+        final_claim = self.store.claim_customer_payment_notifications(now=now+131)
+        self.assertEqual(final_claim[0]["attempts"], 1)
+        self.store.mark_customer_payment_notification_sent(final_claim[0]["notification_id"], now=now+132)
+        self.assertEqual(self.store.get_customer_payment_notification("pay-customer-retry")["status"], "sent")
+
+    def test_v20_customer_payment_notification_migration_is_additive_and_idempotent(self):
+        self.store.create_payment_attempt(payment_id="legacy-payment-v20", telegram_id=1001,
+            provider="manual", amount_minor=700, currency="IRR", idempotency_key="legacy-intent-v20")
+        with self.store._connect() as db:
+            db.execute("DROP TABLE customer_payment_notifications")
+            db.execute("DELETE FROM schema_migrations WHERE version=20")
+        migrated = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        self.assertEqual(migrated.get_payment_attempt("legacy-payment-v20")["status"], "pending")
+        with migrated._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=20 AND name='customer_payment_notification_outbox'").fetchone()[0], 1)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+        reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
+        with reopened._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 20)
+
     def test_verified_payment_credits_wallet_once(self):
         self.store.create_payment_attempt(
             payment_id="pay-1", telegram_id=1001, provider="mock", amount_minor=2500,
@@ -998,7 +1078,7 @@ class CustomerDataStoreTests(unittest.TestCase):
                 "SELECT version, name FROM schema_migrations ORDER BY version"
             ).fetchall()
             self.assertEqual([(row["version"], row["name"]) for row in versions],
-                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"), (10, "manual_product_category_binding"), (11, "manual_product_customer_purchase_limit"), (12, "manual_product_sort_order"), (13, "manual_product_terms_snapshot"), (14, "manual_product_image_url"), (15, "manual_product_visibility_schedule"), (16, "manual_product_variants"), (17, "manual_variant_delivery_overrides"), (18, "product_order_reconciliation_audit"), (19, "manual_product_telegram_file_delivery")])
+                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"), (10, "manual_product_category_binding"), (11, "manual_product_customer_purchase_limit"), (12, "manual_product_sort_order"), (13, "manual_product_terms_snapshot"), (14, "manual_product_image_url"), (15, "manual_product_visibility_schedule"), (16, "manual_product_variants"), (17, "manual_variant_delivery_overrides"), (18, "product_order_reconciliation_audit"), (19, "manual_product_telegram_file_delivery"), (20, "customer_payment_notification_outbox")])
 
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         with reopened._connect() as db:
@@ -1006,7 +1086,7 @@ class CustomerDataStoreTests(unittest.TestCase):
                 "SELECT version, name FROM schema_migrations ORDER BY version"
             ).fetchall()
             self.assertEqual([(row["version"], row["name"]) for row in versions],
-                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"), (10, "manual_product_category_binding"), (11, "manual_product_customer_purchase_limit"), (12, "manual_product_sort_order"), (13, "manual_product_terms_snapshot"), (14, "manual_product_image_url"), (15, "manual_product_visibility_schedule"), (16, "manual_product_variants"), (17, "manual_variant_delivery_overrides"), (18, "product_order_reconciliation_audit"), (19, "manual_product_telegram_file_delivery")])
+                             [(1, "core_additive_legacy_migrations"), (2, "service_change_operations_and_audit"), (3, "manual_shop_tables"), (4, "manual_order_purchase_snapshot"), (5, "manual_delivery_notification_outbox"), (6, "customer_ticket_notification_outbox"), (7, "per_event_telegram_notification_routes"), (8, "tenant_backup_policy_disabled_by_default"), (9, "durable_per_destination_admin_notification_outbox"), (10, "manual_product_category_binding"), (11, "manual_product_customer_purchase_limit"), (12, "manual_product_sort_order"), (13, "manual_product_terms_snapshot"), (14, "manual_product_image_url"), (15, "manual_product_visibility_schedule"), (16, "manual_product_variants"), (17, "manual_variant_delivery_overrides"), (18, "product_order_reconciliation_audit"), (19, "manual_product_telegram_file_delivery"), (20, "customer_payment_notification_outbox")])
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_representative_unversioned_legacy_database_preserves_business_rows(self):
@@ -1069,7 +1149,7 @@ class CustomerDataStoreTests(unittest.TestCase):
                  (11, "manual_product_customer_purchase_limit"),
                  (12, "manual_product_sort_order"),
                  (13, "manual_product_terms_snapshot"), (14, "manual_product_image_url"),
-                 (15, "manual_product_visibility_schedule"), (16, "manual_product_variants"), (17, "manual_variant_delivery_overrides"), (18, "product_order_reconciliation_audit"), (19, "manual_product_telegram_file_delivery")],
+                 (15, "manual_product_visibility_schedule"), (16, "manual_product_variants"), (17, "manual_variant_delivery_overrides"), (18, "product_order_reconciliation_audit"), (19, "manual_product_telegram_file_delivery"), (20, "customer_payment_notification_outbox")],
             )
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertIn("category_id", {
@@ -1140,7 +1220,7 @@ class CustomerDataStoreTests(unittest.TestCase):
         # A second open must not reapply or duplicate either migration.
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         with reopened._connect() as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 19)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 20)
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_v11_manual_purchase_cap_migration_preserves_legacy_products_and_reopens_idempotently(self):
@@ -1162,7 +1242,7 @@ class CustomerDataStoreTests(unittest.TestCase):
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         self.assertEqual(reopened.get_manual_product("legacy-cap-item")["max_purchases_per_customer"], 0)
         with reopened._connect() as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 19)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 20)
 
     def test_v12_manual_product_sort_order_migration_preserves_legacy_rows(self):
         self.store.put_manual_product(product_id="legacy-sort-item", title="Legacy sort item", price_minor=500,
@@ -1182,7 +1262,7 @@ class CustomerDataStoreTests(unittest.TestCase):
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         self.assertEqual(reopened.get_manual_product("legacy-sort-item")["sort_order"], 0)
         with reopened._connect() as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 19)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 20)
 
     def test_manual_product_image_url_validation_and_edit_preservation(self):
         self.store.put_manual_product(product_id="image-item", title="Image item", price_minor=500,
@@ -1220,7 +1300,7 @@ class CustomerDataStoreTests(unittest.TestCase):
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         self.assertEqual(reopened.get_manual_product("legacy-image")["image_url"], "")
         with reopened._connect() as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 19)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 20)
 
     def test_manual_product_schedule_filters_catalog_and_purchase_and_preserves_on_edit(self):
         self.store.ensure_customer(1001, first_name="Buyer")
@@ -1287,7 +1367,7 @@ class CustomerDataStoreTests(unittest.TestCase):
         reopened = CustomerDataStore(self.path, tenant_id="bot-alpha")
         self.assertEqual(reopened.get_manual_product("legacy-schedule", enabled_only=False)["visible_from_utc"], "")
         with reopened._connect() as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 19)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 20)
 
     def test_manual_product_terms_are_snapshotted_and_changed_terms_require_reconfirmation(self):
         import hashlib

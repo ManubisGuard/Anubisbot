@@ -47,6 +47,26 @@ class CustomerDataStore:
         db.execute("PRAGMA synchronous=FULL")
         return db
 
+    def _enqueue_customer_payment_notification_in_transaction(self, db: sqlite3.Connection, *,
+            payment_id: str, telegram_id: int, event_type: str, amount_minor: int, currency: str,
+            now: float | None = None) -> int:
+        if event_type not in {"verified", "rejected"}:
+            raise CustomerStoreError("Unsupported customer payment notification event")
+        ts = time.time() if now is None else float(now)
+        cur = db.execute("""INSERT OR IGNORE INTO customer_payment_notifications
+            (tenant_id,payment_id,telegram_id,event_type,amount_minor,currency,status,attempts,available_at,created_at)
+            VALUES(?,?,?,?,?,?,'pending',0,?,?)""",
+            (self.tenant_id, payment_id, telegram_id, event_type, amount_minor, currency, ts, ts))
+        row = db.execute("""SELECT notification_id,telegram_id,amount_minor,currency FROM customer_payment_notifications
+            WHERE tenant_id=? AND payment_id=? AND event_type=?""",
+            (self.tenant_id, payment_id, event_type)).fetchone()
+        if row is None:
+            raise CustomerStoreError("Customer payment notification could not be persisted")
+        if (int(row["telegram_id"]) != telegram_id or int(row["amount_minor"]) != amount_minor
+                or str(row["currency"]) != currency):
+            raise CustomerStoreError("Customer payment notification replay conflicts with original event")
+        return int(row["notification_id"])
+
     def _enqueue_trust_event_in_transaction(self, db: sqlite3.Connection, *, event_type: str,
                                             idempotency_key: str, payload: dict[str, Any]) -> None:
         """Insert a privacy-filtered outbox row in the same SQLite business transaction."""
@@ -442,7 +462,7 @@ class CustomerDataStore:
                     int(row["version"])
                     for row in db.execute("SELECT version FROM schema_migrations").fetchall()
                 }
-                unknown_versions = sorted(version for version in applied if version > 19)
+                unknown_versions = sorted(version for version in applied if version > 20)
                 if unknown_versions:
                     raise CustomerStoreError(
                         "Database schema is newer than this application supports"
@@ -904,6 +924,34 @@ class CustomerDataStore:
                     db.execute("INSERT INTO schema_migrations(version,name) VALUES(19,?)",
                                ("manual_product_telegram_file_delivery",))
                     applied.add(19)
+                # v20 makes customer payment approval/rejection notifications durable
+                # and retryable, independently from the admin notification outbox.
+                if 20 not in applied:
+                    db.execute("""CREATE TABLE IF NOT EXISTS customer_payment_notifications (
+                        notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tenant_id TEXT NOT NULL,
+                        payment_id TEXT NOT NULL,
+                        telegram_id INTEGER NOT NULL,
+                        event_type TEXT NOT NULL CHECK(event_type IN ('verified','rejected')),
+                        amount_minor INTEGER NOT NULL CHECK(amount_minor > 0),
+                        currency TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending'
+                            CHECK(status IN ('pending','processing','sent','dead')),
+                        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                        available_at REAL NOT NULL,
+                        created_at REAL NOT NULL,
+                        claimed_at REAL,
+                        sent_at TEXT,
+                        last_error_code TEXT,
+                        UNIQUE(tenant_id,payment_id,event_type),
+                        FOREIGN KEY(tenant_id,payment_id)
+                            REFERENCES payment_attempts(tenant_id,payment_id)
+                    )""")
+                    db.execute("CREATE INDEX IF NOT EXISTS ix_customer_payment_notifications_due "
+                               "ON customer_payment_notifications(status,available_at,notification_id)")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(20,?)",
+                               ("customer_payment_notification_outbox",))
+                    applied.add(20)
                 db.commit()
             except Exception:
                 db.rollback()
@@ -2080,7 +2128,7 @@ class CustomerDataStore:
         db = self._connect()
         try:
             db.execute("BEGIN IMMEDIATE")
-            payment = db.execute("""SELECT provider,status,telegram_id FROM payment_attempts
+            payment = db.execute("""SELECT provider,status,telegram_id,amount_minor,currency FROM payment_attempts
                 WHERE tenant_id=? AND payment_id=?""", (self.tenant_id,payment_id)).fetchone()
             if not payment or payment["telegram_id"] != telegram_id:
                 raise CustomerStoreError("Payment not found for this customer")
@@ -2091,11 +2139,22 @@ class CustomerDataStore:
             if existing:
                 if (existing["transfer_reference"] == reference and existing["payer_name"] == payer_name
                         and existing["receipt_file_id"] == receipt_file_id and existing["status"] == "submitted"):
+                    # Also repairs a missing admin alert when replaying a legacy receipt.
+                    self._enqueue_admin_notification_in_transaction(db, event_key="payment",
+                        idempotency_key=f"payment-receipt:{payment_id}",
+                        payload={"public_order_id": payment_id[:20], "amount_minor": int(payment["amount_minor"]),
+                                 "currency": str(payment["currency"]), "status": "receipt_submitted",
+                                 "customer_id": int(payment["telegram_id"])})
                     db.commit()
                     return
                 raise CustomerStoreError("A receipt was already submitted for this payment")
             db.execute("""INSERT INTO manual_deposit_receipts(tenant_id,payment_id,telegram_id,transfer_reference,payer_name,receipt_file_id)
                 VALUES(?,?,?,?,?,?)""", (self.tenant_id,payment_id,telegram_id,reference,payer_name,receipt_file_id))
+            self._enqueue_admin_notification_in_transaction(db, event_key="payment",
+                idempotency_key=f"payment-receipt:{payment_id}",
+                payload={"public_order_id": payment_id[:20], "amount_minor": int(payment["amount_minor"]),
+                         "currency": str(payment["currency"]), "status": "receipt_submitted",
+                         "customer_id": int(payment["telegram_id"])})
             db.commit()
         except Exception:
             db.rollback()
@@ -2126,7 +2185,7 @@ class CustomerDataStore:
         db = self._connect()
         try:
             db.execute("BEGIN IMMEDIATE")
-            payment = db.execute("SELECT status,provider FROM payment_attempts WHERE tenant_id=? AND payment_id=?",
+            payment = db.execute("SELECT status,provider,telegram_id,amount_minor,currency FROM payment_attempts WHERE tenant_id=? AND payment_id=?",
                                  (self.tenant_id,payment_id)).fetchone()
             receipt = db.execute("SELECT status FROM manual_deposit_receipts WHERE tenant_id=? AND payment_id=?",
                                  (self.tenant_id,payment_id)).fetchone()
@@ -2140,6 +2199,9 @@ class CustomerDataStore:
                 amount_minor,currency,failure_code) SELECT tenant_id,payment_id,'failed',?,amount_minor,currency,?
                 FROM payment_attempts WHERE tenant_id=? AND payment_id=?""",
                 (admin_id,("manual_receipt_rejected:" + reason)[:128],self.tenant_id,payment_id))
+            self._enqueue_customer_payment_notification_in_transaction(db, payment_id=payment_id,
+                telegram_id=int(payment["telegram_id"]), event_type="rejected",
+                amount_minor=int(payment["amount_minor"]), currency=str(payment["currency"]))
             db.commit()
         except Exception:
             db.rollback()
@@ -2224,6 +2286,9 @@ class CustomerDataStore:
                         (self.tenant_id, f"payment:{payment_id}"),
                     ).fetchone()
                     if existing:
+                        self._enqueue_customer_payment_notification_in_transaction(db, payment_id=payment_id,
+                            telegram_id=int(row["telegram_id"]), event_type="verified",
+                            amount_minor=verified_amount_minor, currency=verified_currency)
                         db.commit()
                         return int(existing[0])
                 raise CustomerStoreError("Payment is already settled with different data")
@@ -2262,6 +2327,9 @@ class CustomerDataStore:
                 (tenant_id,payment_id,event_type,actor_telegram_id,amount_minor,currency,external_reference)
                 VALUES(?,?,'verified',?,?,?,?)""",
                 (self.tenant_id, payment_id, verified_by, verified_amount_minor, verified_currency, external_reference[:256]))
+            self._enqueue_customer_payment_notification_in_transaction(db, payment_id=payment_id,
+                telegram_id=int(row["telegram_id"]), event_type="verified",
+                amount_minor=verified_amount_minor, currency=verified_currency)
             self._enqueue_admin_notification_in_transaction(db, event_key="payment",
                 idempotency_key=f"payment:{payment_id}",
                 payload={"public_order_id": payment_id[:20], "amount_minor": verified_amount_minor,
@@ -2277,6 +2345,80 @@ class CustomerDataStore:
             raise
         finally:
             db.close()
+
+    def claim_customer_payment_notifications(self, *, limit: int = 20, now: float | None = None,
+                                             stale_after: float = 120.0) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise CustomerStoreError("Invalid customer payment notification batch size")
+        ts = time.time() if now is None else float(now)
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""UPDATE customer_payment_notifications SET status='pending',claimed_at=NULL
+                WHERE tenant_id=? AND status='processing' AND claimed_at IS NOT NULL AND claimed_at<=?""",
+                (self.tenant_id, ts - max(1.0, float(stale_after))))
+            ids = db.execute("""SELECT notification_id FROM customer_payment_notifications
+                WHERE tenant_id=? AND status='pending' AND available_at<=?
+                ORDER BY notification_id LIMIT ?""", (self.tenant_id, ts, limit)).fetchall()
+            claimed=[]
+            for row in ids:
+                cur=db.execute("""UPDATE customer_payment_notifications SET status='processing',attempts=attempts+1,claimed_at=?
+                    WHERE tenant_id=? AND notification_id=? AND status='pending'""",
+                    (ts,self.tenant_id,int(row["notification_id"])))
+                if cur.rowcount != 1: continue
+                item=db.execute("SELECT * FROM customer_payment_notifications WHERE tenant_id=? AND notification_id=?",
+                    (self.tenant_id,int(row["notification_id"]))).fetchone()
+                if item: claimed.append(dict(item))
+            db.commit()
+            return claimed
+        except Exception:
+            db.rollback(); raise
+        finally:
+            db.close()
+
+    def mark_customer_payment_notification_sent(self, notification_id: int, *, now: float | None = None) -> None:
+        ts = time.time() if now is None else float(now)
+        with self._connect() as db:
+            cur=db.execute("""UPDATE customer_payment_notifications SET status='sent',sent_at=?,claimed_at=NULL,last_error_code=NULL
+                WHERE tenant_id=? AND notification_id=? AND status='processing'""",
+                (datetime.fromtimestamp(ts, timezone.utc).isoformat(),self.tenant_id,notification_id))
+            if cur.rowcount != 1:
+                raise CustomerStoreError("Customer payment notification is not in processing state")
+
+    def retry_customer_payment_notification(self, notification_id: int, *, attempt: int,
+            error_code: str, now: float | None = None, max_attempts: int = 8) -> str:
+        if not error_code or len(error_code)>80 or any(ch.isspace() for ch in error_code):
+            raise CustomerStoreError("Notification error code must be short and non-sensitive")
+        if isinstance(attempt,bool) or not isinstance(attempt,int) or attempt<1:
+            raise CustomerStoreError("Invalid notification attempt")
+        if isinstance(max_attempts,bool) or not isinstance(max_attempts,int) or max_attempts<1:
+            raise CustomerStoreError("Invalid maximum notification attempts")
+        ts=time.time() if now is None else float(now)
+        status="dead" if attempt>=max_attempts else "pending"
+        next_at=ts if status=="dead" else ts+min(3600,2**min(attempt,10))
+        with self._connect() as db:
+            cur=db.execute("""UPDATE customer_payment_notifications SET status=?,available_at=?,claimed_at=NULL,last_error_code=?
+                WHERE tenant_id=? AND notification_id=? AND status='processing'""",
+                (status,next_at,error_code,self.tenant_id,notification_id))
+            if cur.rowcount!=1:
+                raise CustomerStoreError("Customer payment notification is not in processing state")
+        return status
+
+    def get_customer_payment_notification(self, payment_id: str, event_type: str | None = None) -> dict[str, Any] | None:
+        sql="SELECT notification_id,payment_id,telegram_id,event_type,amount_minor,currency,status,attempts,available_at,created_at,claimed_at,sent_at,last_error_code FROM customer_payment_notifications WHERE tenant_id=? AND payment_id=?"
+        args: tuple[Any,...]=(self.tenant_id,payment_id)
+        if event_type is not None:
+            if event_type not in {"verified","rejected"}: raise CustomerStoreError("Unsupported customer payment notification event")
+            sql+=" AND event_type=?"; args+=(event_type,)
+        sql+=" ORDER BY notification_id DESC LIMIT 1"
+        with self._connect() as db: row=db.execute(sql,args).fetchone()
+        return dict(row) if row else None
+
+    def retry_customer_payment_notification_now(self, payment_id: str) -> bool:
+        with self._connect() as db:
+            cur=db.execute("""UPDATE customer_payment_notifications SET status='pending',attempts=0,available_at=?,claimed_at=NULL,last_error_code=NULL
+                WHERE tenant_id=? AND payment_id=? AND status='dead'""",(time.time(),self.tenant_id,payment_id))
+            return cur.rowcount==1
 
     def get_payment_attempt(self, payment_id: str, telegram_id: int | None = None) -> dict[str, Any] | None:
         sql = "SELECT payment_id,telegram_id,provider,amount_minor,currency,status,idempotency_key,external_reference,failure_code,created_at,updated_at FROM payment_attempts WHERE tenant_id=? AND payment_id=?"

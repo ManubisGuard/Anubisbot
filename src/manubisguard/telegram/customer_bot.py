@@ -98,7 +98,7 @@ BACK_MENU = {"inline_keyboard": [[{"text": "⬅️ منوی اصلی", "callback
 
 ADMIN_ONLY_COMMANDS = frozenset({
     "/pending-deposits", "/deposit-receipt-view", "/wallet-reject", "/wallet-verify",
-    "/wallet-credit", "/payment-events", "/trust-channel", "/trust-channel-status",
+    "/wallet-credit", "/payment-events", "/payment-notification-retry", "/trust-channel", "/trust-channel-status",
     "/panel", "/panel-enable", "/panels", "/panel-check", "/panel-roles",
     "/discount", "/category", "/categories", "/service-operations", "/service-operation",
     "/service-operation-check", "/service-operation-finalize",
@@ -423,6 +423,38 @@ class CustomerBot:
                             event_key, type(exc).__name__)
         return counts
 
+    async def _deliver_customer_payment_notifications(self, *, now: float | None = None,
+                                                       limit: int = 20) -> dict[str, int]:
+        """Drain durable wallet approval/rejection notices; failures remain retryable."""
+        counts = {"sent": 0, "retry": 0, "dead": 0}
+        for item in self.data.claim_customer_payment_notifications(limit=limit, now=now):
+            payment_id = str(item["payment_id"])
+            target = int(item["telegram_id"])
+            amount = int(item["amount_minor"])
+            currency = str(item["currency"])
+            if item["event_type"] == "verified":
+                body = (f"✅ شارژ کیف پول تأیید شد.\nمبلغ: {amount:,} {currency}\n"
+                        f"شناسه پرداخت: {payment_id}\nموجودی جدید را می‌توانی از بخش کیف پول ببینی.")
+            else:
+                body = (f"❌ رسید واریز تأیید نشد و مبلغی به کیف پول اضافه نشد.\n"
+                        f"شناسه پرداخت: {payment_id}\nاگر فکر می‌کنی اشتباهی رخ داده، با پشتیبانی تماس بگیر.")
+            try:
+                await self.api.send_text(target, body,
+                    self._customer_menu(customer_id=target, include_admin=False))
+                self.data.mark_customer_payment_notification_sent(int(item["notification_id"]), now=now)
+                counts["sent"] += 1
+            except Exception as exc:
+                try:
+                    status = self.data.retry_customer_payment_notification(int(item["notification_id"]),
+                        attempt=int(item["attempts"]), error_code=type(exc).__name__.lower(),
+                        now=now, max_attempts=8)
+                    counts["dead" if status == "dead" else "retry"] += 1
+                except Exception as state_exc:
+                    LOG.error("Customer payment notification state update failed (%s)", type(state_exc).__name__)
+                LOG.warning("Customer payment notification failed for payment %s (%s)",
+                            payment_id[:20], type(exc).__name__)
+        return counts
+
     async def _deliver_customer_ticket_notifications(self, *, now: float | None = None, limit: int = 20) -> dict[str, int]:
         """Deliver durable Mini App and Telegram support tickets to configured bot admins."""
         counts = {"sent": 0, "retry": 0, "dead": 0, "no_admin": 0}
@@ -609,11 +641,12 @@ class CustomerBot:
                 receipt = self.data.get_manual_deposit_receipt(payment_id)
                 if not receipt: raise CustomerStoreError("رسید پیدا نشد")
                 self.data.reject_manual_deposit_receipt(payment_id=payment_id, admin_id=uid, reason=reason)
-                try:
-                    await self.api.send_text(int(receipt["telegram_id"]), f"❌ رسید واریز {payment_id} تأیید نشد. دلیل: {reason}", self._customer_menu(include_admin=False))
-                except Exception:
-                    LOG.warning("Rejected manual deposit notification failed")
-                await self.api.send_text(chat_id, "رسید رد شد؛ هیچ مبلغی به کیف پول اضافه نشد.", menu)
+                await self._deliver_customer_payment_notifications(limit=20)
+                customer_notice = self.data.get_customer_payment_notification(payment_id, "rejected")
+                notice_state = str(customer_notice.get("status") if customer_notice else "missing")
+                notice_text = {"sent":"مشتری مطلع شد", "pending":"اعلان مشتری در صف تلاش مجدد است",
+                    "processing":"اعلان مشتری در حال ارسال است", "dead":"اعلان مشتری به سقف تلاش رسیده؛ از /payment-notification-retry استفاده کن"}.get(notice_state, "وضعیت اعلان مشتری نیازمند بررسی است")
+                await self.api.send_text(chat_id, f"رسید رد شد؛ هیچ مبلغی به کیف پول اضافه نشد. {notice_text}.", menu)
             except (ValueError, CustomerStoreError) as exc:
                 await self.api.send_text(chat_id, f"رد رسید انجام نشد: {exc}", menu)
             return
@@ -622,6 +655,19 @@ class CustomerBot:
             return
         if is_admin and command == "/wallet-credit":
             await self._admin_wallet_credit(chat_id, text, uid)
+            return
+        if is_admin and command == "/payment-notification-retry":
+            payment_id = text.partition(" ")[2].strip()
+            if not payment_id or len(payment_id) > 128 or any(ch.isspace() for ch in payment_id):
+                await self.api.send_text(chat_id, "فرمت: /payment-notification-retry PAYMENT_ID", menu)
+                return
+            if not self.data.retry_customer_payment_notification_now(payment_id):
+                await self.api.send_text(chat_id, "اعلان مرده‌ای برای این پرداخت پیدا نشد؛ فقط اعلان‌های dead قابل تلاش مجدد هستند.", menu)
+                return
+            await self._deliver_customer_payment_notifications(limit=20)
+            state = self.data.get_customer_payment_notification(payment_id)
+            status = str(state.get("status") if state else "missing")
+            await self.api.send_text(chat_id, f"وضعیت اعلان پرداخت {payment_id}: {status}.", menu)
             return
         if is_admin and command == "/payment-events":
             await self._admin_payment_events(chat_id, text)
@@ -1501,14 +1547,15 @@ class CustomerBot:
             await self.api.send_text(chat_id, f"تأیید شارژ انجام نشد: {type(exc).__name__}: {str(exc)[:160]}", self._customer_menu())
             return
         target = int(attempt["telegram_id"])
-        try:
-            await self.api.send_text(target, f"✅ شارژ کیف پول تأیید شد.\nمبلغ: {amount:,} {currency.upper()}\nشناسه تراکنش: {reference}", self._customer_menu(include_admin=False))
-        except Exception:
-            LOG.warning("Wallet was credited but customer notification failed")
+        await self._deliver_customer_payment_notifications(limit=20)
+        customer_notice = self.data.get_customer_payment_notification(payment_id, "verified")
+        notice_state = str(customer_notice.get("status") if customer_notice else "missing")
         await self._emit_trust_event(TrustEvent.WALLET_DEPOSIT,
             {"amount_minor": amount, "currency": currency.upper(), "public_order_id": payment_id[:20]},
             f"wallet-credit:payment:{payment_id}")
-        await self.api.send_text(chat_id, f"شارژ تأیید و به‌صورت idempotent ثبت شد؛ کاربر {target}، مبلغ {amount:,} {currency.upper()}، دفترکل #{ledger_id}.", self._customer_menu())
+        notice_text = {"sent":"اعلان مشتری ارسال شد", "pending":"اعلان مشتری در صف ارسال مجدد است",
+                       "processing":"اعلان مشتری در حال ارسال است", "dead":"اعلان مشتری به سقف تلاش رسیده؛ از /payment-notification-retry استفاده کن"}.get(notice_state, "وضعیت اعلان مشتری نیازمند بررسی است")
+        await self.api.send_text(chat_id, f"شارژ تأیید و به‌صورت idempotent ثبت شد؛ کاربر {target}، مبلغ {amount:,} {currency.upper()}، دفترکل #{ledger_id}. {notice_text}.", self._customer_menu())
 
     async def _admin_payment_events(self, chat_id: int, text: str) -> None:
         """Read-only private-admin view of the immutable payment lifecycle audit."""
@@ -3099,6 +3146,10 @@ class CustomerBot:
                     await self._deliver_customer_ticket_notifications(limit=20)
                 except Exception as exc:
                     LOG.warning("Support ticket notification worker failed (%s)", type(exc).__name__)
+                try:
+                    await self._deliver_customer_payment_notifications(limit=20)
+                except Exception as exc:
+                    LOG.warning("Customer payment notification worker failed (%s)", type(exc).__name__)
                 try:
                     await self._deliver_admin_notifications(limit=20)
                 except Exception as exc:
