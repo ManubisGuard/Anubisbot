@@ -3060,6 +3060,7 @@ class CustomerBot:
                 {"inline_keyboard": [
                     [{"text": "➕ شارژ دستی کیف پول", "callback_data": "customer:wallet:deposit"}],
                     [{"text": "📜 گردش حساب", "callback_data": "customer:wallet:history"}],
+                    [{"text": "🧾 وضعیت شارژهای دستی", "callback_data": "customer:wallet:payments"}],
                     [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
                 ]})
             return
@@ -3080,9 +3081,28 @@ class CustomerBot:
                 "پس از ساخت درخواست، شناسه پرداخت و دستور ثبت رسید نمایش داده می‌شود. موجودی فقط بعد از بررسی مدیر افزایش می‌یابد.",
                 {"inline_keyboard": [
                     [{"text": "📜 گردش حساب", "callback_data": "customer:wallet:history"}],
+                    [{"text": "🧾 وضعیت شارژهای دستی", "callback_data": "customer:wallet:payments"}],
                     [{"text": "⬅️ بازگشت به کیف پول", "callback_data": "customer:wallet"}],
                     [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
                 ]})
+            return
+        if key == "wallet:payments":
+            payments = self.data.list_customer_payment_attempts(uid, limit=10)
+            labels = {"awaiting_receipt":"در انتظار ثبت رسید", "receipt_submitted":"رسید ثبت شده، منتظر بررسی مدیر",
+                      "verified":"تأیید شد و کیف پول شارژ شد", "rejected":"رسید رد شد", "failed":"ناموفق"}
+            lines = ["🧾 وضعیت شارژهای دستی اخیر"]
+            for payment in payments:
+                lines.append(f"\n• مبلغ: {int(payment['amount_minor']):,} {payment['currency']}"
+                    f"\nوضعیت: {labels.get(payment['status'], 'در حال بررسی')}"
+                    f"\nشناسه پرداخت: {payment['payment_id']}\nزمان: {payment['created_at']}")
+            if not payments:
+                lines.append("\nهنوز درخواست شارژ دستی ثبت نکرده‌ای.")
+            await self.api.send_text(chat_id, "\n".join(lines), {"inline_keyboard": [
+                [{"text": "➕ شارژ دستی کیف پول", "callback_data": "customer:wallet:deposit"}],
+                [{"text": "📜 گردش حساب", "callback_data": "customer:wallet:history"}],
+                [{"text": "⬅️ بازگشت به کیف پول", "callback_data": "customer:wallet"}],
+                [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
+            ]})
             return
         if key == "wallet:history":
             entries = self.data.list_wallet_transactions(uid, limit=10)
@@ -3101,6 +3121,7 @@ class CustomerBot:
                 lines.append("\nهنوز تراکنشی برای این حساب ثبت نشده است.")
             await self.api.send_text(chat_id, "\n".join(lines), {"inline_keyboard": [
                 [{"text": "➕ شارژ دستی کیف پول", "callback_data": "customer:wallet:deposit"}],
+                [{"text": "🧾 وضعیت شارژهای دستی", "callback_data": "customer:wallet:payments"}],
                 [{"text": "⬅️ بازگشت به کیف پول", "callback_data": "customer:wallet"}],
                 [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
             ]})

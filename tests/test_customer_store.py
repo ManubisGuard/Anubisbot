@@ -493,6 +493,35 @@ class CustomerDataStoreTests(unittest.TestCase):
         self.assertEqual(stored["provider_user_id"], "provider-user-original")
         self.assertEqual(stored["subscription_url"], "https://sub.example/original")
 
+    def test_customer_manual_payment_history_maps_status_and_is_owner_tenant_scoped(self):
+        self.store.ensure_customer(1002, first_name="Other")
+        self.store.create_payment_attempt(payment_id="status-awaiting", telegram_id=1001,
+            provider="manual", amount_minor=100, currency="IRR", idempotency_key="status-awaiting-key")
+        self.store.create_payment_attempt(payment_id="status-submitted", telegram_id=1001,
+            provider="manual", amount_minor=200, currency="IRR", idempotency_key="status-submitted-key")
+        self.store.submit_manual_deposit_receipt(payment_id="status-submitted", telegram_id=1001,
+            transfer_reference="private-reference")
+        self.store.create_payment_attempt(payment_id="status-verified", telegram_id=1001,
+            provider="manual", amount_minor=300, currency="IRR", idempotency_key="status-verified-key")
+        self.store.settle_verified_wallet_deposit(payment_id="status-verified", verified_amount_minor=300,
+            verified_currency="IRR", external_reference="bank-status-verified")
+        self.store.create_payment_attempt(payment_id="status-rejected", telegram_id=1001,
+            provider="manual", amount_minor=400, currency="IRR", idempotency_key="status-rejected-key")
+        self.store.submit_manual_deposit_receipt(payment_id="status-rejected", telegram_id=1001,
+            transfer_reference="private-rejected-reference")
+        self.store.reject_manual_deposit_receipt(payment_id="status-rejected", admin_id=9001, reason="receipt_invalid")
+        self.store.create_payment_attempt(payment_id="status-other-user", telegram_id=1002,
+            provider="manual", amount_minor=500, currency="IRR", idempotency_key="status-other-user-key")
+        rows = {row["payment_id"]: row for row in self.store.list_customer_payment_attempts(1001)}
+        self.assertEqual(rows["status-awaiting"]["status"], "awaiting_receipt")
+        self.assertEqual(rows["status-submitted"]["status"], "receipt_submitted")
+        self.assertEqual(rows["status-verified"]["status"], "verified")
+        self.assertEqual(rows["status-rejected"]["status"], "rejected")
+        self.assertNotIn("status-other-user", rows)
+        self.assertNotIn("private-reference", repr(rows))
+        self.assertNotIn("external_reference", rows["status-verified"])
+        self.assertFalse(CustomerDataStore(self.path, tenant_id="bot-beta").list_customer_payment_attempts(1001))
+
     def test_verified_payment_queues_customer_notification_atomically_and_replay_does_not_duplicate(self):
         self.store.create_payment_attempt(payment_id="pay-customer-outbox", telegram_id=1001,
             provider="manual", amount_minor=2500, currency="IRR", idempotency_key="intent-customer-outbox")

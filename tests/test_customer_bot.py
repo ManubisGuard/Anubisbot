@@ -1003,6 +1003,30 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("bank-ref-12345", history)
         self.assertIn("6883349141", history)
 
+    async def test_customer_can_view_manual_deposit_status_after_receipt_submission(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.create_payment_attempt(payment_id="pay-status-screen", telegram_id=999,
+            provider="manual", amount_minor=2100, currency="IRR", idempotency_key="intent-status-screen")
+        self.bot.data.submit_manual_deposit_receipt(payment_id="pay-status-screen", telegram_id=999,
+            transfer_reference="private-customer-reference")
+        await self.bot._handle_callback({"id":"payment-status-view","from":{"id":999},
+            "message":{"message_id":760,"chat":{"id":999,"type":"private"}},
+            "data":"customer:wallet:payments"})
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        self.assertIn("رسید ثبت شده، منتظر بررسی مدیر", body)
+        self.assertIn("pay-status-screen", body)
+        self.assertNotIn("private-customer-reference", body)
+        self.assertTrue(any(button["callback_data"] == "customer:wallet:history"
+                            for row in keyboard["inline_keyboard"] for button in row))
+        self.bot.data.settle_verified_wallet_deposit(payment_id="pay-status-screen", verified_amount_minor=2100,
+            verified_currency="IRR", external_reference="private-bank-reference")
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"payment-status-view-verified","from":{"id":999},
+            "message":{"message_id":761,"chat":{"id":999,"type":"private"}},
+            "data":"customer:wallet:payments"})
+        self.assertIn("تأیید شد و کیف پول شارژ شد", self.bot.api.send_text.await_args.args[1])
+        self.assertNotIn("private-bank-reference", self.bot.api.send_text.await_args.args[1])
+
     async def test_customer_payment_notification_worker_retries_send_failure_without_leaking_details(self):
         self.bot.data.ensure_customer(999, first_name="Buyer")
         self.bot.data.create_payment_attempt(payment_id="pay-notify-retry", telegram_id=999,

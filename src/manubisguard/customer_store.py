@@ -2429,6 +2429,28 @@ class CustomerDataStore:
             row = db.execute(sql, args).fetchone()
         return dict(row) if row else None
 
+    def list_customer_payment_attempts(self, telegram_id: int, *, limit: int = 10) -> list[dict[str, Any]]:
+        """Return only the customer's own manual deposit intents and safe status labels."""
+        if isinstance(telegram_id, bool) or not isinstance(telegram_id, int) or telegram_id <= 0:
+            raise CustomerStoreError("Invalid customer ID")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+            raise CustomerStoreError("Invalid customer payment history limit")
+        with self._connect() as db:
+            rows = db.execute("""SELECT p.payment_id,p.amount_minor,p.currency,p.status,p.created_at,
+                CASE WHEN p.status='verified' THEN 'verified'
+                     WHEN p.status='failed' AND r.status='rejected' THEN 'rejected'
+                     WHEN p.status='failed' THEN 'failed'
+                     WHEN r.status='submitted' THEN 'receipt_submitted'
+                     ELSE 'awaiting_receipt' END AS customer_status
+                FROM payment_attempts p LEFT JOIN manual_deposit_receipts r
+                  ON r.tenant_id=p.tenant_id AND r.payment_id=p.payment_id
+                WHERE p.tenant_id=? AND p.telegram_id=? AND p.provider='manual'
+                ORDER BY p.created_at DESC,p.payment_id DESC LIMIT ?""",
+                (self.tenant_id, telegram_id, limit)).fetchall()
+        return [{"payment_id":str(row["payment_id"]),"amount_minor":int(row["amount_minor"]),
+                 "currency":str(row["currency"]),"status":str(row["customer_status"]),
+                 "created_at":str(row["created_at"])} for row in rows]
+
     def list_payment_attempt_events(self, payment_id: str) -> list[dict[str, Any]]:
         """Return tenant-scoped immutable lifecycle events for a payment attempt."""
         with self._connect() as db:
