@@ -829,11 +829,19 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback({"id":"shop","from":{"id":999},
             "message":{"chat":{"id":999,"type":"private"}},"data":"customer:shop"})
         root_body = self.bot.api.send_text.await_args.args[1]
-        self.assertIn("AI Gift", root_body)
-        self.assertIn("توضیحات: Manual AI product", root_body)
+        self.assertNotIn("AI Gift", root_body)
+        self.assertNotIn("AI Plan", root_body)
         keyboard=self.bot.api.send_text.await_args.args[2]
         callbacks={b.get("callback_data") for row in keyboard["inline_keyboard"] for b in row}
         self.assertIn("customer:category:ai",callbacks)
+        self.assertIn("customer:category:all",callbacks)
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"all-products","from":{"id":999},
+            "message":{"chat":{"id":999,"type":"private"}},"data":"customer:category:all"})
+        all_body=self.bot.api.send_text.await_args.args[1]
+        self.assertIn("AI Gift", all_body)
+        self.assertIn("AI Plan", all_body)
+        self.assertIn("Basic Plan", all_body)
         self.bot.api.send_text.reset_mock()
         await self.bot._handle_callback({"id":"cat","from":{"id":999},
             "message":{"chat":{"id":999,"type":"private"}},"data":"customer:category:ai"})
@@ -2179,8 +2187,9 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         body, keyboard = self.bot.api.send_text.await_args.args[1:3]
         first_ids = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
                      if button.get("callback_data", "").startswith("customer:manualbuy:page-")]
-        self.assertEqual(len(first_ids), 10)
-        self.assertIn("صفحه محصولات 1 از 3", body)
+        self.assertEqual(len(first_ids), 4)
+        self.assertIn("صفحه محصولات 1 از 7", body)
+        self.assertLessEqual(sum(len(row) for row in keyboard["inline_keyboard"]), 8)
         next_callback = next(button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
                              if button.get("callback_data") == "customer:shop_page:1")
         self.bot.api.send_text.reset_mock()
@@ -2188,19 +2197,17 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         body, keyboard = self.bot.api.send_text.await_args.args[1:3]
         second_ids = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
                       if button.get("callback_data", "").startswith("customer:manualbuy:page-")]
-        self.assertEqual(len(second_ids), 10)
-        self.assertIn("صفحه محصولات 2 از 3", body)
+        self.assertEqual(len(second_ids), 4)
+        self.assertIn("صفحه محصولات 2 از 7", body)
         self.assertTrue(set(first_ids).isdisjoint(second_ids))
-        next_callback = next(button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
-                             if button.get("callback_data") == "customer:shop_page:2")
         self.bot.api.send_text.reset_mock()
-        await self.bot._handle_callback({**query,"id":"shop-page-2","data":next_callback})
+        await self.bot._handle_callback({**query,"id":"shop-page-last","data":"customer:shop_page:6"})
         body, keyboard = self.bot.api.send_text.await_args.args[1:3]
         last_ids = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
                     if button.get("callback_data", "").startswith("customer:manualbuy:page-")]
-        self.assertEqual(len(last_ids), 5)
-        self.assertIn("صفحه محصولات 3 از 3", body)
-        self.assertIn("customer:manualbuy:page-24", last_ids)
+        self.assertEqual(last_ids, ["customer:manualbuy:page-24"])
+        self.assertIn("صفحه محصولات 7 از 7", body)
+        self.assertLessEqual(sum(len(row) for row in keyboard["inline_keyboard"]), 8)
 
     async def test_shop_category_list_paginates_past_twenty_four_categories(self):
         for index in range(27):
@@ -2210,19 +2217,30 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         body, keyboard = self.bot.api.send_text.await_args.args[1:3]
         first_categories = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
             if button.get("callback_data", "").startswith("customer:category:cat-")]
-        self.assertEqual(len(first_categories), 20)
-        self.assertIn("صفحه دسته‌بندی‌ها 1 از 2", body)
+        self.assertEqual(len(first_categories), 4)
+        self.assertIn("صفحه دسته‌بندی‌ها 1 از 7", body)
+        self.assertLessEqual(sum(len(row) for row in keyboard["inline_keyboard"]), 8)
         next_callback = next(button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
             if button.get("callback_data") == "customer:category_menu_page:all:1")
         self.bot.api.send_text.reset_mock()
         await self.bot._handle_callback({**query,"id":"category-menu-page-1","data":next_callback})
         body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        second_categories = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
+            if button.get("callback_data", "").startswith("customer:category:cat-")]
+        self.assertEqual(len(second_categories), 4)
+        self.assertIn("صفحه دسته‌بندی‌ها 2 از 7", body)
+        self.assertTrue(set(first_categories).isdisjoint(second_categories))
+        self.assertLessEqual(sum(len(row) for row in keyboard["inline_keyboard"]), 8)
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({**query,"id":"category-menu-last","data":"customer:category_menu_page:all:6"})
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
         last_categories = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
             if button.get("callback_data", "").startswith("customer:category:cat-")]
-        self.assertEqual(len(last_categories), 7)
-        self.assertIn("customer:category:cat-26", last_categories)
+        self.assertEqual(last_categories, ["customer:category:cat-24", "customer:category:cat-25",
+                                           "customer:category:cat-26"])
+        self.assertIn("صفحه دسته‌بندی‌ها 7 از 7", body)
         self.assertTrue(set(first_categories).isdisjoint(last_categories))
-        self.assertIn("صفحه دسته‌بندی‌ها 2 از 2", body)
+        self.assertLessEqual(sum(len(row) for row in keyboard["inline_keyboard"]), 8)
 
     async def test_manual_product_variant_picker_paginates_past_twenty_variants(self):
         self.bot.data.put_manual_product(product_id="variant-pages", title="Many options", price_minor=1000,

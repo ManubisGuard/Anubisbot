@@ -237,3 +237,32 @@ No live panel/provider calls, production database, N2, active Telegram process, 
 - Do not implement generic auto-pagination yet. Each adapter currently returns a plain list and discards total/has-more metadata; a safe change needs an explicit normalized page contract plus version-specific evidence. Keep the 200-item bound and explicit caller-controlled offsets. Do not infer that a short page proves completeness where the provider contract/version is unknown.
 - **No adapter tests were run**, intentionally. No source code was changed. No provider API/live panel, production database, N2, Telegram process, deployment, timer, restart or secret was accessed. Evidence: public-source + local source inspection only; not live acceptance.
 - Next project phase: **Phase 2 — audit the existing customer purchase journey** (catalog/category → product detail/quote → confirmation → payment choice → order status). First map existing code and the acceptance gap; do not rebuild existing screens and do not begin with a test-only loop.
+
+## Phase 2 slice 1 — compact customer catalog navigation (2026-10-28)
+
+### Audit finding
+
+The previous customer shop mixed category buttons and purchase buttons in one screen, with up to 20 categories and up to 10 manual plus 10 panel products. This conflicted with the product UX rule to keep keyboards compact (normally no more than 6–8 buttons) and made category selection noisy.
+
+### Implemented
+
+- Root shop and /shop open a dedicated category selector when categories exist; products are not mixed into that selector.
+- Category selection page shows four categories at a time, with explicit “all products”, previous/next and main-menu navigation. Category pagination still reaches every category.
+- Product listing combines manual and panel products into one catalog sequence and shows four items per page, preventing two separate product lists from doubling the number of purchase buttons.
+- Product pages provide category navigation and main-menu navigation; purchase actions use supported primary styling. Existing confirmation/quote checks, wallet logic and fulfillment handlers were left intact.
+- Added/updated UI tests for mixed category/catalog navigation, all-products route, later-page reachability and the eight-button maximum.
+
+### Validation
+
+- Focused customer bot UI suite: **141 tests passed in 26.378 seconds**, exit 0. Command: `PYTHONPATH=src:scripts/test_support python3 -m unittest discover -s tests -p 'test_customer_bot.py' -v`.
+- Full isolated regression suite: **504 tests passed in 63.972 seconds**, exit 0. Command: `./scripts/run_isolated_tests.sh`. The full suite naturally includes adapter tests; no separate adapter-only suite was run as part of this product UX step.
+- Static checks passed: `python3 -m compileall -q -f src tests scripts`; `bash -n scripts/*.sh`; `node --check customer_webapp/app.js`; `git diff --check`.
+- No live Telegram bot, provider API, production panel/database, N2, deployment, timer or process was touched. Evidence remains E2 local tests; no live acceptance claim.
+
+### Next Phase 2 task
+
+Continue the customer journey audit from the next actual gap, without redoing the catalog navigation:
+1. Inspect panel-product detail/quote presentation and determine whether a dedicated detail step improves clarity without adding friction.
+2. Handle insufficient wallet balance with a clear recovery path to wallet/manual deposit, without implying that card-to-card receipt submission instantly credits funds.
+3. Review order status and paid-but-undelivered recovery screens for customer-facing clarity and safe retry.
+4. Only then change the relevant journey; add focused customer-flow regressions and run the full isolated suite for code changes. Do not run adapter tests as a standalone task unless a provider-related change creates a specific reason.

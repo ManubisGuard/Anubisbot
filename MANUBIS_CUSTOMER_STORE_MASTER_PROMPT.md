@@ -60,7 +60,8 @@ UI quality requirements:
 
 - Completed locally/published: panel management/read-only checks; guided panel registration; category management; guided product creation for manual/inventory/file/panel fulfillment; guarded manual receipt review with audit navigation.
 - Latest adapter hardening (2026-10-28): PasarGuard rejects boolean/negative/malformed counters and incomplete auth before secret resolution. Rebecca and Sanaei reject boolean expiry/usage/quota fields; Sanaei fails closed on malformed mapped usage instead of silently returning zero. All three user-list APIs now reject a missing list envelope; Sanaei also rejects malformed list entries/settings instead of silently returning a partial snapshot. Mock timeout tests assert no blind retry for create/update/delete.
-- Pagination public-source research is recorded in `docs/PROVIDER_CAPABILITY_MATRIX.md` and `docs/PROGRESS.md`; exact deployed versions and completeness remain unknown. Do not repeat adapter tests or implement auto-pagination without new version-specific evidence. The next project task is Phase 2: audit the existing customer purchase journey and identify concrete acceptance gaps before coding.
+- Phase 1 pagination public-source research is recorded; exact deployed versions and completeness remain unknown. Do not repeat adapter tests or implement auto-pagination without new version-specific evidence.
+- Phase 2 first slice completed: customer shop now separates category selection from product listing, pages four catalog items at a time, and keeps each category/product keyboard at eight buttons or fewer. Latest focused customer-bot suite: 141 passed in 26.378 seconds; latest full suite: 504 passed in 63.972 seconds. Continue Phase 2 with product detail/quote presentation, insufficient-wallet recovery and order-status journey.
 - Live staging acceptance is blocked until a disposable panel and explicit authorization exist.
 - Online gateways remain deferred. Mini App expansion is later roadmap work.
 
@@ -82,7 +83,7 @@ Do not conflate reference bots with provider adapters. The supported provider or
 ## Test ledger and anti-duplication rule
 
 Latest verified checkpoint on 2026-10-28:
-- Full isolated suite: **504 tests passed in 64.246 seconds**, exit 0, command `./scripts/run_isolated_tests.sh`.
+- Latest full isolated suite after the customer catalog UX change: **504 tests passed in 63.972 seconds**, exit 0, command `./scripts/run_isolated_tests.sh`.
 - Focused combined provider adapter suites: **76 tests passed** across PasarGuard, Rebecca and Sanaei.
 - Static checks passed: `python3 -m compileall -q -f src tests scripts`; `bash -n scripts/*.sh`; `node --check customer_webapp/app.js`; `git diff --check`.
 - Latest published code commit: `eff83db34d9a0116ca507da6158f8b84faab07cd`; docs-only publication-verification commit: `f74be144d15ad87b4ed1f55c8d5c2cc0f0e5f80b`. Verify live branch/HEAD before relying on these values.
@@ -111,6 +112,6 @@ After Phase 1, proceed through these product-first phases. Before each phase, in
 
 1. Read this master prompt, then docs/PROGRESS.md, README.md, and docs/PROVIDER_CAPABILITY_MATRIX.md.
 2. Verify device label, repository path, branch, local/remote HEAD, clean status and latest GitHub commit. Do not trust old chat state.
-3. Start at **Phase 2 customer purchase journey audit**. Phase 1 public-source pagination research is recorded; version-specific/live completeness remains an explicit unresolved gate. Do not begin by rerunning adapter tests.
+3. Continue **Phase 2 customer purchase journey** from the next gap: product detail/quote presentation, insufficient-wallet recovery and order-status clarity. The compact category/catalog navigation slice is already implemented and tested; do not rebuild it. Phase 1 version-specific/live pagination completeness remains unresolved. Do not begin by rerunning adapter tests.
 4. Keep the four reference bots and provider order above; preserve product-first milestones and evidence labels.
 5. After a meaningful step, update this file only if the governing rules/roadmap changed; append the actual evidence to docs/PROGRESS.md. Keep these two files as the single source of handoff truth.

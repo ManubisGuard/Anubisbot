@@ -1494,7 +1494,7 @@ class CustomerBot:
                 "\n\n⏳ بدهی ساعتی/مصرفی:\n" + "\n".join(debt_lines) +
                 "\n\nموجودی از دفترکل ذخیره‌شده خوانده می‌شود. درگاه خودکار هنوز متصل نیست؛ شارژ دستی فقط پس از تأیید پرداخت ثبت می‌شود.", menu)
         elif command == "/shop":
-            await self._show_shop(chat_id, menu)
+            await self._show_shop(chat_id, menu, show_categories=True)
         elif command == "/deposit":
             parts = text.split()
             try:
@@ -2858,43 +2858,65 @@ class CustomerBot:
         await self.api.send_text(chat_id, body, {"inline_keyboard": rows})
 
     async def _show_shop(self, chat_id: int, keyboard: dict[str, Any], category_id: str | None = None,
-                         page: int = 0, category_menu_page: int = 0) -> None:
+                         page: int = 0, category_menu_page: int = 0, show_categories: bool = False) -> None:
         categories = self.data.list_categories()
         category = next((c for c in categories if c["category_id"] == category_id), None) if category_id else None
         if category_id and not category:
             await self.api.send_text(chat_id, "این دسته‌بندی دیگر فعال نیست.", keyboard)
             return
-        category_page_size = 20
-        category_page_count = max(1, (len(categories) + category_page_size - 1) // category_page_size)
-        try:
-            category_menu_page = max(0, min(int(category_menu_page), category_page_count - 1))
-        except (TypeError, ValueError):
-            category_menu_page = 0
-        visible_categories = categories[category_menu_page * category_page_size:(category_menu_page + 1) * category_page_size]
-        category_navigation = []
-        if category_menu_page > 0:
-            category_navigation.append({"text": "⬅️ دسته‌های قبلی", "callback_data": f"customer:category_menu_page:{category_id or 'all'}:{category_menu_page-1}"})
-        if category_menu_page + 1 < category_page_count:
-            category_navigation.append({"text": "دسته‌های بعدی ➡️", "callback_data": f"customer:category_menu_page:{category_id or 'all'}:{category_menu_page+1}"})
+
+        main_menu_row = keyboard.get("inline_keyboard", [[{"text": "⬅️ منو", "callback_data": "customer:home"}]])[0]
+
+        # Keep category selection and product selection on separate screens. This
+        # bounds the number of buttons and avoids mixing dozens of categories with
+        # product purchase actions on a single Telegram message.
+        if show_categories and category_id is None and categories:
+            category_page_size = 4
+            category_page_count = max(1, (len(categories) + category_page_size - 1) // category_page_size)
+            try:
+                category_menu_page = max(0, min(int(category_menu_page), category_page_count - 1))
+            except (TypeError, ValueError):
+                category_menu_page = 0
+            visible_categories = categories[
+                category_menu_page * category_page_size:(category_menu_page + 1) * category_page_size]
+            buttons = [[{"text": item["title"][:30], "callback_data": f"customer:category:{item['category_id']}"}]
+                       for item in visible_categories]
+            navigation = []
+            if category_menu_page > 0:
+                navigation.append({"text": "⬅️ دسته‌های قبلی",
+                                   "callback_data": f"customer:category_menu_page:all:{category_menu_page-1}"})
+            if category_menu_page + 1 < category_page_count:
+                navigation.append({"text": "دسته‌های بعدی ➡️",
+                                   "callback_data": f"customer:category_menu_page:all:{category_menu_page+1}"})
+            if navigation:
+                buttons.append(navigation)
+            buttons.append([{"text": "🛍 همه محصولات", "callback_data": "customer:category:all"}])
+            buttons.append(main_menu_row)
+            heading = f"🛍 فروشگاه — انتخاب دسته‌بندی\nصفحه دسته‌بندی‌ها {category_menu_page + 1} از {category_page_count}"
+            await self.api.send_text(chat_id, heading + "\nبرای دیدن محصولات، یک دسته را انتخاب کن یا همه محصولات را ببین.",
+                                     {"inline_keyboard": buttons})
+            return
+
         all_products = [p for p in self.data.list_products(category_id=category_id)
                         if (self.data.get_panel_connection(str(p.get("panel_id") or "")) or {}).get("enabled")]
         all_manual_products = self.data.list_manual_products(category_id=category_id)
-        page_size = 10
-        page_count = max(1, (len(all_products) + page_size - 1) // page_size,
-                         (len(all_manual_products) + page_size - 1) // page_size)
+        catalog_items = [("manual", item) for item in all_manual_products]
+        catalog_items.extend(("panel", item) for item in all_products)
+        page_size = 4
+        page_count = max(1, (len(catalog_items) + page_size - 1) // page_size)
         try:
             page = max(0, min(int(page), page_count - 1))
         except (TypeError, ValueError):
             page = 0
-        products = all_products[page * page_size:(page + 1) * page_size]
-        manual_products = all_manual_products[page * page_size:(page + 1) * page_size]
+        visible_items = catalog_items[page * page_size:(page + 1) * page_size]
+        manual_products = [item for kind, item in visible_items if kind == "manual"]
+        products = [item for kind, item in visible_items if kind == "panel"]
         heading = f"🛍 دسته‌بندی: {category['title']}" if category else "🛍 فروشگاه محصولات و اشتراک‌ها:"
         if page_count > 1:
             heading += f"\nصفحه محصولات {page + 1} از {page_count}"
-        if category_page_count > 1:
-            heading += f"\nصفحه دسته‌بندی‌ها {category_menu_page + 1} از {category_page_count}"
         lines = [heading]
         buttons = []
+
         for item in manual_products:
             cap = int(item.get("max_purchases_per_customer") or 0)
             cap_text = f" — سقف خرید هر مشتری: {cap}" if cap else ""
@@ -2936,7 +2958,7 @@ class CustomerBot:
                     "caption": "\n".join(caption_parts)[:1000], "protect_content": True}
                 if not is_out_of_stock:
                     photo_payload["reply_markup"] = {"inline_keyboard": [[{"text": f"خرید {item['title'][:28]}",
-                        "callback_data": f"customer:manualbuy:{item['product_id']}"}]]}
+                        "callback_data": f"customer:manualbuy:{item['product_id']}", "style": "primary"}]]}
                 try:
                     await self.api.call("sendPhoto", photo_payload)
                     photo_sent = True
@@ -2948,60 +2970,62 @@ class CustomerBot:
                 if summary:
                     lines.append(f"  توضیحات: {summary}")
                 if not is_out_of_stock:
-                    buttons.append([{"text": f"خرید {item['title'][:28]}", "callback_data": f"customer:manualbuy:{item['product_id']}"}])
-        if categories:
-            category_buttons = [[{"text": "همه محصولات", "callback_data": "customer:category:all"}]]
-            for item in visible_categories:
-                category_buttons.append([{"text": item["title"][:30], "callback_data": f"customer:category:{item['category_id']}"}])
-            buttons.extend(category_buttons)
-            if category_navigation:
-                buttons.append(category_navigation)
-        def product_page_callback(target_page: int) -> str:
-            if category_id:
-                suffix = f":{category_menu_page}" if category_menu_page else ""
-                return f"customer:category_page:{category_id}:{target_page}{suffix}"
-            suffix = f":{category_menu_page}" if category_menu_page else ""
-            return f"customer:shop_page:{target_page}{suffix}"
+                    buttons.append([{"text": f"خرید {item['title'][:28]}",
+                                     "callback_data": f"customer:manualbuy:{item['product_id']}", "style": "primary"}])
 
-        if not products:
-            if not all_manual_products and not all_products and not categories and category_id is None:
-                await self.api.send_text(chat_id, "🛍 فروشگاه فعلاً محصولی ندارد. مدیر می‌تواند محصول پنلی یا محصول دیجیتال دستی تعریف کند.", keyboard)
-                return
-            if category_id is not None and not all_manual_products and not all_products:
+        if not products and not manual_products:
+            if category_id is not None:
                 lines.append("در این دسته فعلاً محصول فعالی وجود ندارد.")
-            elif category_id is None and not all_manual_products and not all_products:
-                lines.append("برای مشاهده محصولات، یک دسته‌بندی انتخاب کن." if categories else "محصول فعالی با اتصال معتبر در این صفحه وجود ندارد.")
+            elif not categories:
+                lines.append("🛍 فروشگاه فعلاً محصولی ندارد. مدیر می‌تواند محصول پنلی یا محصول دیجیتال دستی تعریف کند.")
+            else:
+                lines.append("محصول فعالی با اتصال معتبر در این فروشگاه وجود ندارد.")
             navigation = []
             if page > 0:
-                navigation.append({"text": "⬅️ قبلی", "callback_data": product_page_callback(page-1)})
+                navigation.append({"text": "⬅️ قبلی", "callback_data": self._shop_page_callback(category_id, page - 1)})
             if page + 1 < page_count:
-                navigation.append({"text": "بعدی ➡️", "callback_data": product_page_callback(page+1)})
+                navigation.append({"text": "بعدی ➡️", "callback_data": self._shop_page_callback(category_id, page + 1)})
             if navigation:
                 buttons.append(navigation)
-            buttons.append(keyboard.get("inline_keyboard", [[{"text":"⬅️ منو","callback_data":"customer:home"}]])[0])
+            if categories:
+                buttons.append([{"text": "📂 دسته‌بندی‌ها", "callback_data": "customer:shop"}])
+            buttons.append(main_menu_row)
             await self.api.send_text(chat_id, "\n".join(lines), {"inline_keyboard": buttons})
             return
+
         mode_names = {"fixed":"ثابت", "unlimited":"نامحدود", "hourly":"ساعتی", "usage":"مصرفی"}
         for item in products:
             mode = item["pricing_mode"]
+            rate = int(item["unit_price_minor"])
+            price = int(item["price_minor"])
             if mode in {"hourly", "usage"}:
                 rate_unit = "/ساعت" if mode == "hourly" else "/GiB"
-                price_text = f"{int(item['unit_price_minor']):,} {item['currency']}{rate_unit}"
+                price_text = f"{rate:,} {item['currency']}{rate_unit}"
             else:
-                price_text = f"{int(item['price_minor']):,} {item['currency']}"
+                price_text = f"{price:,} {item['currency']}"
             duration = f" · {item['duration_hours']} ساعت" if item["duration_hours"] else ""
             lines.append(f"• {item['title']} — {mode_names.get(mode,mode)} — {price_text}{duration}")
-            buttons.append([{"text": f"خرید {item['title'][:28]} · {mode_names.get(mode,mode)}", "callback_data": f"customer:buy:{item['product_id']}"}])
+            buttons.append([{"text": f"خرید {item['title'][:28]} · {mode_names.get(mode,mode)}",
+                             "callback_data": f"customer:buy:{item['product_id']}", "style": "primary"}])
         lines.append("\nمدل ساعتی/مصرفی از کیف پول به‌صورت دوره‌ای کسر می‌شود؛ در صورت اتمام موجودی، سرویس برای تعلیق به صف می‌رود.")
         navigation = []
         if page > 0:
-            navigation.append({"text": "⬅️ قبلی", "callback_data": product_page_callback(page-1)})
+            navigation.append({"text": "⬅️ قبلی", "callback_data": self._shop_page_callback(category_id, page - 1)})
         if page + 1 < page_count:
-            navigation.append({"text": "بعدی ➡️", "callback_data": product_page_callback(page+1)})
+            navigation.append({"text": "بعدی ➡️", "callback_data": self._shop_page_callback(category_id, page + 1)})
         if navigation:
             buttons.append(navigation)
-        buttons.append(keyboard.get("inline_keyboard", [[{"text":"⬅️ منو","callback_data":"customer:home"}]])[0])
+        if categories:
+            buttons.append([{"text": "📂 دسته‌بندی‌ها", "callback_data": "customer:shop"}])
+        buttons.append(main_menu_row)
         await self.api.send_text(chat_id, "\n".join(lines), {"inline_keyboard": buttons})
+
+    @staticmethod
+    def _shop_page_callback(category_id: str | None, page: int) -> str:
+        if category_id:
+            return f"customer:category_page:{category_id}:{page}"
+        return f"customer:shop_page:{page}"
+
 
     async def _refresh_customer_service_snapshot(self, *, service: dict[str, Any], telegram_id: int) -> bool:
         """Fetch a read-only provider snapshot; never mutate provider or billing state."""
@@ -3967,7 +3991,7 @@ class CustomerBot:
             await self.api.send_text(chat_id, "\n".join(lines), {"inline_keyboard": rows})
             return
         if key == "shop":
-            await self._show_shop(chat_id, self._customer_menu(customer_id=uid))
+            await self._show_shop(chat_id, self._customer_menu(customer_id=uid), show_categories=True)
             return
         if key.startswith("shop_page:"):
             parts = key.removeprefix("shop_page:").split(":")
@@ -3982,7 +4006,7 @@ class CustomerBot:
         if key.startswith("category_page:"):
             parts = key.removeprefix("category_page:").split(":")
             if len(parts) not in {2,3}:
-                await self._show_shop(chat_id, self._customer_menu(customer_id=uid))
+                await self._show_shop(chat_id, self._customer_menu(customer_id=uid), show_categories=True)
                 return
             try:
                 page = max(0, int(parts[1]))
@@ -3996,14 +4020,14 @@ class CustomerBot:
         if key.startswith("category_menu_page:"):
             parts = key.removeprefix("category_menu_page:").split(":")
             if len(parts) != 2:
-                await self._show_shop(chat_id, self._customer_menu(customer_id=uid))
+                await self._show_shop(chat_id, self._customer_menu(customer_id=uid), show_categories=True)
                 return
             try:
                 category_menu_page = max(0, int(parts[1]))
             except ValueError:
                 category_menu_page = 0
             await self._show_shop(chat_id, self._customer_menu(customer_id=uid),
-                category_id=None if parts[0] == "all" else parts[0], category_menu_page=category_menu_page)
+                category_menu_page=category_menu_page, show_categories=True)
             return
         if key == "miniapp":
             await self.api.send_text(chat_id, "📱 مینی‌اپلیکیشن هنوز به این ربات متصل نشده است. پس از تنظیم آدرس امن، این گزینه فعال می‌شود.", BACK_MENU)
