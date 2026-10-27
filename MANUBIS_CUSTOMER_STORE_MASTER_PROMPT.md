@@ -58,9 +58,9 @@ UI quality requirements:
 
 ## Current product roadmap
 
-- Completed locally/published: panel management/read-only checks; guided panel registration; category management; guided product creation for manual/inventory/file/panel fulfillment.
-- Current next step: improve the admin navigation and guarded review journey for card-to-card wallet receipts, preserving independent verification, immutable wallet ledger, idempotency and audit history.
-- Then: continue focused PasarGuard adapter contract verification and missing/unknown permission/ambiguous mutation recovery tests.
+- Completed locally/published: panel management/read-only checks; guided panel registration; category management; guided product creation for manual/inventory/file/panel fulfillment; guarded manual receipt review with audit navigation.
+- Latest adapter hardening (2026-10-28): PasarGuard rejects boolean/negative/malformed counters, and incomplete/unsupported auth configuration fails before secret resolution. Focused mock timeout tests already assert no blind retry for create/update/delete.
+- Current next step: continue reviewing cross-provider adapter input/schema gaps and state-reconciliation edges. Read the newest entry in docs/PROGRESS.md first to avoid repeating completed checks.
 - Live staging acceptance is blocked until a disposable panel and explicit authorization exist.
 - Online gateways remain deferred. Mini App expansion is later roadmap work.
 

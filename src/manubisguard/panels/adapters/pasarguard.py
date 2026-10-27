@@ -31,6 +31,17 @@ class PasarGuardAdapter:
             raise PanelError("TLS certificate verification must remain enabled")
         if not connection.base_url.lower().startswith("https://"):
             raise PanelError("PasarGuard panel connections require an HTTPS base URL")
+        if connection.auth_mode not in {"api_key", "access_token", "username_password"}:
+            raise PanelError(f"Unsupported PasarGuard auth mode: {connection.auth_mode}")
+        username = None
+        if connection.auth_mode == "username_password":
+            username = connection.metadata.get("username")
+            if not isinstance(username, str) or not username.strip():
+                raise PanelError("username_password auth requires metadata.username")
+            username = username.strip()
+        # Reject incomplete/unsupported auth configuration before touching a secret
+        # resolver. Secret stores may be remote or audited and should not be consulted
+        # for a connection that cannot be used even if credentials were available.
         secret = self._secret_resolver(connection.secret_ref)
         if not secret:
             raise PanelError("Panel credential resolved to an empty value")
@@ -54,11 +65,9 @@ class PasarGuardAdapter:
         if connection.auth_mode == "access_token":
             return factory(**client_options, token=secret), secret
         if connection.auth_mode == "username_password":
-            username = connection.metadata.get("username")
-            if not username:
-                raise PanelError("username_password auth requires metadata.username")
             return factory(**client_options), (username, secret)
-        raise PanelError(f"Unsupported PasarGuard auth mode: {connection.auth_mode}")
+        # The supported auth modes were validated before secret resolution above.
+        raise PanelError("PasarGuard auth mode validation failed")
 
     async def _authed_client(self, connection: PanelConnection):
         client, credential = self._client(connection)
@@ -235,6 +244,9 @@ class PasarGuardAdapter:
     def _validated_counter(value: Any, label: str) -> int | None:
         if value is None:
             return None
+        # bool subclasses int in Python, but true/false are never valid byte counts.
+        if isinstance(value, bool):
+            raise PanelError(f"PasarGuard response contained an invalid {label}") from None
         try:
             number = int(value)
         except (TypeError, ValueError, OverflowError):
@@ -363,28 +375,32 @@ class PasarGuardAdapter:
         else:
             raise PanelError("PasarGuard usage response was not an object")
 
-        def find_counter(source: dict[str, Any], names: tuple[str, ...]) -> int | None:
+        def find_counter(source: dict[str, Any], names: tuple[str, ...], label: str) -> int | None:
             for name in names:
                 value = source.get(name)
                 if value is None:
                     continue
+                # bool subclasses int, and coercing True to 1 can silently corrupt billing.
+                if isinstance(value, bool):
+                    raise PanelError(f"PasarGuard usage response contained an invalid {label}") from None
                 try:
                     number = int(value)
                 except (TypeError, ValueError, OverflowError):
-                    continue
-                if number >= 0:
-                    return number
+                    raise PanelError(f"PasarGuard usage response contained an invalid {label}") from None
+                if number < 0:
+                    raise PanelError(f"PasarGuard usage response contained a negative {label}") from None
+                return number
             return None
 
         nested = next((raw.get(key) for key in ("usage", "data", "result")
                        if isinstance(raw.get(key), dict)), None)
         sources = [raw] + ([nested] if isinstance(nested, dict) else [])
         used = next((value for source in sources if (value := find_counter(
-            source, ("used_bytes", "used_traffic", "used_traffic_bytes", "total_usage"))) is not None), None)
+            source, ("used_bytes", "used_traffic", "used_traffic_bytes", "total_usage"), "usage counter")) is not None), None)
         if used is None:
             raise PanelError("PasarGuard usage response omitted a recognized byte counter")
         limit = next((value for source in sources if (value := find_counter(
-            source, ("data_limit_bytes", "data_limit", "total_bytes"))) is not None), None)
+            source, ("data_limit_bytes", "data_limit", "total_bytes"), "data limit")) is not None), None)
         normalized = dict(raw)
         normalized["used_bytes"] = used
         if limit is not None:

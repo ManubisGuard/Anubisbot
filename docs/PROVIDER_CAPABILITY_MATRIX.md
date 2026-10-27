@@ -1,6 +1,6 @@
 # MANUBIS Bot 2 — Provider Capability Matrix
 
-Updated: 2026-10-21. Scope: source-level audit of `src/manubisguard/panels/adapters/{pasarguard,rebecca,sanaei}.py`, the provider-neutral contract, reseller provider paths, and isolated tests. This document deliberately distinguishes local code/mocks from deployed-panel acceptance.
+Updated: 2026-10-28. Scope: source-level audit of `src/manubisguard/panels/adapters/{pasarguard,rebecca,sanaei}.py`, the provider-neutral contract, reseller provider paths, and isolated tests. This document deliberately distinguishes local code/mocks from deployed-panel acceptance.
 
 ## Evidence legend
 
@@ -35,6 +35,7 @@ Updated: 2026-10-21. Scope: source-level audit of `src/manubisguard/panels/adapt
 5. The official token `/panel/api/clients/links/{email}` endpoint returns direct protocol URLs for a client, potentially several across attached inbounds. These are not equivalent to MANUBIS's HTTPS `subscription_url` field (also consumed by QR generation). The adapter ignores `links` arrays for subscription URLs. For generated URLs, admins must explicitly configure `subscription_base_url` as the separate HTTPS subscription-server origin (including its actual port) and `subscription_path` as the panel's configured single path segment; the client response must include a valid `subId`. The admin registration path validates these fields and capability remains false when absent/invalid. No default port or equivalence with panel API `base_url` is assumed.
 6. Rebecca user creation requires a configured service ID. Its normal adapter's reseller capability is unsupported; native reseller handling is separate and gated by OpenAPI/scope/permission contracts.
 7. Provider mutation timeout/ambiguous-result recovery must remain operation-specific. No adapter mock proves whether a remote write happened when a real connection times out.
+8. PasarGuard user/usage mapping rejects boolean counters rather than coercing Python True to 1; present-but-invalid or negative usage counters fail closed. Unsupported auth modes and username/password configuration without a non-empty username are rejected before the secret resolver is called. These checks validate local inputs only and do not establish live permissions or provider-version compatibility.
 
 ## Remaining acceptance gates
 

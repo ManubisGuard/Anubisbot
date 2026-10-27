@@ -102,7 +102,21 @@ Updated: 2026-10-28
 
 ## Next steps in order
 
-1. Review PasarGuard operation contracts one by one and add focused mock tests for missing/invalid config, permissions unknown, and ambiguous provider mutation outcomes. Keep the adapter capability matrix honest and provider mutations behind state reconciliation.
+1. Continue reviewing provider operation contracts and normalized response schemas across PasarGuard, Rebecca and Sanaei. Check the latest progress entry for already-covered invalid configuration, boolean/negative counters, unknown permission reporting, and no-blind-retry mutation behavior; add only new regression cases.
 2. Continue payment review polish only if a concrete gap is found: receipt image absence, old callback references, stale confirmation, rejection reason validation and audit event navigation are covered in this checkpoint.
 3. Live staging acceptance remains blocked until a disposable panel and explicit authorization are provided.
 4. After each independent implementation step: focused tests, full `./scripts/run_isolated_tests.sh`, static checks, reviewed-path-only staging, publish to `feature/discount-codes`, synchronize and verify clean status. Never use `git add -A`; never restart services or deploy without explicit authorization.
+
+
+## Latest checkpoint — PasarGuard input and configuration fail-closed hardening (2026-10-28)
+
+- Verified current connected device label 8017638839-32c511, workspace /root/bot/workspace/AnubisBot, remote https://github.com/ManubisGuard/Anubisbot.git, branch feature/discount-codes, starting HEAD 8642cf4bf836b6f505b0552e90ff521c160ad8de, and clean/synchronized status before editing.
+- Found a real billing-data edge case: Python booleans are integer subclasses, so True previously normalized to a byte counter of 1. PasarGuard _validated_counter now rejects booleans. _map_usage now rejects explicit boolean, unparseable, or negative counters instead of silently coercing/ignoring those values; absent recognized usage still fails closed.
+- _client validates supported auth modes before resolving the configured secret. username_password mode also requires a non-empty string metadata.username before any secret resolution or SDK client construction. Capability reports retain live_panel_verified=false and leave panel permissions unknown on invalid configuration.
+- Added regression tests for boolean user-usage and data-limit values, boolean/negative usage response counters, unsupported auth mode, and missing username. Test-first run correctly failed on the boolean counter and both invalid-configuration resolver calls before the implementation fix.
+- Focused PasarGuard adapter suite: 24 tests passed in 0.087 seconds. Combined provider contract suites (PasarGuard adapter/reseller, Rebecca adapter/native reseller, Sanaei adapter): 82 tests passed in 2.040 seconds.
+- Full isolated suite: 497 tests passed in 65.253 seconds (OK, exit 0) via ./scripts/run_isolated_tests.sh.
+- Static checks passed: python3 -m compileall -q -f src tests scripts, bash -n scripts/*.sh, node --check customer_webapp/app.js, and git diff --check (STATIC_CHECKS_OK).
+- Updated docs/PROVIDER_CAPABILITY_MATRIX.md, MANUBIS_CUSTOMER_STORE_MASTER_PROMPT.md, and this progress log to reflect the new contracts and remaining scope.
+- Evidence: E2 local unit/mock only. No provider network request, staging panel, live Telegram client, production DB, production panel, N2, running service, timer, deployment, restart, or secret retrieval was performed. At the time this entry was drafted, publication was pending; append the actual commit SHA and verified remote/workspace HEAD after publication.
+- Next: continue the source/test review for any remaining adapter input/schema gaps and state-reconciliation edge cases. Keep provider mutation mocks no-retry. Live acceptance still requires a disposable authorized staging panel and explicit authorization.

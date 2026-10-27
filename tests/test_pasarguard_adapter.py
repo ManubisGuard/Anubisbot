@@ -192,6 +192,16 @@ class PasarGuardAdapterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(PanelError, "omitted a recognized byte counter"):
             self.adapter._map_usage({"username": "alice", "data_limit": 50000})
 
+    async def test_boolean_usage_counters_are_rejected_instead_of_billed_as_one_byte(self):
+        with self.assertRaisesRegex(PanelError, "invalid usage counter"):
+            self.adapter._map_user({"username": "alice", "used_traffic": True}, self.connection.base_url)
+        with self.assertRaisesRegex(PanelError, "invalid data limit"):
+            self.adapter._map_user({"username": "alice", "data_limit": False}, self.connection.base_url)
+        with self.assertRaisesRegex(PanelError, "invalid usage counter"):
+            self.adapter._map_usage({"used_traffic": True})
+        with self.assertRaisesRegex(PanelError, "negative usage counter"):
+            self.adapter._map_usage({"used_traffic": -1})
+
     async def test_create_user_supports_current_sdk_method_name(self):
         fake_sdk = SimpleNamespace(UserCreate=lambda **kwargs: SimpleNamespace(**kwargs))
         with patch.dict(sys.modules, {"pasarguard": fake_sdk}):
@@ -351,6 +361,24 @@ class PasarGuardAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(error.__cause__)
             self.assertTrue(error.__suppress_context__)
 
+
+    async def test_unsupported_auth_mode_and_missing_login_username_fail_before_secret_resolution(self):
+        for connection in (
+            replace(self.connection, auth_mode="unsupported"),
+            replace(self.connection, auth_mode="username_password", metadata={}),
+        ):
+            with self.subTest(auth_mode=connection.auth_mode):
+                resolved = []
+                adapter = PasarGuardAdapter(
+                    secret_resolver=lambda ref: resolved.append(ref) or "test-secret",
+                    sdk_factory=lambda **kwargs: self.fail("invalid auth config must not construct SDK"),
+                )
+                report = await adapter.capability_report(connection)
+                self.assertFalse(report["live_panel_verified"])
+                self.assertEqual(report["error_type"], "PanelError")
+                self.assertEqual(resolved, [])
+                self.assertTrue(all(op["status"] == "unknown" for op in report["operations"].values()))
+                self.assertTrue(all(op["panel_permission"] == "unknown" for op in report["operations"].values()))
 
     async def test_capability_report_invalid_connection_fails_closed_before_secret_resolution(self):
         resolved = []
