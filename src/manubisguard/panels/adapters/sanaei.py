@@ -396,25 +396,38 @@ class SanaeiAdapter:
         limit = max(1, min(int(limit), 200)); offset = max(0, int(offset))
         if mode == "token":
             result = await self._request(connection, "GET", "/panel/api/clients/list")
-            raw = result.get("obj", []) if isinstance(result, dict) else []
+            if not isinstance(result, dict) or "obj" not in result:
+                raise PanelError("Sanaei clients list did not contain a list")
+            raw = result["obj"]
             if not isinstance(raw, list): raise PanelError("Sanaei clients list did not contain a list")
-            return [self._map({"client": client}, connection.base_url) for client in raw[offset:offset+limit] if isinstance(client, dict)]
+            if any(not isinstance(client, dict) for client in raw):
+                raise PanelError("Sanaei clients list contained an invalid item")
+            return [self._map({"client": client}, connection.base_url) for client in raw[offset:offset+limit]]
         result = await self._request(connection, "GET", "/panel/api/inbounds/list")
-        raw = result.get("obj", []) if isinstance(result, dict) else []
+        if not isinstance(result, dict) or "obj" not in result:
+            raise PanelError("Sanaei inbound response did not contain a list")
+        raw = result["obj"]
         if not isinstance(raw, list): raise PanelError("Sanaei inbound response did not contain a list")
         grouped: dict[str, dict[str, Any]] = {}
         for inbound in raw:
-            if not isinstance(inbound, dict): continue
-            settings = inbound.get("settings", {})
+            if not isinstance(inbound, dict):
+                raise PanelError("Sanaei inbound list contained an invalid item")
+            if "settings" not in inbound:
+                raise PanelError("Sanaei inbound response omitted settings")
+            settings = inbound["settings"]
             if isinstance(settings, str):
                 try: settings = json.loads(settings)
-                except ValueError: continue
-            clients = settings.get("clients", []) if isinstance(settings, dict) else []
-            if not isinstance(clients, list): continue
+                except (ValueError, TypeError):
+                    raise PanelError("Sanaei inbound settings contained invalid JSON") from None
+            if not isinstance(settings, dict):
+                raise PanelError("Sanaei inbound settings were invalid")
+            clients = settings.get("clients")
+            if not isinstance(clients, list):
+                raise PanelError("Sanaei inbound settings did not contain a clients list")
             protocol = str(inbound.get("protocol") or "").lower()
             for client in clients:
                 if not isinstance(client, dict) or not client.get("email"):
-                    continue
+                    raise PanelError("Sanaei inbound clients contained an invalid item")
                 username = str(client["email"])
                 inbound_id = self._legacy_inbound_id(inbound.get("id"))
                 identity = self._legacy_identity_key(client, protocol)

@@ -62,6 +62,27 @@ class SanaeiAdapterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(PanelError, 'clients list did not contain a list'):
             await adapter.list_users(conn)
 
+    async def test_token_list_users_rejects_missing_object_envelope(self):
+        adapter = SanaeiAdapter(secret_resolver=lambda _: 'token-secret',
+            client_factory=lambda **kw: FakeClient(
+                lambda *args: Response(200, {'success': True}), kw['base_url']))
+        conn = PanelConnection(id='s', tenant_id='t', name='Sanaei', kind='sanaei',
+            base_url='https://sanaei.example', auth_mode='access_token', secret_ref='s')
+        with self.assertRaisesRegex(PanelError, 'clients list did not contain a list'):
+            await adapter.list_users(conn)
+
+    async def test_token_list_users_rejects_malformed_items_instead_of_dropping_them(self):
+        payload = {'success': True, 'obj': [
+            {'email': 'alice', 'id': 'uuid-a', 'totalGB': 2}, 'malformed-client'
+        ]}
+        adapter = SanaeiAdapter(secret_resolver=lambda _: 'token-secret',
+            client_factory=lambda **kw: FakeClient(
+                lambda *args: Response(200, payload), kw['base_url']))
+        conn = PanelConnection(id='s', tenant_id='t', name='Sanaei', kind='sanaei',
+            base_url='https://sanaei.example', auth_mode='access_token', secret_ref='s')
+        with self.assertRaisesRegex(PanelError, 'clients list contained an invalid item'):
+            await adapter.list_users(conn)
+
     async def test_token_create_payload_and_expiry_milliseconds(self):
         seen=[]
         def handler(method,path,kwargs):
@@ -94,6 +115,28 @@ class SanaeiAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(user.used_bytes,10)
         self.assertEqual(user.data_limit_bytes,100 * 1024**3)
         self.assertEqual(calls,[('/login','POST'),('/panel/api/inbounds/list','GET')])
+
+    async def test_legacy_list_users_rejects_malformed_data_instead_of_partial_snapshot(self):
+        valid_inbound = {'id': 7, 'protocol': 'vless',
+            'settings': json.dumps({'clients': [{'email': 'alice', 'id': 'uuid-1'}]})}
+        responses = [
+            ({'success': True}, 'inbound response did not contain a list'),
+            ({'success': True, 'obj': [valid_inbound, {'id': 8, 'settings': '{invalid-json'}]},
+             'inbound settings contained invalid JSON'),
+            ({'success': True, 'obj': [valid_inbound, 'malformed-inbound']},
+             'inbound list contained an invalid item'),
+        ]
+        conn = PanelConnection(id='legacy', tenant_id='t', name='Legacy', kind='sanaei',
+            base_url='https://sanaei.example', auth_mode='username_password', secret_ref='s',
+            metadata={'username': 'admin'})
+        for payload, expected in responses:
+            with self.subTest(expected=expected):
+                adapter = SanaeiAdapter(secret_resolver=lambda _: 'password',
+                    client_factory=lambda **kw: FakeClient(
+                        lambda method, path, args: Response(200, {'success': True}) if path == '/login'
+                        else Response(200, payload), kw['base_url']))
+                with self.assertRaisesRegex(PanelError, expected):
+                    await adapter.list_users(conn)
 
     async def test_token_subscription_link_uses_explicit_https_url_not_share_links(self):
         calls=[]

@@ -213,3 +213,12 @@ class RebeccaAdapterTests(unittest.IsolatedAsyncioTestCase):
                 ]}), kw["base_url"]))
         with self.assertRaisesRegex(PanelError, "user list response was invalid"):
             await adapter.list_users(self.connection)
+
+    async def test_list_users_rejects_success_response_without_users_envelope(self):
+        for payload in ({"success": True}, ["unexpected-response"]):
+            with self.subTest(payload=payload):
+                adapter = RebeccaAdapter(secret_resolver=lambda _: "fake-key",
+                    client_factory=lambda **kw: FakeClient(
+                        lambda *args: Response(200, payload), kw["base_url"]))
+                with self.assertRaisesRegex(PanelError, "user list response was invalid"):
+                    await adapter.list_users(self.connection)

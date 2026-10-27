@@ -152,3 +152,16 @@ Updated: 2026-10-28
 - GitHub compare verified this was exactly one commit ahead of d67ccf7b54975d9df1348e002af812bc8b481410, with only seven reviewed paths changed.
 - Updated feature/discount-codes with force=false and expected prior SHA d67ccf7b54975d9df1348e002af812bc8b481410. Fetched the branch; local HEAD and origin/feature/discount-codes both matched 0a5605c324c35f84472c1f92e51edcdcba9375fe. All seven local blob hashes matched their remote tree entries, and git status was clean.
 - Final post-publication static checks passed: compileall, Bash syntax, JavaScript syntax, and git diff --check. Full 499-test isolated suite passed before publication.
+
+## Latest checkpoint — provider list-envelope and partial-snapshot hardening (2026-10-28)
+
+- Verified device label 8017638839-32c511, workspace /root/bot/workspace/AnubisBot, branch feature/discount-codes, starting HEAD 0c539c68007193030e448cebbd0e58c074f2c234, and a clean/synchronized worktree before editing.
+- Test-first review found successful but malformed list responses were being interpreted as empty results: PasarGuard defaulted a missing `users` field to an empty list; Rebecca defaulted absent/non-object `users` envelopes to empty; Sanaei defaulted missing `obj` to empty and skipped malformed token clients and legacy inbounds/settings.
+- PasarGuard now requires `users` to be a list/tuple. Rebecca requires the `users` list after optional `data` unwrapping. Sanaei requires an explicit `obj` list in token and legacy modes, rejects malformed token client items, and fails closed for malformed legacy inbound items, settings JSON, settings objects, client lists and client records rather than returning a partial snapshot.
+- Added five regression test methods across tests/test_pasarguard_adapter.py, tests/test_rebecca_adapter.py and tests/test_sanaei_adapter.py (including subcases for malformed success envelopes and legacy partial-list ambiguity). The focused three-adapter suite passed: **76 tests**.
+- Full isolated suite: **504 tests passed in 64.246 seconds (OK, exit 0)** via `./scripts/run_isolated_tests.sh`.
+- Static checks passed after source/test changes: `python3 -m compileall -q -f src tests scripts`, `bash -n scripts/*.sh`, `node --check customer_webapp/app.js`, and `git diff --check` (`STATIC_CHECKS_OK`).
+- Updated `docs/PROVIDER_CAPABILITY_MATRIX.md` and this master prompt to record the explicit response-envelope contracts and the remaining pagination-completeness uncertainty.
+- Evidence level: E2 local unit/mock only. No provider network requests, live panel, production DB, N2, live Telegram process, timer, deployment, restart or secret resolution beyond fake test resolvers was performed.
+- Publication pending at checkpoint creation; record the actual commit, remote HEAD, reviewed path hashes and clean/synchronized worktree in the publication-verification section after the GitHub update.
+- Next: verify provider-version-specific pagination/continuation metadata and whether a well-formed page can still be silently truncated. Keep `list_users` caller-controlled and bounded until supported API contracts prove safe auto-pagination. Continue to avoid blind retries for provider mutations and do not claim live acceptance.

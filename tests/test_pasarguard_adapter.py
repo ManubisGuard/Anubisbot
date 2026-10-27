@@ -238,6 +238,14 @@ class PasarGuardAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.clients[-1].last_users_kwargs["limit"], 200)
         self.assertEqual(self.clients[-1].last_users_kwargs["offset"], 0)
 
+    async def test_list_users_rejects_success_response_without_users_envelope(self):
+        async def malformed_response(self, **kwargs):
+            return SimpleNamespace(total=0)
+
+        with patch.object(FakeClient, "get_users", malformed_response):
+            with self.assertRaisesRegex(PanelError, "user list response was invalid"):
+                await self.adapter.list_users(self.connection)
+
     async def test_user_mapping_normalizes_boolean_status_and_naive_iso_expiry(self):
         mapped = self.adapter._map_user({
             "id": 19, "username": "charlie", "enable": False,

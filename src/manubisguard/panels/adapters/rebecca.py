@@ -200,7 +200,9 @@ class RebeccaAdapter:
         offset = max(0, int(offset))
         result = await self._request(connection, "GET", f"/api/users?limit={limit}&offset={offset}")
         if isinstance(result, dict) and isinstance(result.get("data"), dict): result = result["data"]
-        users = result.get("users", []) if isinstance(result, dict) else []
+        if not isinstance(result, dict) or "users" not in result:
+            raise PanelError("Rebecca user list response was invalid")
+        users = result["users"]
         if not isinstance(users, list) or any(not isinstance(user, dict) for user in users):
             raise PanelError("Rebecca user list response was invalid")
         return [self._map(user, connection.base_url) for user in users]

@@ -350,7 +350,10 @@ class PasarGuardAdapter:
             page_size = max(1, min(int(limit), 200))
             page_offset = max(0, int(offset))
             result = await client.get_users(token=token, offset=page_offset, limit=page_size)
-            users = self._value(result, "users", default=[])
+            # An absent envelope is not evidence that the panel has zero users. Treat
+            # malformed successful responses as errors so callers cannot reconcile a
+            # partial/empty snapshot as authoritative.
+            users = self._value(result, "users", default=None)
             if not isinstance(users, (list, tuple)):
                 raise PanelError("PasarGuard user list response was invalid")
             return [self._map_user(user, connection.base_url) for user in users]
