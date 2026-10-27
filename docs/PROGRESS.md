@@ -163,5 +163,14 @@ Updated: 2026-10-28
 - Static checks passed after source/test changes: `python3 -m compileall -q -f src tests scripts`, `bash -n scripts/*.sh`, `node --check customer_webapp/app.js`, and `git diff --check` (`STATIC_CHECKS_OK`).
 - Updated `docs/PROVIDER_CAPABILITY_MATRIX.md` and this master prompt to record the explicit response-envelope contracts and the remaining pagination-completeness uncertainty.
 - Evidence level: E2 local unit/mock only. No provider network requests, live panel, production DB, N2, live Telegram process, timer, deployment, restart or secret resolution beyond fake test resolvers was performed.
-- Publication pending at checkpoint creation; record the actual commit, remote HEAD, reviewed path hashes and clean/synchronized worktree in the publication-verification section after the GitHub update.
+- Source/tests/docs were published in commit `eff83db34d9a0116ca507da6158f8b84faab07cd` (`Reject malformed provider user-list snapshots`). The exact changed-path and hash verification is recorded in the publication-verification section below.
 - Next: verify provider-version-specific pagination/continuation metadata and whether a well-formed page can still be silently truncated. Keep `list_users` caller-controlled and bounded until supported API contracts prove safe auto-pagination. Continue to avoid blind retries for provider mutations and do not claim live acceptance.
+
+## Publication verification — provider list-envelope hardening (2026-10-28)
+
+- Published source/tests/docs in commit `eff83db34d9a0116ca507da6158f8b84faab07cd` (Reject malformed provider user-list snapshots): https://github.com/ManubisGuard/Anubisbot/commit/eff83db34d9a0116ca507da6158f8b84faab07cd
+- GitHub compare confirmed the commit is exactly one commit ahead of `0c539c68007193030e448cebbd0e58c074f2c234` and changes only the nine reviewed paths listed in the checkpoint above.
+- Updated `feature/discount-codes` with `force=false` and expected prior SHA `0c539c68007193030e448cebbd0e58c074f2c234`. The GitHub ref was read back as `eff83db34d9a0116ca507da6158f8b84faab07cd`.
+- Fetched the published branch and synchronized the workspace. Local HEAD and `origin/feature/discount-codes` matched `eff83db34d9a0116ca507da6158f8b84faab07cd`; all nine local file blob hashes matched the published GitHub content SHAs; `git status --short --branch` was clean.
+- After synchronization, compileall, Bash syntax, JavaScript syntax and `git diff --check` passed again (`STATIC_CHECKS_OK`). The full 504-test isolated suite passed before publication.
+- Evidence remains E2 local unit/mock only. No live provider, staging, production, Telegram or deployment operation was performed.
