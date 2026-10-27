@@ -296,11 +296,11 @@ Continue with **order-status and paid-but-undelivered recovery clarity**. Inspec
 
 ### Audit finding
 
-The existing order history already combines panel and manual orders, scopes history to the customer, and supports safe file redelivery without charging again. However, real panel-order states `provisioning` and `active` were rendered as raw internal labels, and paid/manual orders awaiting delivery had no direct support follow-up from the history screen.
+The existing order history already combines panel and manual orders, scopes history to the customer, and supports safe file redelivery without charging again. However, real panel-order states provisioning and active were rendered as raw internal labels, and paid/manual orders awaiting delivery had no direct support follow-up from the history screen.
 
 ### Implemented
 
-- Added customer-facing Persian labels for actual `provisioning` and `active` states, plus clearer paid/pending-delivery and failed/reconciliation wording.
+- Added customer-facing Persian labels for actual provisioning and active states, plus clearer paid/pending-delivery and failed/reconciliation wording.
 - Added per-order support follow-up buttons for paid, provisioning, pending-delivery, failed, and reconciliation-needed states. The history screen tells customers to include the order ID in their ticket.
 - Added explicit guidance not to repeat a purchase while provider outcome is uncertain; existing reconciliation logic remains read-only until an operator finalizes verified evidence. No automatic refund, provider mutation retry, or new recovery mutation was added.
 - Preserved existing owner-scoped file redelivery, which only serves a fulfilled file order and does not debit the wallet again.
@@ -317,4 +317,11 @@ The existing order history already combines panel and manual orders, scopes hist
 
 Audit whether order-history status needs a customer-safe distinction between a panel order that is still provisioning and one flagged for reconciliation. The provider marker is intentionally not exposed in the customer history query today; if adding this distinction, expose only a sanitized boolean/state label and never provider references or provisioning payloads. Preserve no-blind-retry/no-auto-refund rules. Do not rebuild catalog navigation or insufficient-wallet recovery.
 
-[executed on device: 8017638839-32c511 (fc69b50d-fe64-47f9-ab6a-705be5de41dc)]
+
+## Publication integrity checkpoint — order-status slice (2026-10-28)
+
+- Final published code commit: `9a58812dcfd69d2ebd8882c0046b18b34844544d` on `feature/discount-codes`.
+- During post-publication integrity verification, the first publication (`5a7ff441be2b2696969dc3e25152180f4b2db69d`) was found to contain truncated copies of the two large Python files because the file-reading response was paginated. It was immediately superseded by the non-force corrective commit above, which restores both full files from the prior baseline and reapplies the reviewed patch.
+- Verified full file lengths after correction: `src/manubisguard/telegram/customer_bot.py` 4,569 lines; `tests/test_customer_bot.py` 3,000 lines. Their published Git blob hashes match the workspace hashes (`ae46a82bbc0842a684d7d60ed3eed5332c5fcd59` and `b09c1e7774a5c75f51c3426eb93df9d6ee737a06`).
+- Local HEAD and `origin/feature/discount-codes` both equal `9a58812dcfd69d2ebd8882c0046b18b34844544d`; working tree clean. Post-correction static checks passed: `python3 -m compileall -q -f src tests scripts`; `bash -n scripts/*.sh`; `node --check customer_webapp/app.js`; `git diff --check`.
+- The focused 144-test suite and 507-test full isolated suite ran against the same exact source/test blob hashes before publication. Evidence remains E2 local unit/mock; no live systems were touched.
