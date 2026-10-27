@@ -128,3 +128,19 @@ Updated: 2026-10-28
 - Updated the feature/discount-codes ref with force=false and expected parent 8642cf4bf836b6f505b0552e90ff521c160ad8de. The resulting ref was verified as 034332555c0c5f53f12c98d3bafb831f296e9734.
 - Fetched the published branch and synchronized the isolated workspace. Local HEAD and origin/feature/discount-codes both matched 034332555c0c5f53f12c98d3bafb831f296e9734; the five local file blob hashes matched their remote tree entries; git status was clean.
 - Automated evidence remains E2 unit/mock only; no live provider or production-side operation was performed. The 497-test isolated suite and static checks passed before publication.
+
+
+## Latest checkpoint — Rebecca/Sanaei numeric response normalization (2026-10-28)
+
+- Verified device 8017638839-32c511, workspace /root/bot/workspace/AnubisBot, branch feature/discount-codes, starting HEAD d67ccf7b54975d9df1348e002af812bc8b481410, and clean/synchronized Git status before editing.
+- Test-first inspection found seven failures: Rebecca accepted boolean expiry, usage and data-limit values; Sanaei accepted boolean totalGB, expiry, used_traffic, and up counters because Python bool subclasses int.
+- Rebecca now explicitly rejects booleans in expiry and normalized usage/quota fields with sanitized PanelError messages.
+- Sanaei now rejects boolean/invalid expiry, rejects boolean totalGB, and fails closed on malformed or boolean usage values instead of silently converting them to zero. Existing negative-counter checks remain in place.
+- Added two regression test methods with seven invalid payload subcases across tests/test_rebecca_adapter.py and tests/test_sanaei_adapter.py.
+- Focused Rebecca + Sanaei suites: 47 tests passed in 0.183 seconds.
+- Full isolated suite: 499 tests passed in 65.304 seconds (OK, exit 0) via ./scripts/run_isolated_tests.sh.
+- Static checks passed: python3 -m compileall -q -f src tests scripts, bash -n scripts/*.sh, node --check customer_webapp/app.js, and git diff --check (STATIC_CHECKS_OK).
+- Updated docs/PROVIDER_CAPABILITY_MATRIX.md and MANUBIS_CUSTOMER_STORE_MASTER_PROMPT.md with the new normalization contracts.
+- Evidence level: E2 local unit/mock only. No provider network request, live panel, production DB, N2, running service, timer, deployment, restart, or secret retrieval was performed.
+- Publication pending at the time of this entry; append actual commit SHA and verified local/remote HEAD after publishing.
+- Next: inspect response envelope and pagination behavior across provider adapters for malformed-success responses and partial-list ambiguity; preserve no-blind-retry mutation policy and do not claim live acceptance.

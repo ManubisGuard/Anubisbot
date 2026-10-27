@@ -175,6 +175,18 @@ class SanaeiAdapterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(PanelError,'not verified for legacy'):
             await adapter.get_subscription_url(conn,'alice')
 
+    async def test_user_mapping_rejects_boolean_expiry_and_traffic_counters(self):
+        invalid_objects = [
+            ({"client": {"email": "alice", "totalGB": True}}, "invalid totalGB limit"),
+            ({"client": {"email": "alice", "expiryTime": True}}, "invalid expiry"),
+            ({"client": {"email": "alice", "up": True, "down": 4}}, "invalid usage counter"),
+            ({"client": {"email": "alice"}, "used_traffic": True}, "invalid usage counter"),
+        ]
+        for obj, expected in invalid_objects:
+            with self.subTest(expected=expected, obj=obj):
+                with self.assertRaisesRegex(PanelError, expected):
+                    SanaeiAdapter._map(obj, "https://panel.example")
+
     async def test_token_usage_uses_documented_traffic_endpoint(self):
         calls=[]
         def handler(method,path,kwargs):

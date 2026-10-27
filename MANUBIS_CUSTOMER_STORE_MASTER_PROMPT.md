@@ -59,8 +59,8 @@ UI quality requirements:
 ## Current product roadmap
 
 - Completed locally/published: panel management/read-only checks; guided panel registration; category management; guided product creation for manual/inventory/file/panel fulfillment; guarded manual receipt review with audit navigation.
-- Latest adapter hardening (2026-10-28): PasarGuard rejects boolean/negative/malformed counters, and incomplete/unsupported auth configuration fails before secret resolution. Focused mock timeout tests already assert no blind retry for create/update/delete.
-- Current next step: continue reviewing cross-provider adapter input/schema gaps and state-reconciliation edges. Read the newest entry in docs/PROGRESS.md first to avoid repeating completed checks.
+- Latest adapter hardening (2026-10-28): PasarGuard rejects boolean/negative/malformed counters and incomplete auth before secret resolution. Rebecca and Sanaei reject boolean expiry/usage/quota fields; Sanaei also fails closed on malformed mapped usage instead of silently returning zero. Mock timeout tests assert no blind retry for create/update/delete.
+- Current next step: continue reviewing provider response envelopes, pagination and state-reconciliation edges. Read the newest entry in docs/PROGRESS.md first to avoid repeating completed checks.
 - Live staging acceptance is blocked until a disposable panel and explicit authorization exist.
 - Online gateways remain deferred. Mini App expansion is later roadmap work.
 

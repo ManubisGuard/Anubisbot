@@ -79,6 +79,8 @@ class RebeccaAdapter:
         if not username:
             raise PanelError("Rebecca response omitted user identity")
         exp = obj.get("expire") or obj.get("expire_at")
+        if isinstance(exp, bool):
+            raise PanelError("Rebecca response contained an invalid expiry")
         if isinstance(exp, (int, float)):
             try:
                 exp = datetime.fromtimestamp(exp, timezone.utc) if exp > 0 else None
@@ -100,6 +102,10 @@ class RebeccaAdapter:
         if used_value is None:
             used_value = obj.get("used_bytes", 0)
         data_limit = obj.get("data_limit", obj.get("data_limit_bytes", 0))
+        if isinstance(used_value, bool):
+            raise PanelError("Rebecca response contained an invalid usage counter")
+        if isinstance(data_limit, bool):
+            raise PanelError("Rebecca response contained an invalid data limit")
         try:
             used_bytes = int(used_value or 0)
         except (TypeError, ValueError, OverflowError):

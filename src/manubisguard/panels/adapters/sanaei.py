@@ -140,26 +140,41 @@ class SanaeiAdapter:
             raise PanelError("Sanaei response omitted client email")
         expire_ms = client.get("expiryTime")
         expire = None
+        if isinstance(expire_ms, bool):
+            raise PanelError("Sanaei returned an invalid expiry")
         if isinstance(expire_ms, (int, float)) and expire_ms > 0:
             # 3x-ui stores client expiry as milliseconds since Unix epoch.
-            expire = datetime.fromtimestamp(float(expire_ms) / 1000, timezone.utc)
+            try:
+                expire = datetime.fromtimestamp(float(expire_ms) / 1000, timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                raise PanelError("Sanaei returned an invalid expiry") from None
         total_gb = client.get("totalGB")
         total_bytes = None
         if total_gb is not None:
             try:
+                if isinstance(total_gb, bool):
+                    raise ValueError
                 total_gb_value = int(total_gb)
                 if total_gb_value < 0:
                     raise ValueError
                 total_bytes = total_gb_value * (1024 ** 3)
             except (TypeError, ValueError, OverflowError):
                 raise PanelError("Sanaei returned an invalid totalGB limit") from None
+        used_value = obj.get("used_traffic", 0)
+        if isinstance(used_value, bool):
+            raise PanelError("Sanaei returned an invalid usage counter")
         try:
-            used = int(obj.get("used_traffic", 0) or 0)
-        except (TypeError, ValueError):
-            used = 0
+            used = int(used_value or 0)
+        except (TypeError, ValueError, OverflowError):
+            raise PanelError("Sanaei returned an invalid usage counter") from None
         if not used:
-            try: used = int(client.get("up", 0) or 0) + int(client.get("down", 0) or 0)
-            except (TypeError, ValueError): used = 0
+            up_value, down_value = client.get("up", 0), client.get("down", 0)
+            if isinstance(up_value, bool) or isinstance(down_value, bool):
+                raise PanelError("Sanaei returned an invalid usage counter")
+            try:
+                used = int(up_value or 0) + int(down_value or 0)
+            except (TypeError, ValueError, OverflowError):
+                raise PanelError("Sanaei returned an invalid usage counter") from None
         if used < 0:
             raise PanelError("Sanaei returned a negative usage counter")
         # The clients/links endpoint returns protocol share URIs, not the HTTPS

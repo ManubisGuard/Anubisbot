@@ -150,6 +150,22 @@ class RebeccaAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["operations"]["create_user"]["status"], "unknown")
         self.assertEqual(report["operations"]["create_user"]["panel_permission"], "unknown")
 
+    async def test_get_user_rejects_boolean_expiry_and_traffic_counters(self):
+        invalid_payloads = [
+            ({"username": "alice", "used_traffic": True, "data_limit": 10}, "invalid usage counter"),
+            ({"username": "alice", "used_traffic": 1, "data_limit": False}, "invalid data limit"),
+            ({"username": "alice", "expire": True}, "invalid expiry"),
+        ]
+        for payload, expected in invalid_payloads:
+            with self.subTest(expected=expected, payload=payload):
+                adapter = RebeccaAdapter(
+                    secret_resolver=lambda _: "fake-key",
+                    client_factory=lambda **kw: FakeClient(
+                        lambda *args: Response(200, payload), kw["base_url"]),
+                )
+                with self.assertRaisesRegex(PanelError, expected):
+                    await adapter.get_user(self.connection, "alice")
+
     async def test_get_user_rejects_malformed_or_negative_numeric_fields_safely(self):
         invalid_payloads = [
             ({"username": "alice", "used_traffic": "provider-secret", "data_limit": 10},
