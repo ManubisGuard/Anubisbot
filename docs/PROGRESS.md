@@ -120,3 +120,11 @@ Updated: 2026-10-28
 - Updated docs/PROVIDER_CAPABILITY_MATRIX.md, MANUBIS_CUSTOMER_STORE_MASTER_PROMPT.md, and this progress log to reflect the new contracts and remaining scope.
 - Evidence: E2 local unit/mock only. No provider network request, staging panel, live Telegram client, production DB, production panel, N2, running service, timer, deployment, restart, or secret retrieval was performed. At the time this entry was drafted, publication was pending; append the actual commit SHA and verified remote/workspace HEAD after publication.
 - Next: continue the source/test review for any remaining adapter input/schema gaps and state-reconciliation edge cases. Keep provider mutation mocks no-retry. Live acceptance still requires a disposable authorized staging panel and explicit authorization.
+
+## Publication verification — PasarGuard hardening (2026-10-28)
+
+- Published source/tests and the related documentation in commit 034332555c0c5f53f12c98d3bafb831f296e9734 (Harden PasarGuard counters and auth configuration): https://github.com/ManubisGuard/Anubisbot/commit/034332555c0c5f53f12c98d3bafb831f296e9734
+- GitHub compare confirmed the change is exactly one commit ahead of 8642cf4bf836b6f505b0552e90ff521c160ad8de and changes only these five reviewed paths: MANUBIS_CUSTOMER_STORE_MASTER_PROMPT.md, docs/PROGRESS.md, docs/PROVIDER_CAPABILITY_MATRIX.md, src/manubisguard/panels/adapters/pasarguard.py, tests/test_pasarguard_adapter.py.
+- Updated the feature/discount-codes ref with force=false and expected parent 8642cf4bf836b6f505b0552e90ff521c160ad8de. The resulting ref was verified as 034332555c0c5f53f12c98d3bafb831f296e9734.
+- Fetched the published branch and synchronized the isolated workspace. Local HEAD and origin/feature/discount-codes both matched 034332555c0c5f53f12c98d3bafb831f296e9734; the five local file blob hashes matched their remote tree entries; git status was clean.
+- Automated evidence remains E2 unit/mock only; no live provider or production-side operation was performed. The 497-test isolated suite and static checks passed before publication.
