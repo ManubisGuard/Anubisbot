@@ -1119,6 +1119,27 @@ class CustomerDataStoreTests(unittest.TestCase):
         self.store.set_product_enabled("draft", True)
         self.assertEqual(self.store.list_products()[0]["product_id"], "draft")
 
+    def test_create_category_never_overwrites_existing_id(self):
+        self.store.put_category(category_id="safe", title="Original", description="Keep me", enabled=False)
+        with self.assertRaisesRegex(CustomerStoreError, "already exists"):
+            self.store.create_category(category_id="safe", title="Replacement", description="Must not win")
+        category = self.store.list_categories(enabled_only=False)[0]
+        self.assertEqual(category["title"], "Original")
+        self.assertEqual(category["description"], "Keep me")
+        self.assertEqual(category["enabled"], 0)
+
+    def test_update_category_requires_existing_id_and_preserves_enabled_flag(self):
+        self.store.put_category(category_id="inactive", title="Before", description="Old", enabled=False)
+        self.store.update_category(category_id="inactive", title="After", description="New")
+        category = self.store.list_categories(enabled_only=False)[0]
+        self.assertEqual(category["title"], "After")
+        self.assertEqual(category["description"], "New")
+        self.assertEqual(category["enabled"], 0)
+        with self.assertRaisesRegex(CustomerStoreError, "Category not found"):
+            self.store.update_category(category_id="missing", title="Not recreated")
+        self.assertEqual([item["category_id"] for item in self.store.list_categories(enabled_only=False)],
+                         ["inactive"])
+
     def test_categories_scope_products_and_hide_disabled_categories(self):
         self.store.put_category(category_id="ai", title="AI services", description="AI-ready plans")
         self.store.put_category(category_id="games", title="Gaming")

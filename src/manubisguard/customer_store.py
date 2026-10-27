@@ -1702,6 +1702,39 @@ class CustomerDataStore:
                 (self.tenant_id, category_id, title.strip()[:120], description[:1000], int(enabled)),
             )
 
+    def create_category(self, *, category_id: str, title: str, description: str = "",
+                        enabled: bool = True) -> None:
+        """Insert a new category without replacing a concurrently-created ID."""
+        category_id = category_id.strip()
+        title = title.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", category_id) or not title:
+            raise CustomerStoreError("Category ID must use 1..20 ASCII letters, digits, _ or -; title is required")
+        try:
+            with self._connect() as db:
+                db.execute(
+                    """INSERT INTO customer_categories (tenant_id,category_id,title,description,enabled)
+                       VALUES(?,?,?,?,?)""",
+                    (self.tenant_id, category_id, title[:120], description[:1000], int(enabled)),
+                )
+        except sqlite3.IntegrityError:
+            raise CustomerStoreError("Category already exists or cannot be created") from None
+
+    def update_category(self, *, category_id: str, title: str, description: str = "") -> None:
+        """Update only an existing category while preserving its current enabled state."""
+        category_id = category_id.strip()
+        title = title.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", category_id) or not title:
+            raise CustomerStoreError("Category ID must use 1..20 ASCII letters, digits, _ or -; title is required")
+        with self._connect() as db:
+            cur = db.execute(
+                """UPDATE customer_categories
+                   SET title=?,description=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE tenant_id=? AND category_id=?""",
+                (title[:120], description[:1000], self.tenant_id, category_id),
+            )
+            if cur.rowcount != 1:
+                raise CustomerStoreError("Category not found")
+
     def list_categories(self, *, enabled_only: bool = True) -> list[dict[str, Any]]:
         sql = "SELECT category_id,title,description,enabled FROM customer_categories WHERE tenant_id=?"
         args: tuple[Any, ...] = (self.tenant_id,)
@@ -1711,15 +1744,21 @@ class CustomerDataStore:
         with self._connect() as db:
             return [dict(row) for row in db.execute(sql, args).fetchall()]
 
-    def set_category_enabled(self, category_id: str, enabled: bool) -> None:
+    def set_category_enabled(self, category_id: str, enabled: bool, *,
+                             expected_enabled: bool | None = None) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", category_id.strip()):
             raise CustomerStoreError("Invalid category ID")
+        sql = ("UPDATE customer_categories SET enabled=?,updated_at=CURRENT_TIMESTAMP "
+               "WHERE tenant_id=? AND category_id=?")
+        args: tuple[Any, ...] = (int(enabled), self.tenant_id, category_id.strip())
+        if expected_enabled is not None:
+            sql += " AND enabled=?"
+            args += (int(expected_enabled),)
         with self._connect() as db:
-            cur = db.execute(
-                "UPDATE customer_categories SET enabled=?,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=? AND category_id=?",
-                (int(enabled), self.tenant_id, category_id.strip()),
-            )
+            cur = db.execute(sql, args)
             if cur.rowcount != 1:
+                if expected_enabled is not None:
+                    raise CustomerStoreError("Category not found or state changed")
                 raise CustomerStoreError("Category not found")
 
     def get_product(self, product_id: str, *, enabled_only: bool = True) -> dict[str, Any] | None:

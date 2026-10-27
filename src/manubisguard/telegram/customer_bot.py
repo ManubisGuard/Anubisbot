@@ -212,6 +212,7 @@ class CustomerBot:
         self._pending_support: set[int] = set()
         self._pending_purchase_discount: dict[int, dict[str, str]] = {}
         self._pending_panel_registration: dict[int, dict[str, Any]] = {}
+        self._pending_category_admin: dict[int, dict[str, Any]] = {}
         self.data = CustomerDataStore()
         self.registry = default_registry(secret_resolver=self._resolve_panel_secret)
         self.purchase_service = CustomerPurchaseService(self.data, secret_resolver=self._resolve_panel_secret, registry=self.registry)
@@ -510,8 +511,15 @@ class CustomerBot:
             self._pending_panel_registration.pop(uid, None)
             await self.api.send_text(chat_id, "راه‌اندازی پنل لغو شد؛ هیچ تنظیمی ذخیره نشد.", ADMIN_MENU)
             return
+        if is_admin and command == "/cancel" and uid in self._pending_category_admin:
+            self._pending_category_admin.pop(uid, None)
+            await self.api.send_text(chat_id, "فرم دسته‌بندی لغو شد؛ هیچ تغییری ذخیره نشد.", self._admin_category_keyboard())
+            return
         if is_admin and uid in self._pending_panel_registration and text and not text.startswith("/"):
             await self._handle_panel_registration_message(chat_id, uid, text)
+            return
+        if is_admin and uid in self._pending_category_admin and text and not text.startswith("/"):
+            await self._handle_category_admin_message(chat_id, uid, text)
             return
         deposit_info_payload = text.partition(" ")[2].strip().lower() if command == "/deposit-info" else ""
         admin_command_attempt = command in ADMIN_ONLY_COMMANDS or (
@@ -2143,6 +2151,101 @@ class CustomerBot:
             f"کد {code.strip().upper()} با تخفیف {percentage}٪ ذخیره شد. ورود کد در جریان خرید فعال است؛ هنگام تأیید، قیمت و سهمیه دوباره بررسی می‌شوند.",
             self._customer_menu())
 
+    def _admin_category_keyboard(self) -> dict[str, Any]:
+        categories = self.data.list_categories(enabled_only=False)
+        rows: list[list[dict[str, str]]] = []
+        for category in categories:
+            category_id = str(category["category_id"])
+            state_label = "فعال" if category["enabled"] else "خاموش"
+            rows.append([{"text": f"{'🟢' if category['enabled'] else '⚫'} {category['title'][:24]} · {state_label}",
+                          "callback_data": f"admin:category-edit:{category_id}"}])
+            target = "off" if category["enabled"] else "on"
+            action = "خاموش‌کردن" if category["enabled"] else "فعال‌کردن"
+            rows.append([{"text": f"{action}: {category_id}",
+                          "callback_data": f"admin:category-toggle-confirm:{category_id}:{target}"}])
+        rows.extend([
+            [{"text": "➕ افزودن دسته‌بندی", "callback_data": "admin:category-add"}],
+            [{"text": "⬅️ بازگشت به مدیریت فروشگاه", "callback_data": "admin:products"}],
+            [{"text": "⬅️ پنل مدیریت", "callback_data": "admin:home"}],
+        ])
+        return {"inline_keyboard": rows}
+
+    async def _start_category_admin_wizard(self, chat_id: int, uid: int,
+                                           category: dict[str, Any] | None = None) -> None:
+        now = time.time()
+        if category is None:
+            self._pending_category_admin[uid] = {
+                "mode": "add", "step": "id", "started_at": now,
+                "category_id": "", "title": "", "description": "",
+            }
+            prompt = ("ساخت دسته‌بندی جدید\nشناسه کوتاه لاتین بفرست (۱ تا ۲۰ حرف، عدد، _ یا -).\n"
+                      "نمونه: vpn_services\nبرای لغو /cancel را بزن.")
+        else:
+            self._pending_category_admin[uid] = {
+                "mode": "edit", "step": "title", "started_at": now,
+                "category_id": str(category["category_id"]),
+                "title": str(category["title"]), "description": str(category.get("description") or ""),
+                "enabled": bool(category["enabled"]),
+            }
+            prompt = (f"ویرایش دسته‌بندی «{category['title']}» ({category['category_id']})\n"
+                      "عنوان جدید را بفرست. شناسه ثابت می‌ماند؛ برای لغو /cancel را بزن.")
+        await self.api.send_text(chat_id, prompt, {"inline_keyboard": [
+            [{"text": "لغو فرم", "callback_data": "admin:cancel_category_wizard"}],
+            [{"text": "⬅️ فهرست دسته‌بندی‌ها", "callback_data": "admin:categories"}],
+        ]})
+
+    async def _handle_category_admin_message(self, chat_id: int, uid: int, text: str) -> None:
+        state = self._pending_category_admin.get(uid)
+        if not state:
+            return
+        if time.time() - float(state.get("started_at", 0)) > 15 * 60:
+            self._pending_category_admin.pop(uid, None)
+            await self.api.send_text(chat_id, "فرم دسته‌بندی منقضی شد؛ چیزی ذخیره نشد. دوباره شروع کن.",
+                                     self._admin_category_keyboard())
+            return
+        step = str(state.get("step") or "")
+        value = text.strip()
+        if step == "id":
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", value):
+                await self.api.send_text(chat_id, "شناسه نامعتبر است؛ ۱ تا ۲۰ حرف/عدد لاتین یا _ و - بفرست.")
+                return
+            if any(str(item["category_id"]) == value
+                   for item in self.data.list_categories(enabled_only=False)):
+                await self.api.send_text(chat_id, "این شناسه قبلاً استفاده شده؛ یک شناسه یکتا بفرست.")
+                return
+            state["category_id"] = value
+            state["step"] = "title"
+            await self.api.send_text(chat_id, "عنوان نمایشی دسته‌بندی را بفرست (حداکثر ۱۲۰ نویسه).")
+            return
+        if step == "title":
+            if not value or len(value) > 120:
+                await self.api.send_text(chat_id, "عنوان باید بین ۱ تا ۱۲۰ نویسه باشد.")
+                return
+            state["title"] = value
+            state["step"] = "description"
+            await self.api.send_text(chat_id,
+                "توضیح دسته‌بندی را بفرست (تا ۱۰۰۰ نویسه). برای بدون توضیح یا پاک‌کردن توضیح فعلی، - بفرست.")
+            return
+        if step == "description":
+            if len(value) > 1000:
+                await self.api.send_text(chat_id, "توضیح حداکثر ۱۰۰۰ نویسه است.")
+                return
+            state["description"] = "" if value == "-" else value
+            state["step"] = "confirm"
+            description = state["description"] or "بدون توضیح"
+            mode_label = "افزودن" if state["mode"] == "add" else "ویرایش"
+            await self.api.send_text(chat_id,
+                f"بازبینی {mode_label} دسته‌بندی\nشناسه: {state['category_id']}\n"
+                f"عنوان: {state['title']}\nتوضیح: {description}\n"
+                "با ذخیره، دسته در کاتالوگ همین فروشگاه ثبت می‌شود. ادامه می‌دهی؟",
+                {"inline_keyboard": [
+                    [{"text": "✅ ذخیره دسته‌بندی", "callback_data": "admin:category-save"}],
+                    [{"text": "لغو و بدون ذخیره", "callback_data": "admin:cancel_category_wizard"}],
+                ]})
+            return
+        await self.api.send_text(chat_id, "مرحله فرم شناخته نشد؛ فرم را لغو و دوباره شروع کن.",
+                                 self._admin_category_keyboard())
+
     async def _admin_category_command(self, chat_id: int, text: str) -> None:
         payload = text.partition(" ")[2].strip()
         if payload.startswith("enable "):
@@ -3007,6 +3110,110 @@ class CustomerBot:
                     [{"text": "📋 فهرست پنل‌ها", "callback_data": "admin:list_panels"}],
                     [{"text": "⬅️ پنل‌ها", "callback_data": "admin:panels"}]]})
                 return
+            elif section == "categories":
+                await self.api.send_text(chat_id, "🗂 مدیریت دسته‌بندی‌ها\nدسته را برای ویرایش انتخاب کن یا وضعیت نمایش آن را تغییر بده. خاموش‌کردن دسته، محصولات وابسته را از خرید جدید پنهان می‌کند؛ سفارش‌های ثبت‌شده را حذف نمی‌کند.",
+                                         self._admin_category_keyboard())
+                return
+            elif section == "category-add":
+                await self._start_category_admin_wizard(chat_id, uid)
+                return
+            elif section.startswith("category-edit:"):
+                category_id = section.partition(":")[2]
+                category = next((item for item in self.data.list_categories(enabled_only=False)
+                                 if str(item["category_id"]) == category_id), None)
+                if not category:
+                    await self.api.send_text(chat_id, "دسته پیدا نشد یا دکمه قدیمی است؛ فهرست را تازه کن.",
+                                             self._admin_category_keyboard())
+                    return
+                await self._start_category_admin_wizard(chat_id, uid, category)
+                return
+            elif section.startswith("category-toggle-confirm:"):
+                parts = section.split(":")
+                category_id = parts[1] if len(parts) > 1 else ""
+                target = parts[2] if len(parts) > 2 else ""
+                category = next((item for item in self.data.list_categories(enabled_only=False)
+                                 if str(item["category_id"]) == category_id), None)
+                if not category or target not in {"on", "off"} or bool(category["enabled"]) == (target == "on"):
+                    await self.api.send_text(chat_id, "این تغییر قدیمی یا نامعتبر است؛ فهرست را دوباره باز کن.",
+                                             self._admin_category_keyboard())
+                    return
+                state_label = "فعال‌کردن" if target == "on" else "خاموش‌کردن"
+                impact = ("محصولات دسته دوباره برای خرید جدید نمایش داده می‌شوند."
+                          if target == "on" else
+                          "محصولات این دسته از خرید جدید پنهان می‌شوند؛ سفارش‌ها و اطلاعات محصول حذف نمی‌شوند.")
+                expected = "on" if category["enabled"] else "off"
+                await self.api.send_text(chat_id,
+                    f"تأیید {state_label} دسته‌بندی\n{category['title']} ({category_id})\n{impact}\n\nادامه می‌دهی؟",
+                    {"inline_keyboard": [
+                        [{"text": f"✅ تأیید {state_label}", "callback_data": f"admin:category-toggle:{category_id}:{target}:{expected}"}],
+                        [{"text": "انصراف", "callback_data": "admin:categories"}],
+                    ]})
+                return
+            elif section.startswith("category-toggle:"):
+                parts = section.split(":")
+                category_id = parts[1] if len(parts) > 1 else ""
+                target = parts[2] if len(parts) > 2 else ""
+                expected = parts[3] if len(parts) > 3 else ""
+                category = next((item for item in self.data.list_categories(enabled_only=False)
+                                 if str(item["category_id"]) == category_id), None)
+                if (not category or target not in {"on", "off"} or expected not in {"on", "off"}
+                        or expected == target or bool(category["enabled"]) != (expected == "on")):
+                    await self.api.send_text(chat_id, "وضعیت دسته تغییر کرده یا درخواست نامعتبر است؛ تغییری انجام نشد.",
+                                             self._admin_category_keyboard())
+                    return
+                try:
+                    self.data.set_category_enabled(category_id, target == "on", expected_enabled=(expected == "on"))
+                except CustomerStoreError as exc:
+                    await self.api.send_text(chat_id, f"وضعیت ذخیره نشد: {exc}", self._admin_category_keyboard())
+                    return
+                updated = next((item for item in self.data.list_categories(enabled_only=False)
+                                if str(item["category_id"]) == category_id), None)
+                state_text = "فعال" if updated and updated["enabled"] else "خاموش"
+                await self.api.send_text(chat_id, f"وضعیت دسته «{updated['title'] if updated else category_id}» ذخیره شد: {state_text}.",
+                                         self._admin_category_keyboard())
+                return
+            elif section == "category-save":
+                state = self._pending_category_admin.get(uid)
+                if (not state or state.get("step") != "confirm"
+                        or time.time() - float(state.get("started_at", 0)) > 15 * 60):
+                    self._pending_category_admin.pop(uid, None)
+                    await self.api.send_text(chat_id, "فرم دسته‌بندی خالی، قدیمی یا منقضی است؛ چیزی ذخیره نشد.",
+                                             self._admin_category_keyboard())
+                    return
+                categories = self.data.list_categories(enabled_only=False)
+                category_id = str(state.get("category_id") or "")
+                existing = next((item for item in categories if str(item["category_id"]) == category_id), None)
+                if state.get("mode") == "add" and existing:
+                    self._pending_category_admin.pop(uid, None)
+                    await self.api.send_text(chat_id, "این شناسه در همین حین ثبت شده؛ فرم لغو شد و چیزی بازنویسی نشد.",
+                                             self._admin_category_keyboard())
+                    return
+                if state.get("mode") == "edit" and not existing:
+                    self._pending_category_admin.pop(uid, None)
+                    await self.api.send_text(chat_id, "دسته در همین حین حذف یا جابه‌جا شده؛ تغییر ذخیره نشد.",
+                                             self._admin_category_keyboard())
+                    return
+                try:
+                    if state.get("mode") == "add":
+                        self.data.create_category(category_id=category_id, title=str(state["title"]),
+                            description=str(state.get("description") or ""), enabled=True)
+                    else:
+                        self.data.update_category(category_id=category_id, title=str(state["title"]),
+                            description=str(state.get("description") or ""))
+                except (CustomerStoreError, ValueError) as exc:
+                    self._pending_category_admin.pop(uid, None)
+                    await self.api.send_text(chat_id, f"دسته ذخیره نشد: {exc}", self._admin_category_keyboard())
+                    return
+                self._pending_category_admin.pop(uid, None)
+                action = "اضافه شد" if not existing else "ویرایش شد"
+                await self.api.send_text(chat_id, f"✅ دسته «{state['title']}» {action}.",
+                                         self._admin_category_keyboard())
+                return
+            elif section == "cancel_category_wizard":
+                self._pending_category_admin.pop(uid, None)
+                await self.api.send_text(chat_id, "فرم دسته‌بندی لغو شد؛ هیچ تغییری ذخیره نشد.",
+                                         self._admin_category_keyboard())
+                return
             elif section == "products":
                 body = ("🛍 مدیریت فروشگاه\nمحصولات پنلی: /product add ...\n"
                         "محصول دستی: /manual-product add ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح | category_id | سقف خرید | ترتیب | شرایط خرید | image_url HTTPS | visible_from_utc | visible_until_utc\n"
@@ -3014,6 +3221,12 @@ class CustomerBot:
                         "فهرست محصولات پنلی: /products\n\n"
                         "📦 سفارش‌های تحویل دستی: /manual-orders [pending_delivery|fulfilled|all]\n"
                         "تحویل سفارش: /manual-fulfill ORDER_ID | متن تحویل")
+                await self.api.send_text(chat_id, body, {"inline_keyboard": [
+                    [{"text": "🗂 مدیریت دسته‌بندی‌ها", "callback_data": "admin:categories"}],
+                    [{"text": "➕ افزودن دسته‌بندی", "callback_data": "admin:category-add"}],
+                    [{"text": "⬅️ بازگشت به مدیریت", "callback_data": "admin:home"}],
+                ]})
+                return
             elif section == "resellers":
                 body = "👥 مدیریت نمایندگی\n/reseller-plan add ...\n/reseller-plans"
             elif section == "content":

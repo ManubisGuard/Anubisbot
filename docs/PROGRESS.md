@@ -48,6 +48,16 @@ Updated: 2026-10-27
 - Research sources reviewed for behavior only: [PasarguardBot](https://github.com/AmirKenzo/PasarguardBot), [Faoxima](https://github.com/Mmd-Amir/Faoxima), and the [official Telegram Bot API](https://core.telegram.org/bots/api). No source code was copied. Telegram callback data remains bounded to 64 bytes.
 - No secrets were read or printed. No production DB, provider panel, N2, live Telegram process, systemd timer, deployment, or service restart was touched. Evidence remains E2 local unit/mock only.
 
+## Latest checkpoint — guided category management (2026-10-28)
+
+- Added an admin category screen reachable from `/admin → مدیریت فروشگاه و محصولات → مدیریت دسته‌بندی‌ها`, with category rows, edit buttons, status controls, add action, and back navigation. The existing `/category` and `/categories` commands remain available.
+- Added a private multi-step add/edit wizard for ID, title, and description. It validates the ID and field bounds, requires a final review/confirm action, supports `/cancel`, and expires after 15 minutes without partial writes.
+- Adds use atomic `create_category` insert-only storage, so duplicate IDs cannot overwrite another admin's category during a race. Edits use `update_category` and cannot recreate a missing row; the current enabled flag is preserved.
+- Enabling/disabling a category requires a separate confirmation, includes the expected prior state, and rejects stale callbacks. The store update itself includes that expected state in its SQL predicate. Disabling a category hides its products from new shop purchases but does not delete products or prior orders.
+- Added nine new unit/mock tests covering the guided journey, cancellation/expiry, authorization, stale-state guard, and no-overwrite/update-only store behavior.
+- Focused category suite: **9 tests passed in 1.629 seconds**. Full isolated suite after final code changes: **480 tests passed in 65.900 seconds (OK, exit 0)**.
+- This is local unit/mock evidence only. No production store, active Telegram process, provider panel, N2, systemd timer, or deployment was changed.
+
 ## Current limits / do not overclaim
 
 - The wizard state is in memory and is lost if the bot process restarts; it does not store partially completed forms. Registration does not prove credentials, API scopes, live connectivity, or compatibility with the installed provider version.
@@ -58,7 +68,7 @@ Updated: 2026-10-27
 
 ## Next steps in order
 
-1. Build guided category/product management screens, beginning with safe category create/edit/enable and then product creation by fulfillment type. Preserve quote revalidation, order snapshots, inventory atomicity, existing command fallbacks, and the distinction between manual/inventory/file/panel fulfillment.
+1. Build guided product creation/edit screens with an explicit fulfillment choice (manual, inventory, file, panel). Preserve quote revalidation, order snapshots, inventory atomicity, existing command fallbacks, and the separation between manual-product and panel-backed purchase flows.
 2. Improve admin order/payment review navigation without weakening receipt verification, immutable wallet ledger, idempotency or reconciliation protections.
 3. Review PasarGuard operation contracts one by one and add focused mock tests for missing/invalid config, permissions unknown, and ambiguous provider mutation outcomes.
 4. Live staging acceptance remains blocked until a disposable panel and explicit authorization are provided.

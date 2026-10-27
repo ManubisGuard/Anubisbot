@@ -2456,3 +2456,141 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class GuidedCategoryAdminTests(unittest.IsolatedAsyncioTestCase):
+    ADMIN_ID = 6883349141
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._env = patch.dict(os.environ, {
+            "ANUBIS_CUSTOMER_DB": str(Path(self.tmp.name) / "customer.sqlite3"),
+            "ANUBIS_CONTENT_DB": str(Path(self.tmp.name) / "content.sqlite3"),
+        })
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.addCleanup(self.tmp.cleanup)
+        self.bot = CustomerBot(CustomerBotConfig(token="dummy-customer-token",
+            admin_ids=frozenset({self.ADMIN_ID})))
+        self.bot.api.send_text = AsyncMock()
+        self.bot.api.answer_callback = AsyncMock()
+
+    async def _callback(self, data: str, uid: int | None = None):
+        user_id = uid if uid is not None else self.ADMIN_ID
+        await self.bot._handle_callback({
+            "id": "category-admin-" + str(time.time_ns()),
+            "from": {"id": user_id},
+            "message": {"message_id": 31, "chat": {"id": user_id, "type": "private"}},
+            "data": data,
+        })
+
+    async def _message(self, text: str, uid: int | None = None):
+        user_id = uid if uid is not None else self.ADMIN_ID
+        await self.bot._handle_message({
+            "message_id": 32,
+            "from": {"id": user_id, "first_name": "Admin"},
+            "chat": {"id": user_id, "type": "private"},
+            "text": text,
+        })
+
+    async def test_category_screen_shows_edit_and_confirmed_toggle_buttons(self):
+        self.bot.data.put_category(category_id="vpn", title="VPN services", description="Tunnels")
+        await self._callback("admin:categories")
+        text_value, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        buttons = [button for row in keyboard["inline_keyboard"] for button in row]
+        callbacks = [button["callback_data"] for button in buttons]
+        self.assertIn("مدیریت دسته‌بندی‌ها", text_value)
+        self.assertTrue(any("VPN services" in button["text"] for button in buttons))
+        self.assertIn("admin:category-edit:vpn", callbacks)
+        self.assertIn("admin:category-toggle-confirm:vpn:off", callbacks)
+        self.assertIn("admin:category-add", callbacks)
+
+    async def test_add_category_is_only_persisted_after_confirmation(self):
+        await self._callback("admin:category-add")
+        await self._message("vpn_services")
+        await self._message("خدمات وی‌پی‌ان")
+        await self._message("سرورهای چندلوکیشن")
+        self.assertEqual(self.bot.data.list_categories(enabled_only=False), [])
+        keyboard = self.bot.api.send_text.await_args.args[2]
+        callbacks = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertIn("admin:category-save", callbacks)
+
+        await self._callback("admin:category-save")
+        categories = self.bot.data.list_categories(enabled_only=False)
+        self.assertEqual(len(categories), 1)
+        self.assertEqual(categories[0]["category_id"], "vpn_services")
+        self.assertEqual(categories[0]["title"], "خدمات وی‌پی‌ان")
+        self.assertEqual(categories[0]["description"], "سرورهای چندلوکیشن")
+        self.assertEqual(categories[0]["enabled"], 1)
+        self.assertNotIn(self.ADMIN_ID, self.bot._pending_category_admin)
+
+    async def test_edit_keeps_category_id_and_enabled_state(self):
+        self.bot.data.put_category(category_id="legacy", title="عنوان قدیمی",
+                                   description="توضیح قدیمی", enabled=False)
+        await self._callback("admin:category-edit:legacy")
+        await self._message("عنوان تازه")
+        await self._message("-")
+        await self._callback("admin:category-save")
+        category = self.bot.data.list_categories(enabled_only=False)[0]
+        self.assertEqual(category["category_id"], "legacy")
+        self.assertEqual(category["title"], "عنوان تازه")
+        self.assertEqual(category["description"], "")
+        self.assertEqual(category["enabled"], 0)
+
+    async def test_cancel_and_expiry_do_not_create_category(self):
+        await self._callback("admin:category-add")
+        await self._message("will_cancel")
+        await self._message("/cancel")
+        self.assertEqual(self.bot.data.list_categories(enabled_only=False), [])
+        self.assertNotIn(self.ADMIN_ID, self.bot._pending_category_admin)
+
+        await self._callback("admin:category-add")
+        await self._message("will_expire")
+        self.bot._pending_category_admin[self.ADMIN_ID]["started_at"] = time.time() - 16 * 60
+        await self._message("عنوان")
+        self.assertEqual(self.bot.data.list_categories(enabled_only=False), [])
+        self.assertNotIn(self.ADMIN_ID, self.bot._pending_category_admin)
+
+    async def test_stale_toggle_confirmation_does_not_override_new_state(self):
+        self.bot.data.put_category(category_id="game", title="Gaming", enabled=True)
+        await self._callback("admin:category-toggle-confirm:game:off")
+        keyboard = self.bot.api.send_text.await_args.args[2]
+        action = keyboard["inline_keyboard"][0][0]["callback_data"]
+        self.assertEqual(action, "admin:category-toggle:game:off:on")
+
+        self.bot.data.set_category_enabled("game", False, expected_enabled=True)
+        await self._callback(action)
+        category = self.bot.data.list_categories(enabled_only=False)[0]
+        self.assertEqual(category["enabled"], 0)
+        self.assertIn("تغییری انجام نشد", self.bot.api.send_text.await_args.args[1])
+
+    async def test_non_admin_cannot_start_category_wizard(self):
+        await self._callback("admin:category-add", uid=999)
+        self.assertEqual(self.bot._pending_category_admin, {})
+        self.assertEqual(self.bot.data.list_categories(enabled_only=False), [])
+
+
+    async def test_concurrent_category_creation_cannot_overwrite_existing_id(self):
+        await self._callback("admin:category-add")
+        await self._message("race")
+        await self._message("فرم من")
+        await self._message("شرح من")
+        original_list = self.bot.data.list_categories
+        injected = False
+
+        def racing_list(*, enabled_only=True):
+            nonlocal injected
+            snapshot = original_list(enabled_only=enabled_only)
+            if not injected and not snapshot:
+                injected = True
+                self.bot.data.put_category(category_id="race", title="مدیر دیگر", description="ثبت مستقل")
+            return snapshot
+
+        with patch.object(self.bot.data, "list_categories", side_effect=racing_list):
+            await self._callback("admin:category-save")
+        categories = original_list(enabled_only=False)
+        self.assertEqual(len(categories), 1)
+        self.assertEqual(categories[0]["title"], "مدیر دیگر")
+        self.assertEqual(categories[0]["description"], "ثبت مستقل")
+        self.assertNotIn(self.ADMIN_ID, self.bot._pending_category_admin)
