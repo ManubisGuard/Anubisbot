@@ -142,5 +142,13 @@ Updated: 2026-10-28
 - Static checks passed: python3 -m compileall -q -f src tests scripts, bash -n scripts/*.sh, node --check customer_webapp/app.js, and git diff --check (STATIC_CHECKS_OK).
 - Updated docs/PROVIDER_CAPABILITY_MATRIX.md and MANUBIS_CUSTOMER_STORE_MASTER_PROMPT.md with the new normalization contracts.
 - Evidence level: E2 local unit/mock only. No provider network request, live panel, production DB, N2, running service, timer, deployment, restart, or secret retrieval was performed.
-- Publication pending at the time of this entry; append actual commit SHA and verified local/remote HEAD after publishing.
+- Published in commit 0a5605c324c35f84472c1f92e51edcdcba9375fe (Reject boolean provider usage and quota fields); verified local and remote HEAD matched after fetch/reset.
 - Next: inspect response envelope and pagination behavior across provider adapters for malformed-success responses and partial-list ambiguity; preserve no-blind-retry mutation policy and do not claim live acceptance.
+
+
+## Publication verification — Rebecca/Sanaei numeric normalization (2026-10-28)
+
+- Published code, tests, and docs in commit 0a5605c324c35f84472c1f92e51edcdcba9375fe: https://github.com/ManubisGuard/Anubisbot/commit/0a5605c324c35f84472c1f92e51edcdcba9375fe
+- GitHub compare verified this was exactly one commit ahead of d67ccf7b54975d9df1348e002af812bc8b481410, with only seven reviewed paths changed.
+- Updated feature/discount-codes with force=false and expected prior SHA d67ccf7b54975d9df1348e002af812bc8b481410. Fetched the branch; local HEAD and origin/feature/discount-codes both matched 0a5605c324c35f84472c1f92e51edcdcba9375fe. All seven local blob hashes matched their remote tree entries, and git status was clean.
+- Final post-publication static checks passed: compileall, Bash syntax, JavaScript syntax, and git diff --check. Full 499-test isolated suite passed before publication.
