@@ -1001,7 +1001,7 @@ class CustomerDataStore:
                            category_id: str = "", max_purchases_per_customer: int | None = None,
                            sort_order: int | None = None, terms_text: str = "",
                            image_url: str | None = None, visible_from_utc: str | None = None,
-                           visible_until_utc: str | None = None) -> None:
+                           visible_until_utc: str | None = None, create_only: bool = False) -> None:
         self._ensure_manual_shop_tables()
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", product_id.strip()) or not title.strip():
             raise CustomerStoreError("Manual product ID and title are required; ID must use ASCII letters, digits, _ or -")
@@ -1092,25 +1092,33 @@ class CustomerDataStore:
                 (self.tenant_id, category_id),
             ).fetchone():
                 raise CustomerStoreError("Manual product category does not exist")
-            db.execute("""INSERT INTO manual_products
+            manual_product_sql = """INSERT INTO manual_products
                 (tenant_id,product_id,category_id,title,description,price_minor,currency,delivery_mode,delivery_payload,enabled,
                  max_purchases_per_customer,sort_order,terms_text,image_url,visible_from_utc,visible_until_utc,delivery_file_id)
                 VALUES(?,?,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,0),?,COALESCE(?,''),COALESCE(?,''),COALESCE(?,''),COALESCE(?,''))
-                ON CONFLICT(tenant_id,product_id) DO UPDATE SET
-                category_id=excluded.category_id,title=excluded.title,description=excluded.description,
-                price_minor=excluded.price_minor,currency=excluded.currency,delivery_mode=excluded.delivery_mode,
-                delivery_payload=excluded.delivery_payload,delivery_file_id=excluded.delivery_file_id,enabled=excluded.enabled,terms_text=excluded.terms_text,
-                image_url=CASE WHEN ? IS NULL THEN manual_products.image_url ELSE excluded.image_url END,
-                visible_from_utc=CASE WHEN ? IS NULL THEN manual_products.visible_from_utc ELSE excluded.visible_from_utc END,
-                visible_until_utc=CASE WHEN ? IS NULL THEN manual_products.visible_until_utc ELSE excluded.visible_until_utc END,
-                max_purchases_per_customer=CASE WHEN ? IS NULL THEN manual_products.max_purchases_per_customer
-                    ELSE excluded.max_purchases_per_customer END,
-                sort_order=CASE WHEN ? IS NULL THEN manual_products.sort_order ELSE excluded.sort_order END,
-                updated_at=CURRENT_TIMESTAMP""",
-                (self.tenant_id,product_id.strip(),category_id,title.strip()[:160],description[:4000],price_minor,currency,
-                 stored_delivery_mode,stored_delivery_payload[:12000],int(enabled),max_purchases_per_customer,sort_order,terms_text.strip(),
-                 image_url,visible_from_utc,visible_until_utc,delivery_file_id,image_url,visible_from_utc,visible_until_utc,
-                 max_purchases_per_customer,sort_order))
+                """
+            params = (self.tenant_id,product_id.strip(),category_id,title.strip()[:160],description[:4000],price_minor,currency,
+                stored_delivery_mode,stored_delivery_payload[:12000],int(enabled),max_purchases_per_customer,sort_order,terms_text.strip(),
+                image_url,visible_from_utc,visible_until_utc,delivery_file_id)
+            if not create_only:
+                manual_product_sql += """ON CONFLICT(tenant_id,product_id) DO UPDATE SET
+                    category_id=excluded.category_id,title=excluded.title,description=excluded.description,
+                    price_minor=excluded.price_minor,currency=excluded.currency,delivery_mode=excluded.delivery_mode,
+                    delivery_payload=excluded.delivery_payload,delivery_file_id=excluded.delivery_file_id,enabled=excluded.enabled,terms_text=excluded.terms_text,
+                    image_url=CASE WHEN ? IS NULL THEN manual_products.image_url ELSE excluded.image_url END,
+                    visible_from_utc=CASE WHEN ? IS NULL THEN manual_products.visible_from_utc ELSE excluded.visible_from_utc END,
+                    visible_until_utc=CASE WHEN ? IS NULL THEN manual_products.visible_until_utc ELSE excluded.visible_until_utc END,
+                    max_purchases_per_customer=CASE WHEN ? IS NULL THEN manual_products.max_purchases_per_customer
+                        ELSE excluded.max_purchases_per_customer END,
+                    sort_order=CASE WHEN ? IS NULL THEN manual_products.sort_order ELSE excluded.sort_order END,
+                    updated_at=CURRENT_TIMESTAMP"""
+                params += (image_url,visible_from_utc,visible_until_utc,max_purchases_per_customer,sort_order)
+            try:
+                db.execute(manual_product_sql, params)
+            except sqlite3.IntegrityError:
+                if create_only:
+                    raise CustomerStoreError("Manual product already exists or cannot be created") from None
+                raise
 
     @staticmethod
     def _effective_manual_variant_delivery(product: dict[str, Any], variant: dict[str, Any] | None = None) -> tuple[str, str]:
@@ -2059,7 +2067,7 @@ class CustomerDataStore:
                     price_minor: int, currency: str = "IRR", duration_hours: int = 0,
                     traffic_bytes: int = 0, pricing_mode: str = "fixed", unit_price_minor: int = 0,
                     panel_id: str = "", group_ids: tuple[int, ...] | list[int] = (),
-                    category_id: str = "", enabled: bool = True) -> None:
+                    category_id: str = "", enabled: bool = True, create_only: bool = False) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", product_id.strip()) or not title.strip():
             raise CustomerStoreError("Product ID must use 1..20 ASCII letters, digits, _ or -; title is required")
         max_int = 2**63 - 1
@@ -2090,22 +2098,26 @@ class CustomerDataStore:
         with self._connect() as db:
             if category_id and not db.execute("SELECT 1 FROM customer_categories WHERE tenant_id=? AND category_id=?", (self.tenant_id, category_id)).fetchone():
                 raise CustomerStoreError("Product category does not exist")
-            db.execute(
-                """INSERT INTO customer_products
+            product_sql = """INSERT INTO customer_products
                    (tenant_id,product_id,category_id,title,description,price_minor,currency,duration_hours,
                     traffic_bytes,pricing_mode,unit_price_minor,panel_id,group_ids_json,enabled)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(tenant_id,product_id) DO UPDATE SET category_id=excluded.category_id,title=excluded.title,
-                    description=excluded.description,price_minor=excluded.price_minor,
-                    currency=excluded.currency,duration_hours=excluded.duration_hours,
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+            if not create_only:
+                product_sql += """ ON CONFLICT(tenant_id,product_id) DO UPDATE SET
+                    category_id=excluded.category_id,title=excluded.title,description=excluded.description,
+                    price_minor=excluded.price_minor,currency=excluded.currency,duration_hours=excluded.duration_hours,
                     traffic_bytes=excluded.traffic_bytes,pricing_mode=excluded.pricing_mode,
                     unit_price_minor=excluded.unit_price_minor,panel_id=excluded.panel_id,
-                    group_ids_json=excluded.group_ids_json,enabled=excluded.enabled,
-                    updated_at=CURRENT_TIMESTAMP""",
-                (self.tenant_id, product_id.strip(), category_id, title.strip(), description[:4000],
-                 price_minor, currency, duration_hours, traffic_bytes, pricing_mode,
-                 unit_price_minor, panel_id.strip(), json.dumps(normalized_groups), int(enabled)),
-            )
+                    group_ids_json=excluded.group_ids_json,enabled=excluded.enabled,updated_at=CURRENT_TIMESTAMP"""
+            try:
+                db.execute(product_sql,
+                    (self.tenant_id, product_id.strip(), category_id, title.strip(), description[:4000],
+                     price_minor, currency, duration_hours, traffic_bytes, pricing_mode,
+                     unit_price_minor, panel_id.strip(), json.dumps(normalized_groups), int(enabled)))
+            except sqlite3.IntegrityError:
+                if create_only:
+                    raise CustomerStoreError("Panel product already exists or cannot be created") from None
+                raise
 
     def set_product_enabled(self, product_id: str, enabled: bool) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", product_id.strip()):

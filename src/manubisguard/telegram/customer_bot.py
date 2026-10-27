@@ -213,6 +213,7 @@ class CustomerBot:
         self._pending_purchase_discount: dict[int, dict[str, str]] = {}
         self._pending_panel_registration: dict[int, dict[str, Any]] = {}
         self._pending_category_admin: dict[int, dict[str, Any]] = {}
+        self._pending_product_admin: dict[int, dict[str, Any]] = {}
         self.data = CustomerDataStore()
         self.registry = default_registry(secret_resolver=self._resolve_panel_secret)
         self.purchase_service = CustomerPurchaseService(self.data, secret_resolver=self._resolve_panel_secret, registry=self.registry)
@@ -515,11 +516,22 @@ class CustomerBot:
             self._pending_category_admin.pop(uid, None)
             await self.api.send_text(chat_id, "فرم دسته‌بندی لغو شد؛ هیچ تغییری ذخیره نشد.", self._admin_category_keyboard())
             return
+        if is_admin and command == "/cancel" and uid in self._pending_product_admin:
+            self._pending_product_admin.pop(uid, None)
+            await self.api.send_text(chat_id, "فرم محصول لغو شد؛ هیچ تغییری ذخیره نشد.", self._admin_product_keyboard())
+            return
+        product_state = self._pending_product_admin.get(uid) if is_admin else None
+        if product_state and product_state.get("step") == "file" and isinstance(message.get("document"), dict):
+            await self._handle_product_admin_document(chat_id, uid, message)
+            return
         if is_admin and uid in self._pending_panel_registration and text and not text.startswith("/"):
             await self._handle_panel_registration_message(chat_id, uid, text)
             return
         if is_admin and uid in self._pending_category_admin and text and not text.startswith("/"):
             await self._handle_category_admin_message(chat_id, uid, text)
+            return
+        if is_admin and uid in self._pending_product_admin and text and not text.startswith("/"):
+            await self._handle_product_admin_message(chat_id, uid, text)
             return
         deposit_info_payload = text.partition(" ")[2].strip().lower() if command == "/deposit-info" else ""
         admin_command_attempt = command in ADMIN_ONLY_COMMANDS or (
@@ -2151,6 +2163,309 @@ class CustomerBot:
             f"کد {code.strip().upper()} با تخفیف {percentage}٪ ذخیره شد. ورود کد در جریان خرید فعال است؛ هنگام تأیید، قیمت و سهمیه دوباره بررسی می‌شوند.",
             self._customer_menu())
 
+    def _admin_product_keyboard(self) -> dict[str, Any]:
+        return {"inline_keyboard": [
+            [{"text": "➕ ساخت محصول جدید", "callback_data": "admin:product-create"}],
+            [{"text": "🗂 مدیریت دسته‌بندی‌ها", "callback_data": "admin:categories"}],
+            [{"text": "📋 فهرست محصولات پنلی", "callback_data": "admin:product-list"}],
+            [{"text": "📦 فهرست محصولات فروشگاهی", "callback_data": "admin:manual-product-list"}],
+            [{"text": "⬅️ بازگشت به پنل مدیریت", "callback_data": "admin:home"}],
+        ]}
+
+    async def _start_product_admin_wizard(self, chat_id: int, uid: int, kind: str) -> None:
+        if kind not in {"manual", "inventory", "file", "panel"}:
+            await self.api.send_text(chat_id, "نوع محصول پشتیبانی نمی‌شود.", self._admin_product_keyboard())
+            return
+        self._pending_product_admin[uid] = {
+            "kind": kind, "step": "id", "started_at": time.time(),
+        }
+        labels = {
+            "manual": "تحویل دستی توسط مدیر",
+            "inventory": "تحویل خودکار از موجودی کد/اکانت",
+            "file": "تحویل فایل پس از پرداخت",
+            "panel": "ساخت سرویس روی پنل اتصال‌یافته",
+        }
+        await self.api.send_text(chat_id,
+            f"➕ ساخت محصول جدید\nنوع: {labels[kind]}\n"
+            "شناسه کوتاه و یکتا بفرست (۱ تا ۲۰ حرف/عدد لاتین یا _ و -).\n"
+            "برای لغو هر زمان /cancel را بفرست.",
+            {"inline_keyboard": [[{"text": "لغو فرم", "callback_data": "admin:cancel_product_wizard"}]]})
+
+    async def _send_product_admin_review(self, chat_id: int, state: dict[str, Any]) -> None:
+        kind = str(state.get("kind") or "")
+        if kind == "panel":
+            body = (
+                "بازبینی محصول پنلی\n"
+                f"شناسه: {state['product_id']}\nعنوان: {state['title']}\n"
+                f"مدل قیمت: {state['pricing_mode']}\nهزینه اولیه: {int(state['price_minor']):,} {state['currency']}\n"
+                f"نرخ واحد: {int(state['unit_price_minor']):,} {state['currency']}\n"
+                f"مدت: {state['duration_hours']} ساعت | حجم: {state['traffic_gib']} GiB\n"
+                f"پنل: {state['panel_id']} | گروه/سرویس/این‌باند: {', '.join(state['group_ids']) or 'از metadata پنل'}\n"
+                f"دسته: {state['category_id'] or 'بدون دسته'}\nتوضیح: {state['description'] or 'بدون توضیح'}\n\n"
+                "با ذخیره، محصول در کاتالوگ همین فروشگاه فعال می‌شود. ثبت محصول به معنی اجرای تست اتصال زنده یا ساخت سرویس برای مشتری نیست."
+            )
+        else:
+            mode_labels = {
+                "manual": "تحویل دستی توسط مدیر",
+                "inventory": "تحویل خودکار از موجودی کد/اکانت",
+                "file": "ارسال فایل تلگرام پس از پرداخت",
+            }
+            body = (
+                "بازبینی محصول فروشگاهی\n"
+                f"شناسه: {state['product_id']}\nعنوان: {state['title']}\n"
+                f"قیمت: {int(state['price_minor']):,} {state['currency']}\n"
+                f"نوع تحویل: {mode_labels[kind]}\nدسته: {state['category_id'] or 'بدون دسته'}\n"
+                f"توضیح: {state['description'] or 'بدون توضیح'}"
+            )
+            if kind == "inventory":
+                body += "\nموجودی کد/اکانت هنوز اضافه نشده است؛ بعد از ذخیره با /manual-key add شناسه محصول | کلید موجودی را وارد کن."
+            elif kind == "file":
+                body += "\nفایل پیوست آماده دریافت است و پس از خرید موفق برای مشتری ارسال می‌شود."
+            else:
+                body += "\nسفارش پس از پرداخت در صف تحویل دستی قرار می‌گیرد و با /manual-fulfill تکمیل می‌شود."
+            body += "\n\nمحصول فقط پس از تأیید نهایی ذخیره می‌شود."
+        state["step"] = "confirm"
+        await self.api.send_text(chat_id, body, {"inline_keyboard": [
+            [{"text": "✅ تأیید و ذخیره محصول", "callback_data": "admin:product-save"}],
+            [{"text": "لغو و بدون ذخیره", "callback_data": "admin:cancel_product_wizard"}],
+        ]})
+
+    async def _handle_product_admin_document(self, chat_id: int, uid: int, message: dict[str, Any]) -> None:
+        state = self._pending_product_admin.get(uid)
+        if not state or state.get("kind") != "file" or state.get("step") != "file":
+            return
+        if time.time() - float(state.get("started_at", 0)) > 15 * 60:
+            self._pending_product_admin.pop(uid, None)
+            await self.api.send_text(chat_id, "فرم محصول منقضی شد؛ چیزی ذخیره نشد. دوباره شروع کن.",
+                                     self._admin_product_keyboard())
+            return
+        document = message.get("document") or {}
+        file_id = document.get("file_id")
+        if not isinstance(file_id, str) or not file_id.strip() or len(file_id) > 512:
+            await self.api.send_text(chat_id, "شناسه فایل معتبر نیست؛ یک فایل به‌صورت Document بفرست.")
+            return
+        state["file_id"] = file_id.strip()
+        await self._send_product_admin_review(chat_id, state)
+
+    async def _handle_product_admin_message(self, chat_id: int, uid: int, text: str) -> None:
+        state = self._pending_product_admin.get(uid)
+        if not state:
+            return
+        if time.time() - float(state.get("started_at", 0)) > 15 * 60:
+            self._pending_product_admin.pop(uid, None)
+            await self.api.send_text(chat_id, "فرم محصول منقضی شد؛ چیزی ذخیره نشد. دوباره شروع کن.",
+                                     self._admin_product_keyboard())
+            return
+        kind = str(state.get("kind") or "")
+        step = str(state.get("step") or "")
+        value = text.strip()
+        if step == "file":
+            await self.api.send_text(chat_id, "برای نوع فایل، یک فایل را به‌صورت Document ارسال کن؛ متن پذیرفته نمی‌شود.")
+            return
+        if step == "id":
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", value):
+                await self.api.send_text(chat_id, "شناسه نامعتبر است؛ ۱ تا ۲۰ حرف/عدد لاتین یا _ و - بفرست.")
+                return
+            if (self.data.get_manual_product(value, enabled_only=False)
+                    or self.data.get_product(value, enabled_only=False)):
+                await self.api.send_text(chat_id, "این شناسه در کاتالوگ استفاده شده؛ شناسه یکتای دیگری بفرست.")
+                return
+            state["product_id"] = value
+            state["step"] = "title"
+            await self.api.send_text(chat_id, "عنوان محصول را بفرست (حداکثر ۱۶۰ نویسه).")
+            return
+        if step == "title":
+            if not value or len(value) > 160:
+                await self.api.send_text(chat_id, "عنوان باید بین ۱ تا ۱۶۰ نویسه باشد.")
+                return
+            state["title"] = value
+            if kind == "panel":
+                state["step"] = "pricing_mode"
+                await self.api.send_text(chat_id, "مدل قیمت‌گذاری را انتخاب کن:", {"inline_keyboard": [
+                    [{"text": "قیمت ثابت", "callback_data": "admin:product-pricing:fixed"},
+                     {"text": "نامحدود", "callback_data": "admin:product-pricing:unlimited"}],
+                    [{"text": "ساعتی", "callback_data": "admin:product-pricing:hourly"},
+                     {"text": "مصرفی", "callback_data": "admin:product-pricing:usage"}],
+                    [{"text": "لغو فرم", "callback_data": "admin:cancel_product_wizard"}],
+                ]})
+            else:
+                state["step"] = "price"
+                await self.api.send_text(chat_id, "قیمت محصول را به واحد خرد ارز، به‌صورت عدد صحیح مثبت بفرست.")
+            return
+        if kind != "panel" and step == "price":
+            try:
+                amount = int(value)
+                if amount <= 0 or amount > 2**63 - 1:
+                    raise ValueError
+            except ValueError:
+                await self.api.send_text(chat_id, "قیمت باید عدد صحیح مثبت و در محدوده مجاز باشد.")
+                return
+            state["price_minor"] = amount
+            state["step"] = "currency"
+            await self.api.send_text(chat_id, "کد ارز سه‌حرفی را بفرست؛ برای تومان می‌توانی IRR استفاده کنی.")
+            return
+        if step == "price" and kind == "panel":
+            try:
+                amount = int(value)
+                if amount < 0 or amount > 2**63 - 1:
+                    raise ValueError
+            except ValueError:
+                await self.api.send_text(chat_id, "هزینه اولیه باید عدد صحیح نامنفی باشد.")
+                return
+            state["price_minor"] = amount
+            state["step"] = "unit_price"
+            await self.api.send_text(chat_id, "نرخ واحد را به واحد خرد ارز بفرست؛ برای fixed/unlimited مقدار 0.")
+            return
+        if step == "unit_price":
+            try:
+                amount = int(value)
+                if amount < 0 or amount > 2**63 - 1:
+                    raise ValueError
+            except ValueError:
+                await self.api.send_text(chat_id, "نرخ واحد باید عدد صحیح نامنفی باشد.")
+                return
+            state["unit_price_minor"] = amount
+            state["step"] = "currency"
+            await self.api.send_text(chat_id, "کد ارز سه‌حرفی را بفرست (مثلاً IRR یا USD).")
+            return
+        if step == "currency":
+            currency = value.upper()
+            if len(currency) != 3 or not currency.isascii() or not currency.isalpha():
+                await self.api.send_text(chat_id, "کد ارز باید دقیقاً سه حرف لاتین باشد.")
+                return
+            state["currency"] = currency
+            if kind == "panel":
+                state["step"] = "duration"
+                await self.api.send_text(chat_id, "مدت سرویس به ساعت را به‌صورت عدد صحیح ۰ تا ۸۷۶۰۰ بفرست.")
+            else:
+                state["step"] = "category"
+                await self.api.send_text(chat_id, "شناسه دسته‌بندی را بفرست؛ برای بدون دسته «-» بفرست.")
+            return
+        if step == "duration":
+            try:
+                duration = int(value)
+                if not 0 <= duration <= 87600:
+                    raise ValueError
+            except ValueError:
+                await self.api.send_text(chat_id, "مدت باید عدد صحیح بین ۰ تا ۸۷۶۰۰ ساعت باشد.")
+                return
+            state["duration_hours"] = duration
+            state["step"] = "traffic"
+            await self.api.send_text(chat_id, "سقف ترافیک به GiB و عدد صحیح را بفرست؛ 0 یعنی بدون سقف.")
+            return
+        if step == "traffic":
+            try:
+                gib = int(value)
+                if not 0 <= gib <= (2**63 - 1) // (1024**3):
+                    raise ValueError
+            except ValueError:
+                await self.api.send_text(chat_id, "ترافیک باید عدد صحیح نامنفی GiB باشد.")
+                return
+            state["traffic_gib"] = gib
+            state["traffic_bytes"] = gib * (1024**3)
+            state["step"] = "panel_id"
+            await self.api.send_text(chat_id, "شناسه اتصال پنل فعال را بفرست.")
+            return
+        if step == "panel_id":
+            if not value or len(value) > 120 or any(ch.isspace() for ch in value):
+                await self.api.send_text(chat_id, "شناسه پنل نامعتبر است؛ بدون فاصله و حداکثر ۱۲۰ نویسه بفرست.")
+                return
+            state["panel_id"] = value
+            state["step"] = "groups"
+            await self.api.send_text(chat_id,
+                "شناسه‌های group/service/inbound را با کاما بفرست؛ برای استفاده از metadata پنل «-» بفرست.")
+            return
+        if step == "groups":
+            groups = [] if value == "-" else [part.strip() for part in value.split(",") if part.strip()]
+            try:
+                _panel, normalized_groups = self._validate_product_target(str(state["panel_id"]), groups)
+            except (ValueError, CustomerStoreError) as exc:
+                await self.api.send_text(chat_id, f"تنظیم اتصال محصول معتبر نیست: {exc}\nشناسه‌ها را دوباره بفرست.")
+                return
+            state["group_ids"] = normalized_groups
+            state["step"] = "category"
+            await self.api.send_text(chat_id, "شناسه دسته‌بندی را بفرست؛ برای بدون دسته «-» بفرست.")
+            return
+        if step == "category":
+            category_id = "" if value == "-" else value
+            if category_id:
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", category_id):
+                    await self.api.send_text(chat_id, "شناسه دسته نامعتبر است؛ یا شناسه موجود یا «-» بفرست.")
+                    return
+                if not any(str(row["category_id"]) == category_id
+                           for row in self.data.list_categories(enabled_only=False)):
+                    await self.api.send_text(chat_id, "این دسته وجود ندارد؛ ابتدا از مدیریت دسته‌بندی‌ها بساز.")
+                    return
+            state["category_id"] = category_id
+            state["step"] = "description" if kind != "panel" else "description"
+            await self.api.send_text(chat_id, "توضیح محصول را بفرست (حداکثر ۱۰۰۰ نویسه؛ برای خالی «-»).")
+            return
+        if step == "description":
+            description = "" if value == "-" else value
+            if len(description) > 4000:
+                await self.api.send_text(chat_id, "توضیح حداکثر ۴۰۰۰ نویسه است.")
+                return
+            state["description"] = description
+            if kind == "file":
+                state["step"] = "file"
+                await self.api.send_text(chat_id, "فایل محصول را به‌صورت Document بفرست. فایل پس از خرید موفق به مشتری می‌رسد.")
+            elif kind == "panel":
+                state["step"] = "confirm"
+                await self._send_product_admin_review(chat_id, state)
+            else:
+                await self._send_product_admin_review(chat_id, state)
+            return
+        await self.api.send_text(chat_id, "مرحله فرم شناخته نشد؛ فرم را لغو کن و دوباره شروع کن.",
+                                 self._admin_product_keyboard())
+
+    async def _save_product_admin_wizard(self, chat_id: int, uid: int) -> None:
+        state = self._pending_product_admin.get(uid)
+        if (not state or state.get("step") != "confirm"
+                or time.time() - float(state.get("started_at", 0)) > 15 * 60):
+            self._pending_product_admin.pop(uid, None)
+            await self.api.send_text(chat_id, "فرم محصول خالی، قدیمی یا منقضی است؛ چیزی ذخیره نشد.",
+                                     self._admin_product_keyboard())
+            return
+        product_id = str(state.get("product_id") or "")
+        if (self.data.get_manual_product(product_id, enabled_only=False)
+                or self.data.get_product(product_id, enabled_only=False)):
+            self._pending_product_admin.pop(uid, None)
+            await self.api.send_text(chat_id, "این شناسه همین حالا ثبت شده؛ برای جلوگیری از بازنویسی چیزی ذخیره نشد.",
+                                     self._admin_product_keyboard())
+            return
+        kind = str(state.get("kind") or "")
+        try:
+            if kind == "panel":
+                _panel, groups = self._validate_product_target(str(state["panel_id"]), list(state["group_ids"]))
+                self.data.put_product(
+                    product_id=product_id, title=str(state["title"]), description=str(state.get("description") or ""),
+                    price_minor=int(state["price_minor"]), currency=str(state["currency"]),
+                    duration_hours=int(state["duration_hours"]), traffic_bytes=int(state["traffic_bytes"]),
+                    pricing_mode=str(state["pricing_mode"]), unit_price_minor=int(state["unit_price_minor"]),
+                    panel_id=str(state["panel_id"]), group_ids=groups, category_id=str(state.get("category_id") or ""),
+                    enabled=True, create_only=True)
+            else:
+                self.data.put_manual_product(
+                    product_id=product_id, title=str(state["title"]), price_minor=int(state["price_minor"]),
+                    currency=str(state["currency"]), delivery_mode=kind,
+                    delivery_payload=str(state.get("file_id") or ""), description=str(state.get("description") or ""),
+                    category_id=str(state.get("category_id") or ""), enabled=True, create_only=True)
+        except (CustomerStoreError, ValueError, KeyError) as exc:
+            self._pending_product_admin.pop(uid, None)
+            await self.api.send_text(chat_id, f"محصول ذخیره نشد: {exc}", self._admin_product_keyboard())
+            return
+        self._pending_product_admin.pop(uid, None)
+        if kind == "inventory":
+            next_step = f"برای ثبت موجودی از /manual-key add {product_id} | KEY استفاده کن."
+        elif kind == "manual":
+            next_step = "پس از سفارش، برای تحویل از /manual-orders و /manual-fulfill استفاده کن."
+        elif kind == "file":
+            next_step = "فایل به محصول متصل شد و پس از خرید موفق ارسال می‌شود."
+        else:
+            next_step = "محصول به اتصال پنل متصل شد؛ این ثبت به‌تنهایی هیچ درخواست ساخت سرویس به پنل ارسال نکرد."
+        await self.api.send_text(chat_id, f"✅ محصول «{state['title']}» ذخیره شد.\n{next_step}",
+                                 self._admin_product_keyboard())
+
     def _admin_category_keyboard(self) -> dict[str, Any]:
         categories = self.data.list_categories(enabled_only=False)
         rows: list[list[dict[str, str]]] = []
@@ -3110,6 +3425,66 @@ class CustomerBot:
                     [{"text": "📋 فهرست پنل‌ها", "callback_data": "admin:list_panels"}],
                     [{"text": "⬅️ پنل‌ها", "callback_data": "admin:panels"}]]})
                 return
+            elif section == "product-create":
+                await self.api.send_text(chat_id, "نوع محصول را انتخاب کن:", {"inline_keyboard": [
+                    [{"text": "🧑‍💻 تحویل دستی", "callback_data": "admin:product-type:manual"},
+                     {"text": "🔑 موجودی کد/اکانت", "callback_data": "admin:product-type:inventory"}],
+                    [{"text": "📄 فایل دیجیتال", "callback_data": "admin:product-type:file"},
+                     {"text": "🌐 محصول متصل به پنل", "callback_data": "admin:product-type:panel"}],
+                    [{"text": "⬅️ بازگشت", "callback_data": "admin:products"}],
+                ]})
+                return
+            elif section.startswith("product-type:"):
+                kind = section.partition(":")[2]
+                await self._start_product_admin_wizard(chat_id, uid, kind)
+                return
+            elif section.startswith("product-pricing:"):
+                pricing_mode = section.partition(":")[2]
+                state = self._pending_product_admin.get(uid)
+                if (pricing_mode not in {"fixed", "unlimited", "hourly", "usage"} or not state
+                        or state.get("kind") != "panel" or state.get("step") != "pricing_mode"
+                        or time.time() - float(state.get("started_at", 0)) > 15 * 60):
+                    await self.api.send_text(chat_id, "انتخاب مدل قیمت قدیمی یا نامعتبر است؛ فرم محصول را دوباره شروع کن.",
+                                             self._admin_product_keyboard())
+                    return
+                state["pricing_mode"] = pricing_mode
+                state["step"] = "price"
+                await self.api.send_text(chat_id, "هزینه اولیه/راه‌اندازی را به واحد خرد ارز وارد کن؛ برای مدل hourly/usage اگر هزینه اولیه ندارد مقدار 0.")
+                return
+            elif section == "product-save":
+                await self._save_product_admin_wizard(chat_id, uid)
+                return
+            elif section == "cancel_product_wizard":
+                self._pending_product_admin.pop(uid, None)
+                await self.api.send_text(chat_id, "فرم محصول لغو شد؛ هیچ تغییری ذخیره نشد.",
+                                         self._admin_product_keyboard())
+                return
+            elif section == "product-list":
+                products = self.data.list_products()
+                lines = ["📋 محصولات پنلی فعال:"]
+                lines.extend(f"• {item['product_id']} — {item['title']} — {int(item['price_minor']):,} {item['currency']} — {item['pricing_mode']} — پنل {item['panel_id']}"
+                             for item in products[:50])
+                await self.api.send_text(chat_id, "\n".join(lines) if products else "محصول پنلی فعالی در فروشگاه وجود ندارد.",
+                    {"inline_keyboard": [
+                        [{"text": "➕ ساخت محصول", "callback_data": "admin:product-create"}],
+                        [{"text": "⬅️ مدیریت فروشگاه", "callback_data": "admin:products"}],
+                    ]})
+                return
+            elif section == "manual-product-list":
+                products = self.data.list_manual_products(enabled_only=False)
+                lines = ["📦 محصولات فروشگاهی (تحویل دستی، موجودی یا فایل):"]
+                for item in products[:50]:
+                    status = "فعال" if item["enabled"] else "آرشیو"
+                    stock = (f" — موجودی: {self.data.manual_inventory_count(item['product_id'])}"
+                             if item["delivery_mode"] == "inventory" else "")
+                    lines.append(f"• {item['product_id']} — {item['title']} — {int(item['price_minor']):,} {item['currency']} — {item['delivery_mode']} — {status}{stock}")
+                await self.api.send_text(chat_id, "\n".join(lines) if products else "محصول فروشگاهی ثبت نشده است.",
+                    {"inline_keyboard": [
+                        [{"text": "➕ ساخت محصول", "callback_data": "admin:product-create"}],
+                        [{"text": "🗂 دسته‌بندی‌ها", "callback_data": "admin:categories"}],
+                        [{"text": "⬅️ مدیریت فروشگاه", "callback_data": "admin:products"}],
+                    ]})
+                return
             elif section == "categories":
                 await self.api.send_text(chat_id, "🗂 مدیریت دسته‌بندی‌ها\nدسته را برای ویرایش انتخاب کن یا وضعیت نمایش آن را تغییر بده. خاموش‌کردن دسته، محصولات وابسته را از خرید جدید پنهان می‌کند؛ سفارش‌های ثبت‌شده را حذف نمی‌کند.",
                                          self._admin_category_keyboard())
@@ -3215,17 +3590,11 @@ class CustomerBot:
                                          self._admin_category_keyboard())
                 return
             elif section == "products":
-                body = ("🛍 مدیریت فروشگاه\nمحصولات پنلی: /product add ...\n"
-                        "محصول دستی: /manual-product add ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح | category_id | سقف خرید | ترتیب | شرایط خرید | image_url HTTPS | visible_from_utc | visible_until_utc\n"
-                        "ویرایش: /manual-product edit ID | عنوان | قیمت | ارز | حالت | متن-تحویل | توضیح | category_id | سقف خرید | ترتیب | شرایط خرید | image_url | visible_from_utc | visible_until_utc؛ برای حذف تصویر/زمان مقدار -؛ زمان UTC به قالب YYYY-MM-DDTHH:MM:SSZ؛ آرشیو: /manual-product archive ID؛ فهرست: /manual-product list\n"
-                        "فهرست محصولات پنلی: /products\n\n"
-                        "📦 سفارش‌های تحویل دستی: /manual-orders [pending_delivery|fulfilled|all]\n"
-                        "تحویل سفارش: /manual-fulfill ORDER_ID | متن تحویل")
-                await self.api.send_text(chat_id, body, {"inline_keyboard": [
-                    [{"text": "🗂 مدیریت دسته‌بندی‌ها", "callback_data": "admin:categories"}],
-                    [{"text": "➕ افزودن دسته‌بندی", "callback_data": "admin:category-add"}],
-                    [{"text": "⬅️ بازگشت به مدیریت", "callback_data": "admin:home"}],
-                ]})
+                body = ("🛍 مدیریت فروشگاه و محصولات\n"
+                        "از ساخت محصول برای دریافت فرم مرحله‌ای انتخاب نوع تحویل استفاده کن. شناسه، قیمت و دسته‌بندی قبل از ذخیره بررسی می‌شوند و محصول فقط پس از تأیید نهایی ساخته می‌شود.\n"
+                        "فرمان‌های فعلی نیز همچنان در دسترس‌اند: /product، /manual-product، /manual-variant، /manual-key و /manual-file.\n"
+                        "سفارش‌های تحویل دستی: /manual-orders؛ تحویل: /manual-fulfill ORDER_ID | متن تحویل")
+                await self.api.send_text(chat_id, body, self._admin_product_keyboard())
                 return
             elif section == "resellers":
                 body = "👥 مدیریت نمایندگی\n/reseller-plan add ...\n/reseller-plans"

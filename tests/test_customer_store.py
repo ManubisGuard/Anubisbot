@@ -2216,5 +2216,33 @@ class CustomerDataStoreTests(unittest.TestCase):
         self.assertEqual(self.store.list_manual_variants("legacy-stock"), [])
 
 
+
+    def test_create_manual_product_rejects_existing_id_without_overwriting(self):
+        self.store.put_manual_product(product_id="insert_only", title="Original", price_minor=700,
+            currency="IRR", delivery_mode="manual", description="Original payload", create_only=True)
+        with self.assertRaisesRegex(CustomerStoreError, "already exists"):
+            self.store.put_manual_product(product_id="insert_only", title="Replacement", price_minor=9900,
+                currency="USD", delivery_mode="inventory", description="Replacement payload", create_only=True)
+        saved = self.store.get_manual_product("insert_only", enabled_only=False)
+        self.assertEqual(saved["title"], "Original")
+        self.assertEqual(saved["price_minor"], 700)
+        self.assertEqual(saved["currency"], "IRR")
+        self.assertEqual(saved["description"], "Original payload")
+        self.assertEqual(saved["delivery_mode"], "manual")
+
+    def test_create_panel_product_rejects_existing_id_without_overwriting(self):
+        self.store.put_product(product_id="panel_insert_only", title="Original panel product",
+            price_minor=1500, currency="IRR", panel_id="pg", group_ids=["1"],
+            enabled=False, create_only=True)
+        with self.assertRaisesRegex(CustomerStoreError, "already exists"):
+            self.store.put_product(product_id="panel_insert_only", title="Replacement product",
+                price_minor=9900, currency="USD", panel_id="other", group_ids=["2"],
+                enabled=False, create_only=True)
+        saved = self.store.get_product("panel_insert_only", enabled_only=False)
+        self.assertEqual(saved["title"], "Original panel product")
+        self.assertEqual(saved["price_minor"], 1500)
+        self.assertEqual(saved["panel_id"], "pg")
+
+
 if __name__ == "__main__":
     unittest.main()

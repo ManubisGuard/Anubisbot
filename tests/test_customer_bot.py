@@ -2594,3 +2594,173 @@ class GuidedCategoryAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(categories[0]["title"], "مدیر دیگر")
         self.assertEqual(categories[0]["description"], "ثبت مستقل")
         self.assertNotIn(self.ADMIN_ID, self.bot._pending_category_admin)
+
+
+class GuidedProductAdminTests(unittest.IsolatedAsyncioTestCase):
+    ADMIN_ID = 6883349141
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._env = patch.dict(os.environ, {
+            "ANUBIS_CUSTOMER_DB": str(Path(self.tmp.name) / "customer.sqlite3"),
+            "ANUBIS_CONTENT_DB": str(Path(self.tmp.name) / "content.sqlite3"),
+        })
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.addCleanup(self.tmp.cleanup)
+        self.bot = CustomerBot(CustomerBotConfig(token="dummy-customer-token",
+            admin_ids=frozenset({self.ADMIN_ID})))
+        self.bot.api.send_text = AsyncMock()
+        self.bot.api.answer_callback = AsyncMock()
+
+    async def _callback(self, data: str, uid: int | None = None):
+        user_id = uid if uid is not None else self.ADMIN_ID
+        await self.bot._handle_callback({
+            "id": "product-admin-" + str(time.time_ns()),
+            "from": {"id": user_id},
+            "message": {"message_id": 41, "chat": {"id": user_id, "type": "private"}},
+            "data": data,
+        })
+
+    async def _message(self, text: str, uid: int | None = None):
+        user_id = uid if uid is not None else self.ADMIN_ID
+        await self.bot._handle_message({
+            "message_id": 42,
+            "from": {"id": user_id, "first_name": "Admin"},
+            "chat": {"id": user_id, "type": "private"},
+            "text": text,
+        })
+
+    async def _document(self, file_id: str, uid: int | None = None):
+        user_id = uid if uid is not None else self.ADMIN_ID
+        await self.bot._handle_message({
+            "message_id": 43,
+            "from": {"id": user_id, "first_name": "Admin"},
+            "chat": {"id": user_id, "type": "private"},
+            "document": {"file_id": file_id, "file_name": "download.bin"},
+        })
+
+    async def _basic_manual_steps(self, kind: str, *, product_id="product_1", category="-"):
+        await self._callback(f"admin:product-type:{kind}")
+        await self._message(product_id)
+        await self._message("محصول آزمایشی")
+        await self._message("2500")
+        await self._message("IRR")
+        await self._message(category)
+        await self._message("توضیح محصول")
+
+    async def test_store_menu_has_functional_product_type_routes(self):
+        await self._callback("admin:products")
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        self.assertIn("ساخت محصول", body)
+        keys = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertIn("admin:product-create", keys)
+        self.assertIn("admin:product-list", keys)
+        self.assertIn("admin:manual-product-list", keys)
+
+        await self._callback("admin:product-create")
+        _, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        keys = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertEqual(set(keys), {
+            "admin:product-type:manual", "admin:product-type:inventory",
+            "admin:product-type:file", "admin:product-type:panel", "admin:products",
+        })
+
+    async def test_manual_product_waits_for_confirmation_and_saves_with_category(self):
+        self.bot.data.put_category(category_id="vpn", title="خدمات VPN")
+        await self._basic_manual_steps("manual", category="vpn")
+        self.assertIsNone(self.bot.data.get_manual_product("product_1", enabled_only=False))
+        _, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        keys = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertIn("admin:product-save", keys)
+
+        await self._callback("admin:product-save")
+        item = self.bot.data.get_manual_product("product_1", enabled_only=False)
+        self.assertEqual(item["title"], "محصول آزمایشی")
+        self.assertEqual(item["price_minor"], 2500)
+        self.assertEqual(item["currency"], "IRR")
+        self.assertEqual(item["delivery_mode"], "manual")
+        self.assertEqual(item["category_id"], "vpn")
+        self.assertIn("تحویل", self.bot.api.send_text.await_args.args[1])
+
+    async def test_inventory_product_saves_without_stock_and_explains_restock_step(self):
+        await self._basic_manual_steps("inventory", product_id="keys")
+        self.assertIsNone(self.bot.data.get_manual_product("keys", enabled_only=False))
+        await self._callback("admin:product-save")
+        item = self.bot.data.get_manual_product("keys", enabled_only=False)
+        self.assertEqual(item["delivery_mode"], "inventory")
+        self.assertEqual(self.bot.data.manual_inventory_count("keys"), 0)
+        self.assertIn("/manual-key add keys | KEY", self.bot.api.send_text.await_args.args[1])
+
+    async def test_file_product_requires_document_and_final_confirmation(self):
+        await self._basic_manual_steps("file", product_id="download")
+        self.assertEqual(self.bot._pending_product_admin[self.ADMIN_ID]["step"], "file")
+        self.assertIsNone(self.bot.data.get_manual_product("download", enabled_only=False))
+        await self._message("not a document")
+        self.assertIsNone(self.bot.data.get_manual_product("download", enabled_only=False))
+
+        await self._document("telegram-file-id-123")
+        self.assertIsNone(self.bot.data.get_manual_product("download", enabled_only=False))
+        self.assertIn("فایل پیوست آماده دریافت است", self.bot.api.send_text.await_args.args[1])
+        await self._callback("admin:product-save")
+        item = self.bot.data.get_manual_product("download", enabled_only=False)
+        self.assertEqual(item["delivery_mode"], "file")
+        self.assertEqual(item["delivery_payload"], "telegram-file-id-123")
+
+    async def test_panel_product_uses_validated_panel_metadata_and_create_only_storage(self):
+        self.bot.data.register_panel_connection(
+            panel_id="pg", label="Test PG", provider="pasarguard",
+            base_url="https://pg.example", auth_mode="api_key",
+            secret_ref="env:TEST_PANEL_API_KEY", enabled=True,
+            metadata={"default_group_ids": ["1"]})
+        await self._callback("admin:product-type:panel")
+        await self._message("panel_product")
+        await self._message("پنل تست")
+        await self._callback("admin:product-pricing:fixed")
+        await self._message("5000")
+        await self._message("0")
+        await self._message("IRR")
+        await self._message("720")
+        await self._message("100")
+        await self._message("pg")
+        await self._message("1")
+        await self._message("-")
+        await self._message("محصول پنلی")
+        self.assertIsNone(self.bot.data.get_product("panel_product", enabled_only=False))
+        await self._callback("admin:product-save")
+        product = self.bot.data.get_product("panel_product", enabled_only=False)
+        self.assertEqual(product["panel_id"], "pg")
+        self.assertEqual(product["group_ids_json"], '["1"]')
+        self.assertEqual(product["price_minor"], 5000)
+        self.assertEqual(product["traffic_bytes"], 100 * (1024**3))
+        self.assertEqual(product["pricing_mode"], "fixed")
+        self.assertIn("هیچ درخواست ساخت سرویس", self.bot.api.send_text.await_args.args[1])
+
+    async def test_cancel_expiry_and_non_admin_callback_never_create_product(self):
+        await self._callback("admin:product-type:manual")
+        await self._message("cancel_me")
+        await self._message("/cancel")
+        self.assertIsNone(self.bot.data.get_manual_product("cancel_me", enabled_only=False))
+        self.assertNotIn(self.ADMIN_ID, self.bot._pending_product_admin)
+
+        await self._callback("admin:product-type:inventory")
+        await self._message("expired_product")
+        self.bot._pending_product_admin[self.ADMIN_ID]["started_at"] = time.time() - 16 * 60
+        await self._message("عنوان")
+        self.assertIsNone(self.bot.data.get_manual_product("expired_product", enabled_only=False))
+        self.assertNotIn(self.ADMIN_ID, self.bot._pending_product_admin)
+
+        await self._callback("admin:product-type:manual", uid=999)
+        self.assertEqual(self.bot._pending_product_admin, {})
+        self.assertIsNone(self.bot.data.get_manual_product("expired_product", enabled_only=False))
+
+    async def test_duplicate_id_is_rejected_without_overwriting_existing_product(self):
+        self.bot.data.put_manual_product(product_id="taken", title="اصل", price_minor=900,
+            delivery_mode="manual", delivery_payload="", description="داده اصلی")
+        await self._callback("admin:product-type:manual")
+        await self._message("taken")
+        item = self.bot.data.get_manual_product("taken", enabled_only=False)
+        self.assertEqual(item["title"], "اصل")
+        self.assertEqual(item["price_minor"], 900)
+        self.assertEqual(self.bot._pending_product_admin[self.ADMIN_ID]["step"], "id")
+        self.assertIn("شناسه در کاتالوگ استفاده شده", self.bot.api.send_text.await_args.args[1])

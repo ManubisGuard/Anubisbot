@@ -58,6 +58,16 @@ Updated: 2026-10-27
 - Focused category suite: **9 tests passed in 1.629 seconds**. Full isolated suite after final code changes: **480 tests passed in 65.900 seconds (OK, exit 0)**.
 - This is local unit/mock evidence only. No production store, active Telegram process, provider panel, N2, systemd timer, or deployment was changed.
 
+## Latest checkpoint — guided product creation (2026-10-28)
+
+- Connected the admin shop menu to real product-type choices: manual fulfillment, code/account inventory, Telegram file, and a panel-backed product.
+- The common wizard validates a unique 1..20 character ASCII ID, title, positive store-product price, three-letter currency, optional existing category and description. It requires a final confirmation, supports `/cancel`, expires after 15 minutes, and does not persist a partial draft.
+- File delivery requires a Telegram Document and captures its `file_id` before the final confirmation. Inventory products can be created with zero stock and show the exact command to add inventory. Manual fulfillment points the admin to the existing order/fulfillment workflow.
+- Panel-backed product creation collects pricing mode, setup/unit prices, duration, GiB limit, panel ID, group/service/inbound IDs, category, and description. It uses the existing read-only local panel/metadata validator before writing; it does not test credentials against the live panel or create any provider-side service.
+- Added insert-only creation behavior for both manual products and panel-backed products. The existing upsert behavior used by legacy edit commands is unchanged. Duplicate IDs are caught at the database layer, not just by the UI's preflight check.
+- Focused product wizard/store suite: **9 tests passed in 1.613 seconds**. Final full isolated suite after these code changes: **489 tests passed in 64.807 seconds (OK, exit 0)**. Static checks passed: Python compileall, Bash syntax, Mini App JavaScript syntax, and `git diff --check`.
+- No production store, panel, N2, active bot process, timer, or deployment was touched.
+
 ## Current limits / do not overclaim
 
 - The wizard state is in memory and is lost if the bot process restarts; it does not store partially completed forms. Registration does not prove credentials, API scopes, live connectivity, or compatibility with the installed provider version.
@@ -68,8 +78,7 @@ Updated: 2026-10-27
 
 ## Next steps in order
 
-1. Build guided product creation/edit screens with an explicit fulfillment choice (manual, inventory, file, panel). Preserve quote revalidation, order snapshots, inventory atomicity, existing command fallbacks, and the separation between manual-product and panel-backed purchase flows.
-2. Improve admin order/payment review navigation without weakening receipt verification, immutable wallet ledger, idempotency or reconciliation protections.
-3. Review PasarGuard operation contracts one by one and add focused mock tests for missing/invalid config, permissions unknown, and ambiguous provider mutation outcomes.
-4. Live staging acceptance remains blocked until a disposable panel and explicit authorization are provided.
-5. After each independent implementation step: focused tests, full `./scripts/run_isolated_tests.sh`, static checks, reviewed-path-only staging, commit/push to `feature/discount-codes`. Never use `git add -A`; never restart services or deploy without explicit authorization.
+1. Improve admin order/payment review navigation, especially pending card-to-card receipts, while preserving independent receipt verification, immutable wallet ledger, idempotency and redacted audit history.
+2. Review PasarGuard operation contracts one by one and add focused mock tests for missing/invalid config, permissions unknown, and ambiguous provider mutation outcomes.
+3. Live staging acceptance remains blocked until a disposable panel and explicit authorization are provided.
+4. After each independent implementation step: focused tests, full `./scripts/run_isolated_tests.sh`, static checks, reviewed-path-only staging, commit/push to `feature/discount-codes`. Never use `git add -A`; never restart services or deploy without explicit authorization.
