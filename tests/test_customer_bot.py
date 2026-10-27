@@ -2165,8 +2165,14 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.bot.data.ensure_customer(999, first_name="Buyer")
         orders = [
             {"order_id": "panel-pending-01", "title": "Panel product", "amount_minor": 500,
-             "currency": "IRR", "status": "provisioning", "created_at": "2026-10-28 00:00:00",
-             "updated_at": "2026-10-28 00:01:00", "discount_code": "", "discount_amount_minor": 0,
+             "currency": "IRR", "status": "provisioning", "needs_reconciliation": True,
+             "created_at": "2026-10-28 00:00:00", "updated_at": "2026-10-28 00:01:00",
+             "discount_code": "", "discount_amount_minor": 0,
+             "order_kind": "panel", "can_redeliver_file": False},
+            {"order_id": "panel-normal-01", "title": "Another panel product", "amount_minor": 600,
+             "currency": "IRR", "status": "provisioning", "needs_reconciliation": False,
+             "created_at": "2026-10-27 12:00:00", "updated_at": "2026-10-27 12:01:00",
+             "discount_code": "", "discount_amount_minor": 0,
              "order_kind": "panel", "can_redeliver_file": False},
             {"order_id": "manual-wait-001", "title": "Manual delivery", "amount_minor": 700,
              "currency": "IRR", "status": "pending_delivery", "created_at": "2026-10-27 00:00:00",
@@ -2182,6 +2188,7 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
                 "message": {"message_id": 752, "chat": {"id": 999, "type": "private"}},
                 "data": "customer:orders:0"})
         body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        self.assertIn("نیازمند بررسی پشتیبانی؛ دوباره خرید نکن", body)
         self.assertIn("در حال آماده‌سازی", body)
         self.assertIn("در انتظار تحویل", body)
         self.assertIn("فعال / تحویل‌شده", body)

@@ -3987,10 +3987,11 @@ class CustomerBot:
             followup_buttons = []
             for order in selected:
                 status = str(order.get("status") or "unknown")
+                display_status = "reconcile_required" if order.get("needs_reconciliation") and status == "provisioning" else status
                 lines.append(
                     f"\n• {order['title']}\nشناسه: {order['order_id']}\n"
                     f"مبلغ: {int(order['amount_minor']):,} {order['currency']}\n"
-                    f"وضعیت: {status_labels.get(status, status)}"
+                    f"وضعیت: {status_labels.get(display_status, display_status)}"
                     + (f"\nتخفیف: {order['discount_code']} (−{int(order['discount_amount_minor']):,})"
                        if order.get("discount_code") else "")
                     + (f"\nآخرین تغییر: {order['updated_at']}" if order.get("updated_at") else "")

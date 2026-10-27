@@ -425,6 +425,25 @@ class CustomerDataStoreTests(unittest.TestCase):
         other_tenant = CustomerDataStore(self.path, tenant_id="bot-beta")
         self.assertEqual(other_tenant.list_customer_orders(1001), [])
 
+    def test_customer_order_history_exposes_only_sanitized_reconciliation_flag(self):
+        self.store.ensure_customer(1001, first_name="Buyer")
+        self.store.put_product(product_id="hist-reconcile", title="History Reconcile", price_minor=5000)
+        order = self.store.create_order(order_id="history-reconcile-order", telegram_id=1001,
+            product_id="hist-reconcile", idempotency_key="history-reconcile-key")
+        self.store.transition_order(order_id=order["order_id"], new_status="paid")
+        self.store.transition_order(order_id=order["order_id"], new_status="provisioning")
+        self.store.flag_product_order_reconciliation(order_id=order["order_id"], reason_code="TimeoutError")
+
+        history = self.store.list_customer_orders(1001)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["order_id"], order["order_id"])
+        self.assertTrue(history[0]["needs_reconciliation"])
+        self.assertNotIn("provider_reference", history[0])
+        self.assertNotIn("product_snapshot_json", history[0])
+
+        other_tenant = CustomerDataStore(self.path, tenant_id="bot-beta")
+        self.assertEqual(other_tenant.list_customer_orders(1001), [])
+
     def test_order_snapshots_price_and_is_idempotent(self):
         self.store.put_product(product_id="basic", title="Basic", price_minor=5000, currency="IRR")
         first = self.store.create_order(order_id="order-1", telegram_id=1001,

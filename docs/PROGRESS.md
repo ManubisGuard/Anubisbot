@@ -325,3 +325,29 @@ Audit whether order-history status needs a customer-safe distinction between a p
 - Verified full file lengths after correction: `src/manubisguard/telegram/customer_bot.py` 4,569 lines; `tests/test_customer_bot.py` 3,000 lines. Their published Git blob hashes match the workspace hashes (`ae46a82bbc0842a684d7d60ed3eed5332c5fcd59` and `b09c1e7774a5c75f51c3426eb93df9d6ee737a06`).
 - Local HEAD and `origin/feature/discount-codes` both equal `9a58812dcfd69d2ebd8882c0046b18b34844544d`; working tree clean. Post-correction static checks passed: `python3 -m compileall -q -f src tests scripts`; `bash -n scripts/*.sh`; `node --check customer_webapp/app.js`; `git diff --check`.
 - The focused 144-test suite and 507-test full isolated suite ran against the same exact source/test blob hashes before publication. Evidence remains E2 local unit/mock; no live systems were touched.
+
+
+## Phase 2 slice 4 — sanitized reconciliation status in customer order history (2026-10-28)
+
+### Audit finding
+
+The store already persisted an internal `provider_reference` marker beginning `reconcile_required:` when initial provider provisioning became ambiguous. `list_customer_orders` intentionally omitted that internal reference, but it also omitted a safe indicator, so the customer UI could only show a generic “provisioning” state even when operator reconciliation was required.
+
+### Implemented
+
+- Extended the tenant/customer-scoped order-history query with a computed `needs_reconciliation` boolean, derived only for `provisioning` orders whose internal marker is set. The raw provider reference, marker reason, provisioning intent and provider payload remain excluded from the history result.
+- Customer order history maps that safe boolean to the existing Persian message “needs support review; do not purchase again”, while ordinary provisioning remains distinct and unchanged.
+- Added store regression coverage for true marker detection, omission of provider/internal snapshot fields, and tenant scoping. Extended the customer UI regression to assert that both reconciliation-required and ordinary provisioning states render differently and safely.
+- No new retry, refund, provider call, wallet debit or status mutation was introduced.
+
+### Validation
+
+- Customer store suite: **109 tests passed in 17.965 seconds**, exit 0. Command: `PYTHONPATH=src:scripts/test_support python3 -m unittest discover -s tests -p 'test_customer_store.py' -v`.
+- Customer bot suite: **144 tests passed in 27.006 seconds**, exit 0. Command: `PYTHONPATH=src:scripts/test_support python3 -m unittest discover -s tests -p 'test_customer_bot.py' -v`.
+- Full isolated suite: **508 tests passed in 63.176 seconds**, exit 0. Command: `./scripts/run_isolated_tests.sh`.
+- Static checks passed: `python3 -m compileall -q -f src tests scripts`; `bash -n scripts/*.sh`; `node --check customer_webapp/app.js`; `git diff --check`.
+- Evidence remains E2 local unit/mock only. No live Telegram bot, provider API, production panel/database, N2, timer, deployment, restart or secret was touched.
+
+### Next Phase 2 task
+
+Audit customer payment/receipt status journeys for clear distinction between receipt submitted, awaiting admin review, approved/credited and rejected; ensure customer-facing messages and history never imply wallet credit before atomic approval, and that support follow-up is available where needed. Keep online gateways deferred and preserve the existing append-only/idempotent wallet settlement model.

@@ -1873,7 +1873,9 @@ class CustomerDataStore:
         with self._connect() as db:
             panel_rows = db.execute(
                 """SELECT o.order_id,o.product_id,o.amount_minor,o.currency,o.status,o.created_at,o.updated_at,
-                          o.discount_code,o.discount_amount_minor,o.product_snapshot_json,p.title AS current_title
+                          o.discount_code,o.discount_amount_minor,o.product_snapshot_json,p.title AS current_title,
+                          CASE WHEN o.status='provisioning' AND o.provider_reference LIKE 'reconcile_required:%'
+                               THEN 1 ELSE 0 END AS needs_reconciliation
                    FROM customer_orders o LEFT JOIN customer_products p
                      ON p.tenant_id=o.tenant_id AND p.product_id=o.product_id
                    WHERE o.tenant_id=? AND o.telegram_id=?
