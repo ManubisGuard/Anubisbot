@@ -4470,14 +4470,22 @@ class CustomerBot:
                 lines.append(f"\n• مبلغ: {int(payment['amount_minor']):,} {payment['currency']}"
                     f"\nوضعیت: {labels.get(payment['status'], 'در حال بررسی')}"
                     f"\nشناسه پرداخت: {payment['payment_id']}\nزمان: {payment['created_at']}")
+            if any(payment.get("status") in {"awaiting_receipt", "receipt_submitted"} for payment in payments):
+                lines.append("\n\u062a\u0648\u062c\u0647: \u0633\u0627\u062e\u062a \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u06cc\u0627 \u062b\u0628\u062a \u0631\u0633\u06cc\u062f \u0628\u0647 \u0645\u0639\u0646\u06cc \u0634\u0627\u0631\u0698 \u0634\u062f\u0646 \u0646\u06cc\u0633\u062a\u061b \u0645\u0648\u062c\u0648\u062f\u06cc \u0641\u0642\u0637 \u067e\u0633 \u0627\u0632 \u062a\u0623\u06cc\u06cc\u062f \u0645\u062f\u06cc\u0631 \u0627\u0641\u0632\u0627\u06cc\u0634 \u0645\u06cc\u200c\u06cc\u0627\u0628\u062f.")
+            needs_support = any(payment.get("status") in {"rejected", "failed"} for payment in payments)
+            if needs_support:
+                lines.append("\n\u0627\u06af\u0631 \u062f\u0631\u0628\u0627\u0631\u0647 \u0631\u0633\u06cc\u062f \u0631\u062f\u0634\u062f\u0647 \u06cc\u0627 \u067e\u0631\u062f\u0627\u062e\u062a \u0646\u0627\u0645\u0648\u0641\u0642 \u0633\u0624\u0627\u0644 \u062f\u0627\u0631\u06cc\u060c \u0627\u0632 \u067e\u0634\u062a\u06cc\u0628\u0627\u0646\u06cc \u067e\u06cc\u06af\u06cc\u0631\u06cc \u06a9\u0646؛ \u0627\u06cc\u0646 \u0648\u0636\u0639\u06cc\u062a \u0628\u0647\u200c\u062a\u0646\u0647\u0627\u06cc\u06cc \u0645\u0648\u062c\u0648\u062f\u06cc \u0631\u0627 \u0627\u0641\u0632\u0627\u06cc\u0634 \u0646\u0645\u06cc\u200c\u062f\u0647\u062f.")
             if not payments:
                 lines.append("\nهنوز درخواست شارژ دستی ثبت نکرده‌ای.")
-            await self.api.send_text(chat_id, "\n".join(lines), {"inline_keyboard": [
+            rows = [
                 [{"text": "➕ شارژ دستی کیف پول", "callback_data": "customer:wallet:deposit"}],
                 [{"text": "📜 گردش حساب", "callback_data": "customer:wallet:history"}],
                 [{"text": "⬅️ بازگشت به کیف پول", "callback_data": "customer:wallet"}],
                 [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}],
-            ]})
+            ]
+            if needs_support:
+                rows.insert(2, [{"text": "\U0001f3ab \u067e\u06cc\u06af\u06cc\u0631\u06cc \u0628\u0627 \u067e\u0634\u062a\u06cc\u0628\u0627\u0646\u06cc", "callback_data": "customer:support"}])
+            await self.api.send_text(chat_id, "\n".join(lines), {"inline_keyboard": rows})
             return
         if key == "wallet:history":
             entries = self.data.list_wallet_transactions(uid, limit=10)

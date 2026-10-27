@@ -1045,6 +1045,24 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("تأیید شد و کیف پول شارژ شد", self.bot.api.send_text.await_args.args[1])
         self.assertNotIn("private-bank-reference", self.bot.api.send_text.await_args.args[1])
 
+        self.bot.data.create_payment_attempt(payment_id="pay-status-rejected", telegram_id=999,
+            provider="manual", amount_minor=900, currency="IRR", idempotency_key="intent-status-rejected")
+        self.bot.data.submit_manual_deposit_receipt(payment_id="pay-status-rejected", telegram_id=999,
+            transfer_reference="private-rejected-reference")
+        self.bot.data.reject_manual_deposit_receipt(payment_id="pay-status-rejected", admin_id=6883349141,
+            reason="receipt_invalid")
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"payment-status-view-rejected","from":{"id":999},
+            "message":{"message_id":762,"chat":{"id":999,"type":"private"}},
+            "data":"customer:wallet:payments"})
+        rejected_body, rejected_keyboard = self.bot.api.send_text.await_args.args[1:3]
+        self.assertIn("\u0631\u0633\u06cc\u062f \u0631\u062f \u0634\u062f", rejected_body)
+        self.assertIn("\u0645\u0648\u062c\u0648\u062f\u06cc \u0631\u0627 \u0627\u0641\u0632\u0627\u06cc\u0634 \u0646\u0645\u06cc\u200c\u062f\u0647\u062f", rejected_body)
+        self.assertNotIn("private-rejected-reference", rejected_body)
+        self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 2100)
+        self.assertTrue(any(button["callback_data"] == "customer:support"
+                            for row in rejected_keyboard["inline_keyboard"] for button in row))
+
     async def test_customer_payment_notification_worker_retries_send_failure_without_leaking_details(self):
         self.bot.data.ensure_customer(999, first_name="Buyer")
         self.bot.data.create_payment_attempt(payment_id="pay-notify-retry", telegram_id=999,

@@ -351,3 +351,29 @@ The store already persisted an internal `provider_reference` marker beginning `r
 ### Next Phase 2 task
 
 Audit customer payment/receipt status journeys for clear distinction between receipt submitted, awaiting admin review, approved/credited and rejected; ensure customer-facing messages and history never imply wallet credit before atomic approval, and that support follow-up is available where needed. Keep online gateways deferred and preserve the existing append-only/idempotent wallet settlement model.
+
+
+## Phase 2 slice 5 — manual deposit receipt-status follow-up (2026-10-28)
+
+### Audit finding
+
+The customer wallet already mapped the core manual payment states correctly, but the recent-payment screen did not explicitly repeat that a submitted receipt is not a credit, and rejected/failed payments had no direct support route from that screen. Store-level tests already covered owner/tenant scoping, status mapping, and omission of private transfer references.
+
+### Implemented
+
+- Added a clear customer-facing reminder when any recent payment is awaiting a receipt or receipt review: request/receipt submission does not credit the wallet; credit happens only after admin verification.
+- For rejected/failed payment records, added a short follow-up explanation and a support button while keeping the keyboard compact. No per-payment callback or privileged action was introduced.
+- Extended the existing customer payment-status journey regression to cover rejected receipts, the support route, redaction of the transfer reference, and unchanged wallet balance after rejection.
+- The verified state continues to say that the wallet was credited; the submitted state continues to say it is awaiting admin review.
+
+### Validation
+
+- Targeted receipt-status test: **1 passed in 0.251 seconds**, exit 0.
+- Focused customer bot suite: **144 tests passed in 27.078 seconds**, exit 0. Command: `PYTHONPATH=src:scripts/test_support python3 -m unittest discover -s tests -p 'test_customer_bot.py' -v`.
+- Full isolated suite: **508 tests passed in 63.720 seconds**, exit 0. Command: `./scripts/run_isolated_tests.sh`.
+- Static checks passed after code changes: `python3 -m compileall -q -f src tests scripts`; `git diff --check`. Final static suite also includes `bash -n scripts/*.sh` and `node --check customer_webapp/app.js`.
+- Evidence remains E2 local unit/mock only. No live Telegram bot, provider API, production panel/database, N2, timer, deployment, restart or secret was touched.
+
+### Next Phase 2 task
+
+Review product detail and quote screens for customer clarity, then verify the displayed fulfillment state for manual, file and inventory orders remains aligned with actual order status and notification state. Avoid rebuilding completed catalog navigation and wallet recovery; preserve idempotency and never expose inventory payloads before purchase.
