@@ -219,3 +219,21 @@ At the start of each phase, first map what already exists and the acceptance gap
 ### Safety and evidence
 
 No live panel/provider calls, production database, N2, active Telegram process, timers, deployments, restarts or secrets were touched in this documentation update. This entry is a handoff/roadmap clarification, not a claim of new product acceptance.
+
+## Phase 1 checkpoint — provider pagination public-source research (2026-10-28)
+
+**Purpose:** examine provider list contracts without rerunning adapter tests or touching live panels.
+
+### Findings
+
+- **PasarGuard:** local adapter calls SDK `get_users(token, offset, limit)`, validates the users envelope and returns a list, but drops total metadata. Current public SDK README documents offset/limit pagination and uses `page.total` to stop paging: https://github.com/AmirKenzo/pasarguard_api/blob/main/README.md. The project declares `pasarguard>=2.3.1` without a lockfile; package is not installed in the default Python interpreter on this device. Exact SDK/provider version remains unverified.
+- **Rebecca:** local adapter sends GET `/api/users?limit=...&offset=...`, validates users and returns only the mapped list, dropping total metadata. Current upstream source registers GET `/api/users`, parses query offset/limit and returns the list-service response; OpenAPI describes zero-based offset and notes server-side limit caps. The current response model includes total. Sources: https://github.com/rebeccapanel/Rebecca/blob/master/internal/app/api/routes.go ; https://github.com/rebeccapanel/Rebecca/blob/master/internal/app/api/users.go ; https://github.com/rebeccapanel/Rebecca/blob/master/internal/app/api/openapi/openapi.json ; https://pkg.go.dev/github.com/rebeccapanel/rebecca/internal/app/user. This is current upstream evidence only; deployed version/cap remain unknown.
+- **Sanaei/3x-ui token mode:** local adapter calls `/panel/api/clients/list` and slices the returned list locally. Current official docs describe that endpoint as listing every client and separately document `/panel/api/clients/list/paged` with page/pageSize and total: https://github.com/MHSanaei/3x-ui/blob/main/docs/content/docs/en/reference/api/clients.mdx. The adapter does not call the newer paged endpoint, and its availability on the deployed panel is unknown.
+- **Sanaei legacy mode:** local adapter calls `/panel/api/inbounds/list`, validates all returned inbounds/settings/clients, aggregates the clients, and slices locally. No pagination/continuation contract was found in the reviewed official reference. Exact installed version and any server-side truncation behavior remain unknown.
+
+### Decision and status
+
+- Public-source research is complete for this checkpoint, but **deployed-version completeness is not verified**. A valid-looking response could still be truncated by an unknown deployed version/cap; available sources do not prove or disprove that for the user's panels.
+- Do not implement generic auto-pagination yet. Each adapter currently returns a plain list and discards total/has-more metadata; a safe change needs an explicit normalized page contract plus version-specific evidence. Keep the 200-item bound and explicit caller-controlled offsets. Do not infer that a short page proves completeness where the provider contract/version is unknown.
+- **No adapter tests were run**, intentionally. No source code was changed. No provider API/live panel, production database, N2, Telegram process, deployment, timer, restart or secret was accessed. Evidence: public-source + local source inspection only; not live acceptance.
+- Next project phase: **Phase 2 — audit the existing customer purchase journey** (catalog/category → product detail/quote → confirmation → payment choice → order status). First map existing code and the acceptance gap; do not rebuild existing screens and do not begin with a test-only loop.

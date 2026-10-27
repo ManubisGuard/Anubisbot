@@ -124,3 +124,35 @@ Updated: 2026-10-28. Scope: source-level audit of `src/manubisguard/panels/adapt
 - Update/delete refuse multi-inbound identities before mutation because atomic multi-inbound writes are not implemented; this avoids partially changing or deleting only one of several live copies.
 - Added three regression tests. Test-first run failed before the fix; focused Sanaei suite then passed **32 tests**, and the full isolated suite passed **448 tests in 103.962s (OK, exit 0)**. Compileall, shell syntax, Mini App JS syntax and `git diff --check` passed.
 - Evidence E2 isolated mocks only; no live provider acceptance. Remaining: additional legacy suspend/activate and multi-inbound usage/read edge coverage; live subscription-server and panel-version acceptance remain separate gates.
+
+## Pagination contract review — public-source checkpoint (2026-10-28)
+
+This section records public-source findings only. It does not establish the versions installed on any user-owned panel or prove live result completeness.
+
+### PasarGuard
+
+- Local implementation: `PasarGuardAdapter.list_users()` calls SDK `get_users(token=..., offset=..., limit=...)`, clamps each requested page to 1..200, validates the `users` envelope, maps the page and returns only a list. The adapter discards any total-result metadata, so the caller cannot calculate a reliable final offset from this return value alone.
+- Public SDK source/documentation describes offset/limit pagination and a response object with `page.users` and `page.total`: https://github.com/AmirKenzo/pasarguard_api/blob/main/README.md
+- Project dependency declaration is `pasarguard>=2.3.1` with no lockfile present in this checkout. The default Python interpreter on the connected device reports the package is not installed, so the exact SDK implementation used by a deployed environment cannot be confirmed here.
+- Conclusion: offset/limit + total is supported by current public SDK documentation, but the exact installed SDK and provider version remain unknown. Do not claim version-specific acceptance. Preserve caller-controlled pages; consider exposing validated total metadata only as a separate contract change after the dependency/version is pinned and the normalized adapter contract is reviewed.
+
+### Rebecca
+
+- Local implementation: `RebeccaAdapter.list_users()` issues GET `/api/users?limit=...&offset=...`, requires a users list, maps it and returns only that list; it discards total metadata.
+- Current public Rebecca source registers GET `/api/users`, parses `offset` and `limit` from query parameters, and returns the user-list service result. Its current OpenAPI describes zero-based offset and a limit that may be capped by server settings: https://github.com/rebeccapanel/Rebecca/blob/master/internal/app/api/routes.go ; https://github.com/rebeccapanel/Rebecca/blob/master/internal/app/api/users.go ; https://github.com/rebeccapanel/Rebecca/blob/master/internal/app/api/openapi/openapi.json
+- The current user response model includes a total count (see https://pkg.go.dev/github.com/rebeccapanel/rebecca/internal/app/user). These are upstream-current references, not proof of the user's installed panel version.
+- Conclusion: current upstream documents offset/limit and total. The adapter still loses total metadata, and the deployed Rebecca version/server-side cap are unknown. No auto-pagination or completeness claim until the deployed contract is evidenced.
+
+### Sanaei / 3x-ui
+
+- Local implementation token mode calls GET `/panel/api/clients/list` and locally slices the returned `obj` list. Legacy mode calls GET `/panel/api/inbounds/list`, validates and aggregates each inbound's clients, then locally slices the aggregate. Neither path reads total/continuation metadata.
+- Current official 3x-ui client API documentation describes `/panel/api/clients/list` as returning every client and also documents a newer `/panel/api/clients/list/paged` endpoint with server-side page/pageSize pagination and a total count: https://github.com/MHSanaei/3x-ui/blob/main/docs/content/docs/en/reference/api/clients.mdx
+- The local adapter does not call `list/paged`. Current upstream docs do not establish whether every deployed/older panel has that endpoint or whether an older `list` endpoint may be truncated by version-specific behavior. Legacy inbounds listing also has no documented pagination contract in the reviewed source.
+- Conclusion: retain the current bounded caller-controlled interface and do not switch endpoints or auto-paginate based only on latest upstream docs. Exact deployed version and full-list behavior remain unknown.
+
+### Cross-provider decision
+
+- No adapter tests were run for this source-research phase, by design; no source code was changed.
+- No provider API calls or live panels were accessed. Evidence is public-source + local source inspection only; no live acceptance.
+- Current adapter methods return a plain list, not a page object with total/has-more metadata. A safe generic auto-pagination feature therefore requires a deliberate contract design and provider-specific evidence, not a loop bolted onto the existing methods.
+- A well-formed but server-truncated response cannot be ruled out for the exact deployed versions from available evidence. Keep completeness unknown where the deployed contract is unverified.

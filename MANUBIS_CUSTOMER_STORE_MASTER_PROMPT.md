@@ -51,7 +51,7 @@ UI quality requirements:
 - Do not touch the production panel at `/opt/manubisguard-panel`, N2, mother bot, production DB, secrets, live Telegram processes or systemd timers unless the user explicitly authorizes the exact operation.
 - Do not deploy, restart, stop or mutate a live service merely to test a feature. Prefer local isolated tests and mocks.
 - Never read/print secrets or tokens. No raw provider credentials in DB/logs/exceptions; use secret references.
-- After each independent step: focused tests, full `./scripts/run_isolated_tests.sh`, static checks, inspect diff and status.
+- After each independent **code** step: focused tests, full `./scripts/run_isolated_tests.sh`, static checks, inspect diff and status. For docs-only changes, verify `git diff --check`, reviewed diff, blob hashes, publication and clean synchronization; do not rerun code tests without a specific reason.
 - Stage only explicitly reviewed paths. Never use `git add -A`.
 - If local commit is blocked by Git identity or excludes, do not invent an author or force unsafe local changes. Verify file blob hashes against local `git hash-object`, then use the repository's supported commit workflow and update the branch non-forcefully against the expected parent. Verify remote HEAD and synchronize the workspace after publication.
 - Report actual commit/hash/test output. Distinguish `unit/mock`, `public-source`, and `live` evidence. Never describe mocked evidence as live acceptance.
@@ -60,7 +60,7 @@ UI quality requirements:
 
 - Completed locally/published: panel management/read-only checks; guided panel registration; category management; guided product creation for manual/inventory/file/panel fulfillment; guarded manual receipt review with audit navigation.
 - Latest adapter hardening (2026-10-28): PasarGuard rejects boolean/negative/malformed counters and incomplete auth before secret resolution. Rebecca and Sanaei reject boolean expiry/usage/quota fields; Sanaei fails closed on malformed mapped usage instead of silently returning zero. All three user-list APIs now reject a missing list envelope; Sanaei also rejects malformed list entries/settings instead of silently returning a partial snapshot. Mock timeout tests assert no blind retry for create/update/delete.
-- Current next step: source/code research of provider-version-specific pagination/continuation metadata, not another adapter-test cycle. Do not add pagination tests or implement auto-pagination until the provider contract is evidenced. `list_users` remains explicit caller-controlled bounded pagination (max 200); current tests do not prove total-result completeness or live API compatibility. See “Remaining roadmap — execute in this order” below and the newest entry in docs/PROGRESS.md.
+- Pagination public-source research is recorded in `docs/PROVIDER_CAPABILITY_MATRIX.md` and `docs/PROGRESS.md`; exact deployed versions and completeness remain unknown. Do not repeat adapter tests or implement auto-pagination without new version-specific evidence. The next project task is Phase 2: audit the existing customer purchase journey and identify concrete acceptance gaps before coding.
 - Live staging acceptance is blocked until a disposable panel and explicit authorization exist.
 - Online gateways remain deferred. Mini App expansion is later roadmap work.
 
@@ -92,7 +92,7 @@ Do not rerun the adapter suite or full suite merely to “check again” at the 
 
 ## Remaining roadmap — execute in this order
 
-**Current active step (do not skip): Phase 1, provider pagination contract research.** This is a source/code inspection task, not an adapter-test task. Inspect the existing list-users call paths and pinned dependency/API contracts; check provider-version-specific official documentation or source for total, offset, limit, next, cursor, or other continuation metadata. Determine whether a valid page can be silently truncated, whether an additional request is safe, and how incomplete results must be represented. Do not implement auto-pagination or add adapter tests until the contract is evidenced. Document source URLs/version caveats and the conclusion in docs/PROVIDER_CAPABILITY_MATRIX.md and docs/PROGRESS.md. If authoritative evidence is unavailable, explicitly mark it unknown and retain bounded caller-controlled pagination (maximum 200).
+**Phase 1 public-source pagination research was performed on 2026-10-28 and recorded in docs/PROVIDER_CAPABILITY_MATRIX.md and docs/PROGRESS.md.** Public docs show offset/limit plus total for current PasarGuard SDK and Rebecca source; current 3x-ui docs distinguish an all-clients endpoint from a newer paged endpoint. However, the project does not pin the PasarGuard SDK and the exact deployed panel versions are unknown, so live/version-specific completeness remains unverified. Do not repeat this source review or run adapter tests without new evidence. Do not implement auto-pagination until the adapter contract preserves enough completeness metadata and deployed-version behavior is established. The next product phase is Phase 2: audit the existing customer purchase journey and identify its real acceptance gaps.
 
 After Phase 1, proceed through these product-first phases. Before each phase, inspect existing code and record what is already complete; do not rebuild existing functionality.
 
@@ -111,6 +111,6 @@ After Phase 1, proceed through these product-first phases. Before each phase, in
 
 1. Read this master prompt, then docs/PROGRESS.md, README.md, and docs/PROVIDER_CAPABILITY_MATRIX.md.
 2. Verify device label, repository path, branch, local/remote HEAD, clean status and latest GitHub commit. Do not trust old chat state.
-3. Start at **Phase 1 pagination contract research**. Do not begin by rerunning adapter tests.
+3. Start at **Phase 2 customer purchase journey audit**. Phase 1 public-source pagination research is recorded; version-specific/live completeness remains an explicit unresolved gate. Do not begin by rerunning adapter tests.
 4. Keep the four reference bots and provider order above; preserve product-first milestones and evidence labels.
 5. After a meaningful step, update this file only if the governing rules/roadmap changed; append the actual evidence to docs/PROGRESS.md. Keep these two files as the single source of handoff truth.
