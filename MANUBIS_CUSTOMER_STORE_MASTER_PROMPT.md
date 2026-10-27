@@ -83,10 +83,10 @@ Do not conflate reference bots with provider adapters. The supported provider or
 ## Test ledger and anti-duplication rule
 
 Latest verified checkpoint on 2026-10-28:
-- Latest full isolated suite after the customer catalog UX change: **504 tests passed in 63.972 seconds**, exit 0, command `./scripts/run_isolated_tests.sh`.
+- Latest full isolated suite after insufficient-wallet purchase recovery: **506 tests passed in 66.650 seconds**, exit 0, command `./scripts/run_isolated_tests.sh`.
 - Focused combined provider adapter suites: **76 tests passed** across PasarGuard, Rebecca and Sanaei.
 - Static checks passed: `python3 -m compileall -q -f src tests scripts`; `bash -n scripts/*.sh`; `node --check customer_webapp/app.js`; `git diff --check`.
-- Latest published code commit: `eff83db34d9a0116ca507da6158f8b84faab07cd`; docs-only publication-verification commit: `f74be144d15ad87b4ed1f55c8d5c2cc0f0e5f80b`. Verify live branch/HEAD before relying on these values.
+- Latest published baseline before the current uncommitted Phase 2 slice: `1647fb4142f98450c5572d19e024feb03c4fb829` (`Improve compact customer shop navigation`). Verify live branch/HEAD before relying on these values.
 - Evidence is **E2 local unit/mock**. These results do not prove live provider compatibility or permissions.
 
 Do not rerun the adapter suite or full suite merely to “check again” at the start of the next session. Preserve these as the last-known passing results. Run tests again only when a code change can affect them, a new behavior/contract gap is identified, or a focused regression check is necessary. For docs-only changes, use diff/format/status/hash verification; do not spend a full test run repeating unchanged code. If tests are run for a genuine reason, record exact command, count, duration and exit status.
@@ -112,6 +112,6 @@ After Phase 1, proceed through these product-first phases. Before each phase, in
 
 1. Read this master prompt, then docs/PROGRESS.md, README.md, and docs/PROVIDER_CAPABILITY_MATRIX.md.
 2. Verify device label, repository path, branch, local/remote HEAD, clean status and latest GitHub commit. Do not trust old chat state.
-3. Continue **Phase 2 customer purchase journey** from the next gap: product detail/quote presentation, insufficient-wallet recovery and order-status clarity. The compact category/catalog navigation slice is already implemented and tested; do not rebuild it. Phase 1 version-specific/live pagination completeness remains unresolved. Do not begin by rerunning adapter tests.
+3. Continue **Phase 2 customer purchase journey** from the next gap: order-status and paid-but-undelivered recovery clarity. Compact category/catalog navigation and insufficient-wallet recovery are implemented and tested; do not rebuild them. Phase 1 version-specific/live pagination completeness remains unresolved. Do not begin by rerunning adapter tests.
 4. Keep the four reference bots and provider order above; preserve product-first milestones and evidence labels.
 5. After a meaningful step, update this file only if the governing rules/roadmap changed; append the actual evidence to docs/PROGRESS.md. Keep these two files as the single source of handoff truth.

@@ -342,6 +342,27 @@ class CustomerBot:
                 LOG.warning("Could not send configured customer bot start photo; falling back to text")
         await self.api.send_text(chat_id, body, selected_markup)
 
+    async def _send_purchase_error(self, chat_id: int, exc: Exception, *, title: str = "خرید انجام نشد") -> None:
+        detail = str(exc)
+        normalized = detail.casefold()
+        insufficient_balance = (
+            "wallet balance" in normalized
+            and any(marker in normalized for marker in (
+                "insufficient", "positive wallet balance", "needs at least",
+            ))
+        )
+        if insufficient_balance:
+            await self.api.send_text(chat_id,
+                "موجودی کیف پول برای این خرید کافی نیست. ابتدا کیف پول را شارژ کن؛ "
+                "ثبت درخواست کارت‌به‌کارت به‌تنهایی موجودی را افزایش نمی‌دهد و تأیید مدیر لازم است.",
+                {"inline_keyboard": [
+                    [{"text": "➕ شارژ دستی کیف پول", "callback_data": "customer:wallet:deposit", "style": "primary"}],
+                    [{"text": "💳 مشاهده موجودی کیف پول", "callback_data": "customer:wallet"}],
+                    [{"text": "🛍 بازگشت به فروشگاه", "callback_data": "customer:shop"}],
+                ]})
+            return
+        await self.api.send_text(chat_id, f"{title}: {detail}", BACK_MENU)
+
     def _authorized(self, user: dict[str, Any] | None, chat: dict[str, Any] | None) -> bool:
         user = user or {}
         chat = chat or {}
@@ -4127,7 +4148,7 @@ class CustomerBot:
                     body = f"✅ {status_text}\nمحصول: {result['title']}\nمبلغ: {int(result['amount_minor']):,} {result['currency']}\nشناسه سفارش: {result['order_id']}\nتحویل توسط مدیر/پشتیبانی انجام می‌شود."
                 await self.api.send_text(chat_id, body, BACK_MENU)
             except CustomerStoreError as exc:
-                await self.api.send_text(chat_id, f"خرید انجام نشد: {exc}", BACK_MENU)
+                await self._send_purchase_error(chat_id, exc)
             return
         if key.startswith("category:"):
             selected = key.partition(":")[2]
@@ -4205,7 +4226,7 @@ class CustomerBot:
             except PurchaseNeedsReconciliation as exc:
                 await self.api.send_text(chat_id, f"سفارش برای جلوگیری از ساخت تکراری در وضعیت بررسی قرار گرفت. مبلغ رزرو شده است و باید نتیجه پنل بررسی شود.\n{exc}", BACK_MENU)
             except (CustomerStoreError, ValueError) as exc:
-                await self.api.send_text(chat_id, f"خرید انجام نشد: {exc}", BACK_MENU)
+                await self._send_purchase_error(chat_id, exc)
             return
         if key == "resellers":
             plans = [plan for plan in self.data.list_reseller_plans(enabled_only=True)

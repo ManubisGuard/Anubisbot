@@ -7,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+from manubisguard.customer_store import CustomerStoreError
 from manubisguard.telegram import customer_bot as customer_bot_module
 from manubisguard.telegram.customer_bot import (
     CUSTOMER_MENU,
@@ -2004,6 +2005,44 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback({"id":"quote-product-confirm","from":{"id":999},
             "message":{"chat":{"id":999,"type":"private"},"message_id":12},"data":callback})
         self.assertEqual(self.bot.purchase_service.buy_from_wallet.await_args.kwargs["expected_quote_hash"], quote_hash)
+
+    async def test_manual_purchase_insufficient_wallet_offers_deposit_recovery(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.put_manual_product(product_id="low-balance-manual", title="Paid item",
+            price_minor=1200, currency="IRR", delivery_mode="manual")
+        query = {"from":{"id":999},"message":{"chat":{"id":999,"type":"private"},"message_id":51}}
+        await self.bot._handle_callback({**query,"id":"manual-select-low","data":"customer:manualbuy:low-balance-manual"})
+        confirmation = self.bot.api.send_text.await_args.args[2]["inline_keyboard"][0][0]["callback_data"]
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({**query,"id":"manual-confirm-low","data":confirmation})
+        body, markup = self.bot.api.send_text.await_args.args[1:3]
+        callbacks = {button.get("callback_data") for row in markup["inline_keyboard"] for button in row}
+        self.assertIn("موجودی کیف پول", body)
+        self.assertIn("تأیید مدیر", body)
+        self.assertIn("customer:wallet:deposit", callbacks)
+        self.assertIn("customer:wallet", callbacks)
+        self.assertIn("customer:shop", callbacks)
+        self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 0)
+
+    async def test_panel_purchase_insufficient_wallet_offers_deposit_recovery(self):
+        self.bot.data.register_panel_connection(panel_id="low-balance-panel", label="Fake", provider="pasarguard",
+            base_url="https://panel.example", auth_mode="api_key", secret_ref="env:PANEL_KEY", enabled=True)
+        self.bot.data.put_product(product_id="lowbal-panel", title="Panel plan", price_minor=2500,
+            panel_id="low-balance-panel", traffic_bytes=1024**3, duration_hours=24, group_ids=["1"])
+        query = {"from":{"id":999},"message":{"chat":{"id":999,"type":"private"},"message_id":52}}
+        await self.bot._handle_callback({**query,"id":"panel-select-low","data":"customer:buy:lowbal-panel"})
+        confirmation = self.bot.api.send_text.await_args.args[2]["inline_keyboard"][0][0]["callback_data"]
+        self.bot.purchase_service.buy_from_wallet = AsyncMock(side_effect=CustomerStoreError("Insufficient wallet balance"))
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({**query,"id":"panel-confirm-low","data":confirmation})
+        body, markup = self.bot.api.send_text.await_args.args[1:3]
+        callbacks = {button.get("callback_data") for row in markup["inline_keyboard"] for button in row}
+        self.assertIn("موجودی کیف پول", body)
+        self.assertIn("تأیید مدیر", body)
+        self.assertIn("customer:wallet:deposit", callbacks)
+        self.assertIn("customer:wallet", callbacks)
+        self.assertIn("customer:shop", callbacks)
+        self.bot.purchase_service.buy_from_wallet.assert_awaited_once()
 
     async def test_legacy_panel_purchase_callback_without_quote_fails_closed(self):
         self.bot.purchase_service.buy_from_wallet = AsyncMock()

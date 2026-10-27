@@ -266,3 +266,27 @@ Continue the customer journey audit from the next actual gap, without redoing th
 2. Handle insufficient wallet balance with a clear recovery path to wallet/manual deposit, without implying that card-to-card receipt submission instantly credits funds.
 3. Review order status and paid-but-undelivered recovery screens for customer-facing clarity and safe retry.
 4. Only then change the relevant journey; add focused customer-flow regressions and run the full isolated suite for code changes. Do not run adapter tests as a standalone task unless a provider-related change creates a specific reason.
+
+## Phase 2 slice 2 — insufficient-wallet purchase recovery (2026-10-28)
+
+### Audit finding
+
+Catalog navigation is now compact, but both manual-product and panel-product purchase confirmation paths returned a generic failure/back-menu screen when the wallet was insufficient. This left the user without a direct route to the wallet or manual top-up flow.
+
+### Implemented
+
+- Added one shared customer-facing purchase-error renderer for wallet-balance failures, including metered plans whose setup charge would leave no positive balance.
+- On insufficient balance, the bot now explains in Persian that manual card-to-card top-up is not credited until an admin verifies it, and offers direct buttons for manual wallet top-up, wallet balance, and return to shop.
+- Reused the helper in manual product purchase and panel product/discounted purchase failure paths. Other errors preserve their existing back-menu behavior.
+- Added two focused regression tests covering manual and panel purchase recovery, checking the three navigation callbacks and confirming no wallet debit occurred in the manual case.
+
+### Validation
+
+- Focused customer bot UI suite: **143 tests passed in 27.535 seconds**, exit 0. Command: `PYTHONPATH=src:scripts/test_support python3 -m unittest discover -s tests -p 'test_customer_bot.py' -v`. An initial focused run exposed two fixture issues in the new tests (missing customer registration and an overlong product ID); fixtures were corrected and the full focused suite passed.
+- Full isolated suite: **506 tests passed in 66.650 seconds**, exit 0. Command: `./scripts/run_isolated_tests.sh`. This full-suite run naturally includes adapter tests; no adapter-only test cycle was started.
+- Static checks passed: `python3 -m compileall -q -f src tests scripts`; `bash -n scripts/*.sh`; `node --check customer_webapp/app.js`; `git diff --check`.
+- Evidence level remains E2 local unit/mock only. No live Telegram bot, live provider, production panel/database, N2, timer, deployment, restart, or secret was touched.
+
+### Next Phase 2 task
+
+Continue with **order-status and paid-but-undelivered recovery clarity**. Inspect the existing order history/status labels and recovery/reconciliation callbacks first; preserve idempotency and never blindly retry a provider mutation or automatically refund an ambiguous outcome. Do not revisit catalog navigation or rerun adapter tests separately.
