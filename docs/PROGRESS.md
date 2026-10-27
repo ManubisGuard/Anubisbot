@@ -90,6 +90,7 @@ Updated: 2026-10-28
 - Focused suite: **6 tests passed in 1.090 seconds**. Full isolated suite after all source/test changes: **495 tests passed in 66.465 seconds (OK, exit 0)**.
 - Static checks passed: `python3 -m compileall -q -f src tests scripts`, `bash -n scripts/*.sh`, `node --check customer_webapp/app.js`, and `git diff --check`.
 - Evidence level: `unit/mock + public-source`. No live Telegram message was sent as a test, and no production DB, live bot, panel, N2, timer or deployment was touched.
+- Published code/tests/rule/docs in commit [`f8626b4`](https://github.com/ManubisGuard/Anubisbot/commit/f8626b499345714ab8564a7a6a846db121c5f9b3), message `Add Telegram UI standards and receipt review flow`. The isolated workspace was fetched/reset to that exact remote commit and verified clean before this log-only follow-up.
 
 ## Current limits / do not overclaim
 
