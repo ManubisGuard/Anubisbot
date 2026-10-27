@@ -1,6 +1,6 @@
 # MANUBIS progress checkpoint
 
-Updated: 2026-10-27
+Updated: 2026-10-28
 
 ## Workspace and safety boundary
 
@@ -68,6 +68,29 @@ Updated: 2026-10-27
 - Focused product wizard/store suite: **9 tests passed in 1.613 seconds**. Final full isolated suite after these code changes: **489 tests passed in 64.807 seconds (OK, exit 0)**. Static checks passed: Python compileall, Bash syntax, Mini App JavaScript syntax, and `git diff --check`.
 - No production store, panel, N2, active bot process, timer, or deployment was touched.
 
+## Latest checkpoint — Telegram API standard and guided receipt review (2026-10-28)
+
+### Mandatory UI/API rule captured for future contributors
+
+- Added root-level `MANUBIS_CUSTOMER_STORE_MASTER_PROMPT.md` as the single master continuation prompt. `docs/PROGRESS.md` remains the single chronological evidence log; README links to both. Future AI must read the master prompt + progress log and verify real Git state before editing.
+- Checked the official Telegram Bot API documentation on 2026-10-28: it currently shows **Bot API 10.3**, dated 2026-08-24: https://core.telegram.org/bots/api
+- The official docs describe native button `style` values `primary` (blue), `success` (green), and `danger` (red) for supported button types. Use them semantically, verify client/button compatibility, and keep callback data within 1–64 bytes.
+- Native Telegram chat keyboards do not offer arbitrary CSS glass/blur/transparency. Glassmorphism is a Mini App/Web App CSS treatment only; it must include contrast and fallback behavior. Do not claim native chat buttons are glass. Check official docs again before each meaningful Telegram API/UI implementation and record the current version/date.
+- This checkpoint is documented from public official source evidence. It does not claim live Telegram client compatibility has been tested.
+
+### Guided manual receipt review UI
+
+- The admin finance menu now has a native-styled **review pending receipts** button. `/pending-deposits` opens the same paginated queue (eight receipts per page) rather than a text-only dump.
+- Receipt detail view shows the payment ID, customer, requested amount/currency, submitted transfer reference, payer label and creation time. It explicitly warns that receipt submission/reference matching is not proof of payment.
+- Detail buttons: view the Telegram receipt image (when present), initiate explicit independent-verification confirmation, reject with a required reason, or open payment audit events. Uses Bot API native `primary`, `success`, and `danger` styles and short SHA-256-derived callback tokens.
+- Confirmation re-checks that the receipt is still submitted and the manual payment is still pending before forwarding to the existing wallet verification flow. Wallet settlement remains guarded by the existing transactional/idempotent store contract. Replayed/stale callbacks fail closed.
+- Reject action asks for a 1–128 character reason, supports `/cancel`, expires after 15 minutes, and uses the existing atomic rejection path + durable customer notification outbox. Rejecting never credits the wallet.
+- Callback-token mapping is intentionally in memory. After a bot process restart, old receipt buttons fail closed; the admin can reopen/refresh the queue to mint current references. No partial receipt-rejection state is persisted.
+- Added six journey tests: finance-menu entry, queue/detail/token/style and image display, explicit confirmation and duplicate replay, rejection with reason, stale token/non-admin denial, and cancellation without state mutation.
+- Focused suite: **6 tests passed in 1.090 seconds**. Full isolated suite after all source/test changes: **495 tests passed in 66.465 seconds (OK, exit 0)**.
+- Static checks passed: `python3 -m compileall -q -f src tests scripts`, `bash -n scripts/*.sh`, `node --check customer_webapp/app.js`, and `git diff --check`.
+- Evidence level: `unit/mock + public-source`. No live Telegram message was sent as a test, and no production DB, live bot, panel, N2, timer or deployment was touched.
+
 ## Current limits / do not overclaim
 
 - The wizard state is in memory and is lost if the bot process restarts; it does not store partially completed forms. Registration does not prove credentials, API scopes, live connectivity, or compatibility with the installed provider version.
@@ -78,7 +101,7 @@ Updated: 2026-10-27
 
 ## Next steps in order
 
-1. Improve admin order/payment review navigation, especially pending card-to-card receipts, while preserving independent receipt verification, immutable wallet ledger, idempotency and redacted audit history.
-2. Review PasarGuard operation contracts one by one and add focused mock tests for missing/invalid config, permissions unknown, and ambiguous provider mutation outcomes.
+1. Review PasarGuard operation contracts one by one and add focused mock tests for missing/invalid config, permissions unknown, and ambiguous provider mutation outcomes. Keep the adapter capability matrix honest and provider mutations behind state reconciliation.
+2. Continue payment review polish only if a concrete gap is found: receipt image absence, old callback references, stale confirmation, rejection reason validation and audit event navigation are covered in this checkpoint.
 3. Live staging acceptance remains blocked until a disposable panel and explicit authorization are provided.
-4. After each independent implementation step: focused tests, full `./scripts/run_isolated_tests.sh`, static checks, reviewed-path-only staging, commit/push to `feature/discount-codes`. Never use `git add -A`; never restart services or deploy without explicit authorization.
+4. After each independent implementation step: focused tests, full `./scripts/run_isolated_tests.sh`, static checks, reviewed-path-only staging, publish to `feature/discount-codes`, synchronize and verify clean status. Never use `git add -A`; never restart services or deploy without explicit authorization.

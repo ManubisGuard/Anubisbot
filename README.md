@@ -1,5 +1,9 @@
 # MANUBIS Bot — Customer Product Core
 
+## AI continuation / source of truth
+
+Before continuing work, read [`MANUBIS_CUSTOMER_STORE_MASTER_PROMPT.md`](MANUBIS_CUSTOMER_STORE_MASTER_PROMPT.md) and then [`docs/PROGRESS.md`](docs/PROGRESS.md). The master prompt defines product scope, mandatory latest-Telegram-API/UI standards, operational safety rules and the handoff protocol. `docs/PROGRESS.md` is the single chronological log of verified stages. Always verify current Git branch/HEAD/status before editing; do not trust a previous chat as the source of truth.
+
 An independent project directory for the MANUBIS multi-panel bot platform. The pre-existing mother/factory bot is separately named **Anubis Bot Creatore** and is outside this project’s live operational scope; do not rename, restart or deploy it from this workspace. The existing reference checkout and `/root/fork/main.zip` are not modified by this project.
 
 ## Architecture
@@ -40,7 +44,7 @@ pytest
 
 - Mother-bot Telegram UI: `src/manubisguard/telegram/control_bot.py`. It is only for creating/listing/managing isolated customer bot instances. It must not contain panel connections, reseller plans, customer sales, or customer payments.
 - Customer-facing bot UI: `src/manubisguard/telegram/customer_bot.py`. Its menu owns the product areas: shop, customer services, panel connections, resellers, wallet/payments, trust channel, support and product settings.
-- Native Telegram button styles are sent through the Bot API `style` field: `primary`, `success`, and `danger`. These are Telegram-defined colors, not arbitrary CSS colors.
+- **Mandatory current Telegram API rule:** check the latest official [Bot API docs](https://core.telegram.org/bots/api) before each meaningful Telegram UI/API change and record the checked version/date in `docs/PROGRESS.md`. The docs reviewed on 2026-10-28 show Bot API 10.3 (2026-08-24), including native button `style` values `primary` (blue), `success` (green), and `danger` (red) for supported button types. Use styles semantically, verify compatibility, and keep callback data within 1–64 bytes. Native Telegram chat buttons do not expose arbitrary CSS glass/blur/transparency. Glassmorphism belongs in the Mini App/Web App CSS with contrast and fallback; never claim a native button has a glass effect it cannot render.
 - Static responsive mother-bot Mini App: `webapp/index.html`. It contains the bot-factory workflow only; it no longer exposes panel/reseller management as mother-bot pages.
 - The control-bot factory lifecycle is still a preview: persistent instance registry, automated customer-token provisioning and isolated start/stop/recovery management are incomplete. Both bot entrypoints now fail closed unless `MANUBISGUARD_TEST_MODE=1` is explicitly set; the local test runners set this flag deliberately. Customer panel adapters and wallet/manual-receipt flows exist in local code, but are not live-accepted; no automatic gateway/webhook payment integration is enabled.
 - The existing `@ManubisVPNBot` staging token belongs to the mother bot. Do not reuse it for the customer bot. The customer test runner requires a separate `.env.customer.test` and token.
@@ -99,7 +103,7 @@ Provider limitations, wallet/debt behavior, and operational boundaries are summa
 
 ## Verification status (2026-10-28)
 
-- Latest full isolated run after the guided panel-registration wizard, category management, and product creation: **489 tests passed (`OK`) in 64.807 seconds**. The new guided-product journey tests cover all four fulfillment types, confirmation before persistence, document-required file delivery, cancellation/expiry, admin authorization, duplicate-ID protection, and insert-only storage for manual and panel products.
+- Latest full isolated run after the guided panel-registration wizard, category management, product creation and the native-styled manual-receipt review journey: **495 tests passed (`OK`) in 66.465 seconds**. New journey coverage includes four product fulfillment types, confirmation before persistence, required file attachment, insert-only product storage, receipt queue/detail/image display, independent-verification confirmation, idempotent replay, rejection reason, cancellation, stale callbacks and admin authorization.
 - Static checks passed after the final source changes: `python3 -m compileall -q -f src tests scripts`, `bash -n scripts/*.sh`, `node --check customer_webapp/app.js`, and `git diff --check`.
 - The isolated runner creates temporary HOME/TMP/cache directories, clears inherited environment variables, blocks IPv4/IPv6 network connections, and enforces a 20-second per-test timeout by default.
 - The customer-bot admin panel menu has a paginated panel list, per-panel details, a read-only connection-check action, and confirmation-based enable/disable of local sales. Callback data uses short hashed panel references below Telegram's 64-byte limit; stale or ambiguous references fail closed. Migration v21 adds an append-only audit trail with actor, previous/new state, source, and idempotency key; stale confirmations are rejected.

@@ -214,6 +214,8 @@ class CustomerBot:
         self._pending_panel_registration: dict[int, dict[str, Any]] = {}
         self._pending_category_admin: dict[int, dict[str, Any]] = {}
         self._pending_product_admin: dict[int, dict[str, Any]] = {}
+        self._pending_receipt_reject: dict[int, dict[str, Any]] = {}
+        self._receipt_callback_refs: dict[str, str] = {}
         self.data = CustomerDataStore()
         self.registry = default_registry(secret_resolver=self._resolve_panel_secret)
         self.purchase_service = CustomerPurchaseService(self.data, secret_resolver=self._resolve_panel_secret, registry=self.registry)
@@ -520,6 +522,42 @@ class CustomerBot:
             self._pending_product_admin.pop(uid, None)
             await self.api.send_text(chat_id, "فرم محصول لغو شد؛ هیچ تغییری ذخیره نشد.", self._admin_product_keyboard())
             return
+        if is_admin and command == "/cancel" and uid in self._pending_receipt_reject:
+            self._pending_receipt_reject.pop(uid, None)
+            await self.api.send_text(chat_id, "رد رسید لغو شد؛ وضعیت پرداخت تغییر نکرد.", {"inline_keyboard": [[
+                {"text": "🧾 بازگشت به رسیدها", "callback_data": "admin:receipt-queue", "style": "primary"}]]})
+            return
+        receipt_reject_state = self._pending_receipt_reject.get(uid) if is_admin else None
+        if receipt_reject_state and text and not text.startswith("/"):
+            if time.time() - float(receipt_reject_state.get("started_at", 0)) > 15 * 60:
+                self._pending_receipt_reject.pop(uid, None)
+                await self.api.send_text(chat_id, "فرم رد رسید منقضی شد؛ پرداخت تغییر نکرد. دوباره از فهرست رسیدها شروع کن.",
+                    {"inline_keyboard": [[{"text": "🧾 فهرست رسیدها", "callback_data": "admin:receipt-queue", "style": "primary"}]]})
+                return
+            reason = text.strip()
+            if not reason or len(reason) > 128:
+                await self.api.send_text(chat_id, "دلیل رد باید بین ۱ تا ۱۲۸ نویسه باشد. برای لغو /cancel را بفرست.")
+                return
+            payment_id = str(receipt_reject_state.get("payment_id") or "")
+            try:
+                receipt = self.data.get_manual_deposit_receipt(payment_id)
+                if not receipt or receipt.get("status") != "submitted":
+                    raise CustomerStoreError("رسید دیگر در وضعیت انتظار بررسی نیست")
+                self.data.reject_manual_deposit_receipt(payment_id=payment_id, admin_id=uid, reason=reason)
+                self._pending_receipt_reject.pop(uid, None)
+                await self._deliver_customer_payment_notifications(limit=20)
+                notice = self.data.get_customer_payment_notification(payment_id, "rejected")
+                notice_state = str(notice.get("status") if notice else "missing")
+                notice_text = {"sent":"اعلان مشتری ارسال شد", "pending":"اعلان در صف تلاش مجدد است",
+                    "processing":"اعلان در حال ارسال است", "dead":"اعلان به سقف تلاش رسیده است"}.get(notice_state, "وضعیت اعلان نیازمند بررسی است")
+                await self.api.send_text(chat_id, f"رسید {payment_id} رد شد؛ هیچ مبلغی شارژ نشد. {notice_text}.",
+                    {"inline_keyboard": [[{"text": "🧾 فهرست رسیدهای منتظر", "callback_data": "admin:receipt-queue", "style": "primary"}],
+                                         [{"text": "⬅️ مدیریت مالی", "callback_data": "admin:finance"}]]})
+            except (ValueError, CustomerStoreError) as exc:
+                self._pending_receipt_reject.pop(uid, None)
+                await self.api.send_text(chat_id, f"رد رسید انجام نشد: {str(exc)[:180]}",
+                    {"inline_keyboard": [[{"text": "🧾 بازگشت به رسیدها", "callback_data": "admin:receipt-queue", "style": "primary"}]]})
+            return
         product_state = self._pending_product_admin.get(uid) if is_admin else None
         if product_state and product_state.get("step") == "file" and isinstance(message.get("document"), dict):
             await self._handle_product_admin_document(chat_id, uid, message)
@@ -627,14 +665,8 @@ class CustomerBot:
                 await self.api.send_text(chat_id, f"💳 اطلاعات واریز دستی\nبانک: {details['bank_name'] or '—'}\nشماره کارت: {details['card_number']}\nبه نام: {details['account_holder']}\n\nپس از واریز، با /deposit-receipt PAYMENT_ID | کدپیگیری رسید را ثبت کن. شارژ فقط پس از بررسی مدیر انجام می‌شود.", menu)
             return
         if is_admin and command == "/pending-deposits":
-            receipts = self.data.list_manual_deposit_receipts()
-            lines = ["🧾 رسیدهای کارت‌به‌کارت در انتظار بررسی:"]
-            for receipt in receipts:
-                lines.append(f"• {receipt['payment_id']} | کاربر {receipt['telegram_id']} | {receipt['amount_minor']:,} {receipt['currency']} | پیگیری {receipt['transfer_reference']} | واریزکننده {receipt['payer_name'] or '—'}")
-            lines.append("برای دیدن تصویر: /deposit-receipt-view PAYMENT_ID")
-            lines.append("برای تأیید: /wallet-verify PAYMENT_ID | مبلغ | ارز | کدپیگیری")
-            lines.append("برای رد: /wallet-reject PAYMENT_ID | دلیل")
-            await self.api.send_text(chat_id, "\n".join(lines), menu)
+            body, keyboard = self._admin_receipt_queue_screen()
+            await self.api.send_text(chat_id, body, keyboard)
             return
         if command == "/deposit-receipt":
             payload = text.partition(" ")[2].strip()
@@ -2163,6 +2195,84 @@ class CustomerBot:
             f"کد {code.strip().upper()} با تخفیف {percentage}٪ ذخیره شد. ورود کد در جریان خرید فعال است؛ هنگام تأیید، قیمت و سهمیه دوباره بررسی می‌شوند.",
             self._customer_menu())
 
+    def _receipt_callback_token(self, payment_id: str) -> str:
+        token = hashlib.sha256(f"{self.data.tenant_id}:{payment_id}".encode("utf-8")).hexdigest()[:12]
+        self._receipt_callback_refs[token] = payment_id
+        return token
+
+    def _receipt_for_callback(self, token: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        if not re.fullmatch(r"[a-f0-9]{12}", token):
+            return None
+        payment_id = self._receipt_callback_refs.get(token)
+        if not payment_id:
+            return None
+        receipt = self.data.get_manual_deposit_receipt(payment_id)
+        attempt = self.data.get_payment_attempt(payment_id)
+        if (not receipt or not attempt or receipt.get("status") != "submitted"
+                or attempt.get("provider") != "manual" or attempt.get("status") != "pending"
+                or str(receipt.get("transfer_reference") or "") == ""):
+            return None
+        return receipt, attempt
+
+    def _admin_receipt_queue_screen(self, page: int = 0) -> tuple[str, dict[str, Any]]:
+        receipts = self.data.list_manual_deposit_receipts()
+        page_size = 8
+        page_count = max(1, (len(receipts) + page_size - 1) // page_size)
+        page = max(0, min(page, page_count - 1))
+        selected = receipts[page * page_size:(page + 1) * page_size]
+        if not selected:
+            return ("🧾 رسیدهای کارت‌به‌کارت\n\nرسید منتظر بررسی وجود ندارد.",
+                    {"inline_keyboard": [
+                        [{"text": "🔄 تازه‌سازی", "callback_data": "admin:receipt-queue", "style": "primary"}],
+                        [{"text": "⬅️ مدیریت مالی", "callback_data": "admin:finance"}],
+                    ]})
+        lines = [f"🧾 رسیدهای کارت‌به‌کارت منتظر بررسی ({len(receipts)} مورد)", ""]
+        rows: list[list[dict[str, str]]] = []
+        for receipt in selected:
+            payment_id = str(receipt["payment_id"])
+            token = self._receipt_callback_token(payment_id)
+            amount = int(receipt["amount_minor"])
+            currency = str(receipt["currency"])
+            reference = str(receipt["transfer_reference"])
+            lines.append(f"• {payment_id} | کاربر {receipt['telegram_id']} | {amount:,} {currency} | پیگیری {reference}")
+            rows.append([{"text": f"🔎 {payment_id[:20]} · {amount:,} {currency}",
+                          "callback_data": f"admin:receipt-view:{token}", "style": "primary"}])
+        nav: list[dict[str, str]] = []
+        if page > 0:
+            nav.append({"text": "⬅️ قبلی", "callback_data": f"admin:receipt-queue:{page - 1}"})
+        if page + 1 < page_count:
+            nav.append({"text": "بعدی ➡️", "callback_data": f"admin:receipt-queue:{page + 1}"})
+        if nav:
+            rows.append(nav)
+        rows.extend([
+            [{"text": "🔄 تازه‌سازی", "callback_data": f"admin:receipt-queue:{page}", "style": "primary"}],
+            [{"text": "⬅️ مدیریت مالی", "callback_data": "admin:finance"}],
+        ])
+        return "\n".join(lines), {"inline_keyboard": rows}
+
+    def _admin_receipt_detail_screen(self, receipt: dict[str, Any], attempt: dict[str, Any], token: str) -> tuple[str, dict[str, Any]]:
+        amount = int(attempt.get("amount_minor") or 0)
+        currency = str(attempt.get("currency") or "")
+        body = (
+            f"🧾 بررسی رسید کارت‌به‌کارت\nشناسه پرداخت: {receipt['payment_id']}\n"
+            f"کاربر: {receipt['telegram_id']}\nمبلغ درخواستی: {amount:,} {currency}\n"
+            f"کدپیگیری ارسالی مشتری: {receipt['transfer_reference']}\n"
+            f"نام واریزکننده: {receipt.get('payer_name') or 'ثبت نشده'}\n"
+            f"زمان ثبت: {receipt.get('created_at') or 'نامشخص'}\n\n"
+            "رسید و تراکنش بانکی را مستقل بررسی کن. ثبت رسید یا تطبیق کدپیگیری به‌تنهایی اثبات پرداخت نیست؛ "
+            "موجودی فقط پس از تأیید صریح مدیر افزایش می‌یابد."
+        )
+        rows = []
+        if receipt.get("receipt_file_id"):
+            rows.append([{"text": "📷 مشاهده تصویر رسید", "callback_data": f"admin:receipt-image:{token}", "style": "primary"}])
+        rows.extend([
+            [{"text": "✅ پرداخت را مستقل بررسی کردم", "callback_data": f"admin:receipt-verify:{token}", "style": "success"}],
+            [{"text": "⛔ رد رسید", "callback_data": f"admin:receipt-reject:{token}", "style": "danger"}],
+            [{"text": "⬅️ فهرست رسیدها", "callback_data": "admin:receipt-queue"}],
+            [{"text": "📚 سابقه پرداخت", "callback_data": f"admin:receipt-events:{token}"}],
+        ])
+        return body, {"inline_keyboard": rows}
+
     def _admin_product_keyboard(self) -> dict[str, Any]:
         return {"inline_keyboard": [
             [{"text": "➕ ساخت محصول جدید", "callback_data": "admin:product-create"}],
@@ -3257,6 +3367,99 @@ class CustomerBot:
                 await self.api.send_text(chat_id, "این بخش فقط برای مدیر مجاز است.", BACK_MENU)
                 return
             section = data.split(":", 1)[1]
+            if section == "receipt-queue" or section.startswith("receipt-queue:"):
+                raw_page = section.partition(":")[2]
+                try:
+                    page = int(raw_page) if raw_page else 0
+                    if page < 0 or page > 1000:
+                        raise ValueError
+                except ValueError:
+                    await self.api.send_text(chat_id, "شماره صفحه رسید معتبر نیست؛ فهرست را دوباره باز کن.",
+                        {"inline_keyboard": [[{"text": "🧾 فهرست رسیدها", "callback_data": "admin:receipt-queue", "style": "primary"}]]})
+                    return
+                body, keyboard = self._admin_receipt_queue_screen(page)
+                await self.api.send_text(chat_id, body, keyboard)
+                return
+            if section.startswith("receipt-view:"):
+                token = section.partition(":")[2]
+                pair = self._receipt_for_callback(token)
+                if not pair:
+                    await self.api.send_text(chat_id, "این رسید دیگر منتظر بررسی نیست یا دکمه قدیمی است؛ فهرست را تازه کن.",
+                        {"inline_keyboard": [[{"text": "🔄 تازه‌سازی رسیدها", "callback_data": "admin:receipt-queue", "style": "primary"}]]})
+                    return
+                body, keyboard = self._admin_receipt_detail_screen(pair[0], pair[1], token)
+                await self.api.send_text(chat_id, body, keyboard)
+                return
+            if section.startswith("receipt-image:"):
+                token = section.partition(":")[2]
+                pair = self._receipt_for_callback(token)
+                if not pair:
+                    await self.api.send_text(chat_id, "رسید دیگر در انتظار بررسی نیست؛ فهرست را تازه کن.",
+                        {"inline_keyboard": [[{"text": "🧾 فهرست رسیدها", "callback_data": "admin:receipt-queue", "style": "primary"}]]})
+                    return
+                receipt, _attempt = pair
+                if not receipt.get("receipt_file_id"):
+                    await self.api.send_text(chat_id, "مشتری تصویر رسیدی ارسال نکرده است.",
+                        {"inline_keyboard": [[{"text": "⬅️ جزئیات رسید", "callback_data": f"admin:receipt-view:{token}"}]]})
+                    return
+                await self.api.call("sendPhoto", {"chat_id": chat_id, "photo": receipt["receipt_file_id"],
+                    "caption": f"رسید پرداخت {receipt['payment_id']} | کاربر {receipt['telegram_id']} | پیگیری {receipt['transfer_reference']}"})
+                return
+            if section.startswith("receipt-verify:"):
+                token = section.partition(":")[2]
+                pair = self._receipt_for_callback(token)
+                if not pair:
+                    await self.api.send_text(chat_id, "رسید دیگر در انتظار بررسی نیست؛ هیچ مبلغی شارژ نشد.",
+                        {"inline_keyboard": [[{"text": "🧾 فهرست رسیدها", "callback_data": "admin:receipt-queue", "style": "primary"}]]})
+                    return
+                receipt, attempt = pair
+                await self.api.send_text(chat_id,
+                    f"⚠️ تأیید نهایی شارژ\nپرداخت: {receipt['payment_id']}\nکاربر: {receipt['telegram_id']}\n"
+                    f"مبلغ: {int(attempt['amount_minor']):,} {attempt['currency']}\n"
+                    f"کدپیگیری ثبت‌شده: {receipt['transfer_reference']}\n\n"
+                    "فقط اگر تراکنش را مستقل در حساب بانکی/رسید بانکی بررسی کرده‌ای تأیید کن. "
+                    "این کار کیف پول را شارژ می‌کند و در دفترکل و رویدادهای پرداخت ثبت می‌شود.",
+                    {"inline_keyboard": [
+                        [{"text": "✅ تأیید مستقل و شارژ کیف پول", "callback_data": f"admin:receipt-verify-confirm:{token}", "style": "success"}],
+                        [{"text": "↩️ بازگشت به جزئیات", "callback_data": f"admin:receipt-view:{token}"}],
+                        [{"text": "لغو", "callback_data": "admin:receipt-queue", "style": "danger"}],
+                    ]})
+                return
+            if section.startswith("receipt-verify-confirm:"):
+                token = section.partition(":")[2]
+                pair = self._receipt_for_callback(token)
+                if not pair:
+                    await self.api.send_text(chat_id, "رسید تغییر کرده یا قبلاً پردازش شده است؛ شارژ تکراری انجام نشد.",
+                        {"inline_keyboard": [[{"text": "🧾 فهرست رسیدها", "callback_data": "admin:receipt-queue", "style": "primary"}]]})
+                    return
+                receipt, attempt = pair
+                command_text = (f"/wallet-verify {receipt['payment_id']} | {int(attempt['amount_minor'])} | "
+                                f"{attempt['currency']} | {receipt['transfer_reference']}")
+                await self._admin_wallet_verify(chat_id, command_text, uid)
+                return
+            if section.startswith("receipt-reject:"):
+                token = section.partition(":")[2]
+                pair = self._receipt_for_callback(token)
+                if not pair:
+                    await self.api.send_text(chat_id, "رسید دیگر در انتظار بررسی نیست؛ وضعیت پرداخت تغییر نکرد.",
+                        {"inline_keyboard": [[{"text": "🧾 فهرست رسیدها", "callback_data": "admin:receipt-queue", "style": "primary"}]]})
+                    return
+                receipt, attempt = pair
+                self._pending_receipt_reject[uid] = {
+                    "payment_id": str(receipt["payment_id"]), "started_at": time.time(),
+                }
+                await self.api.send_text(chat_id,
+                    f"⛔ رد رسید {receipt['payment_id']}\nمبلغ درخواستی: {int(attempt['amount_minor']):,} {attempt['currency']}\n"
+                    "دلیل رد را بفرست (حداکثر ۱۲۸ نویسه). این اقدام پرداخت را ناموفق می‌کند و کیف پول را شارژ نمی‌کند. برای لغو /cancel را بفرست.")
+                return
+            if section.startswith("receipt-events:"):
+                token = section.partition(":")[2]
+                pair = self._receipt_for_callback(token)
+                if not pair:
+                    await self.api.send_text(chat_id, "رسید دیگر در انتظار بررسی نیست؛ برای سابقه پرداخت از /payment-events PAYMENT_ID استفاده کن.", ADMIN_MENU)
+                    return
+                await self._admin_payment_events(chat_id, f"/payment-events {pair[0]['payment_id']}")
+                return
             if section == "home":
                 admin_keyboard = {"inline_keyboard": list(ADMIN_MENU["inline_keyboard"]) + [
                     [{"text": "🎛 حالت کیبورد منوی اصلی", "callback_data": "admin:keyboard-settings"}]
@@ -3617,6 +3820,13 @@ class CustomerBot:
                 body = "🎫 تیکت‌های پشتیبانی\n/tickets\n/reply TICKET_ID | پاسخ\n\nمسیر ارسال اعلان تیکت: /notify-route add support_ticket | CHAT_ID | TOPIC_ID\nفهرست مسیرها: /notify-route list"
             else:
                 body = "⚙️ تنظیمات ربات\nتنظیمات محرمانه فقط از محیط سرور مدیریت می‌شوند. کلیدها در تلگرام نمایش داده نمی‌شوند."
+            if section == "finance":
+                finance_keyboard = {"inline_keyboard": [
+                    [{"text": "🧾 بررسی رسیدهای منتظر", "callback_data": "admin:receipt-queue", "style": "primary"}],
+                    [{"text": "⬅️ بازگشت به پنل مدیریت", "callback_data": "admin:home"}],
+                ]}
+                await self.api.send_text(chat_id, body, finance_keyboard)
+                return
             await self.api.send_text(chat_id, body, ADMIN_MENU)
             return
         if data.startswith("content:edit:"):

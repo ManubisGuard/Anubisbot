@@ -2764,3 +2764,151 @@ class GuidedProductAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["price_minor"], 900)
         self.assertEqual(self.bot._pending_product_admin[self.ADMIN_ID]["step"], "id")
         self.assertIn("شناسه در کاتالوگ استفاده شده", self.bot.api.send_text.await_args.args[1])
+
+
+class AdminReceiptReviewJourneyTests(unittest.IsolatedAsyncioTestCase):
+    ADMIN_ID = 6883349141
+    CUSTOMER_ID = 999
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._env = patch.dict(os.environ, {
+            "ANUBIS_CUSTOMER_DB": str(Path(self.tmp.name) / "customer.sqlite3"),
+            "ANUBIS_CONTENT_DB": str(Path(self.tmp.name) / "content.sqlite3"),
+        })
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.addCleanup(self.tmp.cleanup)
+        self.bot = CustomerBot(CustomerBotConfig(token="dummy-customer-token",
+            admin_ids=frozenset({self.ADMIN_ID})))
+        self.bot.api.send_text = AsyncMock()
+        self.bot.api.answer_callback = AsyncMock()
+        self.bot.api.call = AsyncMock()
+
+    async def _callback(self, data: str, uid: int | None = None):
+        user_id = uid if uid is not None else self.ADMIN_ID
+        await self.bot._handle_callback({
+            "id": "receipt-review-" + str(time.time_ns()),
+            "from": {"id": user_id},
+            "message": {"message_id": 51, "chat": {"id": user_id, "type": "private"}},
+            "data": data,
+        })
+
+    async def _message(self, text: str, uid: int | None = None):
+        user_id = uid if uid is not None else self.ADMIN_ID
+        await self.bot._handle_message({
+            "message_id": 52,
+            "from": {"id": user_id, "first_name": "Admin"},
+            "chat": {"id": user_id, "type": "private"},
+            "text": text,
+        })
+
+    def _receipt(self, payment_id: str, *, amount: int = 2500, file_id: str = ""):
+        self.bot.data.ensure_customer(self.CUSTOMER_ID, first_name="Buyer")
+        self.bot.data.create_payment_attempt(
+            payment_id=payment_id, telegram_id=self.CUSTOMER_ID, provider="manual",
+            amount_minor=amount, currency="IRR", idempotency_key=f"intent:{payment_id}")
+        self.bot.data.submit_manual_deposit_receipt(
+            payment_id=payment_id, telegram_id=self.CUSTOMER_ID,
+            transfer_reference=f"bank-ref-{payment_id}", receipt_file_id=file_id)
+
+    async def test_finance_menu_exposes_native_styled_receipt_queue_button(self):
+        await self._callback("admin:finance")
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        self.assertIn("مدیریت مالی", body)
+        button = next(button for row in keyboard["inline_keyboard"] for button in row
+                      if button["callback_data"] == "admin:receipt-queue")
+        self.assertEqual(button["style"], "primary")
+
+    async def test_receipt_queue_detail_and_image_buttons_are_native_styled_and_tokenized(self):
+        self._receipt("pay-ui-detail", file_id="telegram-receipt-file")
+        await self._callback("admin:receipt-queue")
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        self.assertIn("pay-ui-detail", body)
+        buttons = [button for row in keyboard["inline_keyboard"] for button in row]
+        view = next(button for button in buttons if button["callback_data"].startswith("admin:receipt-view:"))
+        self.assertEqual(view["style"], "primary")
+        self.assertLessEqual(len(view["callback_data"].encode()), 64)
+
+        await self._callback(view["callback_data"])
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        self.assertIn("کدپیگیری ارسالی مشتری", body)
+        buttons = [button for row in keyboard["inline_keyboard"] for button in row]
+        self.assertEqual(next(b for b in buttons if b["callback_data"].startswith("admin:receipt-image:"))["style"], "primary")
+        self.assertEqual(next(b for b in buttons if b["callback_data"].startswith("admin:receipt-verify:"))["style"], "success")
+        self.assertEqual(next(b for b in buttons if b["callback_data"].startswith("admin:receipt-reject:"))["style"], "danger")
+
+        image_button = next(b for b in buttons if b["callback_data"].startswith("admin:receipt-image:"))
+        await self._callback(image_button["callback_data"])
+        self.bot.api.call.assert_awaited_with("sendPhoto", {
+            "chat_id": self.ADMIN_ID, "photo": "telegram-receipt-file",
+            "caption": "رسید پرداخت pay-ui-detail | کاربر 999 | پیگیری bank-ref-pay-ui-detail"})
+
+    async def test_explicit_independent_verification_confirms_once_and_replay_fails_closed(self):
+        self._receipt("pay-ui-verify", amount=2600)
+        await self._callback("admin:receipt-queue")
+        keyboard = self.bot.api.send_text.await_args.args[2]
+        view_data = next(b["callback_data"] for row in keyboard["inline_keyboard"] for b in row
+                         if b["callback_data"].startswith("admin:receipt-view:"))
+        token = view_data.rsplit(":", 1)[1]
+        await self._callback(f"admin:receipt-verify:{token}")
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        self.assertIn("فقط اگر تراکنش را مستقل", body)
+        confirm = next(b["callback_data"] for row in keyboard["inline_keyboard"] for b in row
+                       if b["callback_data"].startswith("admin:receipt-verify-confirm:"))
+        await self._callback(confirm)
+        self.assertEqual(self.bot.data.wallet_balance(self.CUSTOMER_ID), 2600)
+        self.assertEqual(self.bot.data.get_payment_attempt("pay-ui-verify")["status"], "verified")
+        events = self.bot.data.list_payment_attempt_events("pay-ui-verify")
+        self.assertEqual([event["event_type"] for event in events], ["created", "verified"])
+
+        self.bot.api.send_text.reset_mock()
+        await self._callback(confirm)
+        self.assertEqual(self.bot.data.wallet_balance(self.CUSTOMER_ID), 2600)
+        self.assertIn("قبلاً پردازش", self.bot.api.send_text.await_args.args[1])
+
+    async def test_reject_button_requires_reason_and_never_credits_wallet(self):
+        self._receipt("pay-ui-reject", amount=1700)
+        await self._callback("admin:receipt-queue")
+        keyboard = self.bot.api.send_text.await_args.args[2]
+        view_data = next(b["callback_data"] for row in keyboard["inline_keyboard"] for b in row
+                         if b["callback_data"].startswith("admin:receipt-view:"))
+        await self._callback(view_data)
+        keyboard = self.bot.api.send_text.await_args.args[2]
+        reject = next(b["callback_data"] for row in keyboard["inline_keyboard"] for b in row
+                      if b["callback_data"].startswith("admin:receipt-reject:"))
+        await self._callback(reject)
+        self.assertIn(self.ADMIN_ID, self.bot._pending_receipt_reject)
+        await self._message("تصویر با تراکنش بانکی مطابقت ندارد")
+        self.assertNotIn(self.ADMIN_ID, self.bot._pending_receipt_reject)
+        self.assertEqual(self.bot.data.wallet_balance(self.CUSTOMER_ID), 0)
+        self.assertEqual(self.bot.data.get_payment_attempt("pay-ui-reject")["status"], "failed")
+        self.assertEqual(self.bot.data.get_manual_deposit_receipt("pay-ui-reject")["status"], "rejected")
+
+    async def test_stale_token_and_non_admin_cannot_approve_receipt(self):
+        self._receipt("pay-ui-stale")
+        await self._callback("admin:receipt-queue")
+        keyboard = self.bot.api.send_text.await_args.args[2]
+        view_data = next(b["callback_data"] for row in keyboard["inline_keyboard"] for b in row
+                         if b["callback_data"].startswith("admin:receipt-view:"))
+        await self._callback(view_data, uid=self.CUSTOMER_ID)
+        self.assertEqual(self.bot.data.wallet_balance(self.CUSTOMER_ID), 0)
+        await self._callback("admin:receipt-view:000000000000")
+        self.assertIn("قدیمی", self.bot.api.send_text.await_args.args[1])
+        self.assertEqual(self.bot.data.wallet_balance(self.CUSTOMER_ID), 0)
+
+    async def test_reject_reason_flow_can_cancel_without_mutating_payment(self):
+        self._receipt("pay-ui-cancel")
+        await self._callback("admin:receipt-queue")
+        keyboard = self.bot.api.send_text.await_args.args[2]
+        view_data = next(b["callback_data"] for row in keyboard["inline_keyboard"] for b in row
+                         if b["callback_data"].startswith("admin:receipt-view:"))
+        await self._callback(view_data)
+        keyboard = self.bot.api.send_text.await_args.args[2]
+        reject = next(b["callback_data"] for row in keyboard["inline_keyboard"] for b in row
+                      if b["callback_data"].startswith("admin:receipt-reject:"))
+        await self._callback(reject)
+        await self._message("/cancel")
+        self.assertEqual(self.bot.data.get_payment_attempt("pay-ui-cancel")["status"], "pending")
+        self.assertEqual(self.bot.data.get_manual_deposit_receipt("pay-ui-cancel")["status"], "submitted")
+        self.assertEqual(self.bot.data.wallet_balance(self.CUSTOMER_ID), 0)
