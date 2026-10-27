@@ -211,6 +211,7 @@ class CustomerBot:
         self._pending_content: dict[int, str] = {}
         self._pending_support: set[int] = set()
         self._pending_purchase_discount: dict[int, dict[str, str]] = {}
+        self._pending_panel_registration: dict[int, dict[str, Any]] = {}
         self.data = CustomerDataStore()
         self.registry = default_registry(secret_resolver=self._resolve_panel_secret)
         self.purchase_service = CustomerPurchaseService(self.data, secret_resolver=self._resolve_panel_secret, registry=self.registry)
@@ -505,6 +506,13 @@ class CustomerBot:
                 return
         text = (message.get("text") or message.get("caption") or "").strip()
         command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
+        if is_admin and command == "/cancel" and uid in self._pending_panel_registration:
+            self._pending_panel_registration.pop(uid, None)
+            await self.api.send_text(chat_id, "راه‌اندازی پنل لغو شد؛ هیچ تنظیمی ذخیره نشد.", ADMIN_MENU)
+            return
+        if is_admin and uid in self._pending_panel_registration and text and not text.startswith("/"):
+            await self._handle_panel_registration_message(chat_id, uid, text)
+            return
         deposit_info_payload = text.partition(" ")[2].strip().lower() if command == "/deposit-info" else ""
         admin_command_attempt = command in ADMIN_ONLY_COMMANDS or (
             command == "/deposit-info" and deposit_info_payload.startswith("set "))
@@ -1715,6 +1723,164 @@ class CustomerBot:
         ]}
         return "\n".join(lines), keyboard
 
+    async def _start_panel_registration(self, chat_id: int, uid: int, provider: str, auth_mode: str) -> None:
+        self._pending_panel_registration[uid] = {
+            "provider": provider, "auth_mode": auth_mode, "step": "panel_id",
+            "started_at": time.time(),
+        }
+        await self.api.send_text(
+            chat_id,
+            f"راه‌اندازی پنل جدید · مرحله ۱ از ۵\nنوع: {provider} · احراز هویت: {auth_mode}\n\n"
+            "یک شناسه داخلی وارد کن؛ فقط حروف انگلیسی، عدد، نقطه، خط تیره یا زیرخط، حداکثر ۶۴ نویسه.\n"
+            "این شناسه در MANUBIS استفاده می‌شود و نام کاربری پنل نیست.\n\nبرای لغو: /cancel",
+            {"inline_keyboard": [[{"text": "لغو راه‌اندازی", "callback_data": "admin:cancel_panel_wizard"}],
+                                 [{"text": "⬅️ بازگشت به مدیریت پنل‌ها", "callback_data": "admin:panels"}]]},
+        )
+
+    def _panel_registration_enabled_keyboard(self) -> dict[str, Any]:
+        return {"inline_keyboard": [
+            [{"text": "🟢 ثبت با فروش فعال", "callback_data": "admin:panel-wizard-enabled:on"}],
+            [{"text": "⚫ ثبت با فروش غیرفعال", "callback_data": "admin:panel-wizard-enabled:off"}],
+            [{"text": "لغو راه‌اندازی", "callback_data": "admin:cancel_panel_wizard"}],
+        ]}
+
+    async def _finish_panel_registration(self, chat_id: int, uid: int, enabled: bool) -> None:
+        state = self._pending_panel_registration.get(uid)
+        if (not state or state.get("step") != "enabled"
+                or time.time() - float(state.get("started_at", 0)) > 900):
+            self._pending_panel_registration.pop(uid, None)
+            await self.api.send_text(chat_id, "فرم راه‌اندازی منقضی یا نامعتبر است؛ هیچ تغییری ذخیره نشد. از مدیریت پنل‌ها دوباره شروع کن.", ADMIN_MENU)
+            return
+        if self.data.get_panel_connection(state["panel_id"]):
+            self._pending_panel_registration.pop(uid, None)
+            await self.api.send_text(
+                chat_id,
+                "این شناسه از قبل ثبت شده است؛ برای جلوگیری از جایگزینی ناخواسته، تنظیمات جدید ذخیره نشد. "
+                "اگر قصد ویرایش داری از فرمان مدیریتی /panel add با همان شناسه استفاده کن.",
+                ADMIN_MENU,
+            )
+            return
+        try:
+            self.data.register_panel_connection(
+                panel_id=state["panel_id"], label=state["label"], provider=state["provider"],
+                base_url=state["base_url"], auth_mode=state["auth_mode"],
+                secret_ref=state["secret_ref"], enabled=enabled, metadata=state.get("metadata", {}),
+            )
+        except (CustomerStoreError, ValueError) as exc:
+            await self.api.send_text(chat_id, f"پنل ذخیره نشد: {exc}\nفرم لغو شد؛ دوباره از مدیریت پنل‌ها شروع کن.", ADMIN_MENU)
+            self._pending_panel_registration.pop(uid, None)
+            return
+        panel_id = state["panel_id"]
+        self._pending_panel_registration.pop(uid, None)
+        await self.api.send_text(
+            chat_id,
+            f"✅ تنظیمات پنل «{state['label']}» ذخیره شد.\nشناسه: {panel_id}\n"
+            f"فروش محلی: {'فعال' if enabled else 'غیرفعال'}\n"
+            "اتصال زنده و مجوزهای API هنوز تأیید نشده‌اند. برای بررسی فقط‌خواندنی، پنل را از فهرست انتخاب کن. "
+            "هیچ تغییری در پنل ارائه‌دهنده انجام نشده است.",
+            {"inline_keyboard": [
+                [{"text": "🔎 رفتن به فهرست پنل‌ها", "callback_data": "admin:list_panels"}],
+                [{"text": "➕ افزودن پنل دیگر", "callback_data": "admin:add_panel"}],
+                [{"text": "⬅️ پنل مدیریت", "callback_data": "admin:panels"}],
+            ]},
+        )
+
+    async def _handle_panel_registration_message(self, chat_id: int, uid: int, text: str) -> None:
+        state = self._pending_panel_registration.get(uid)
+        if not state:
+            return
+        if time.time() - float(state.get("started_at", 0)) > 900:
+            self._pending_panel_registration.pop(uid, None)
+            await self.api.send_text(chat_id, "فرم راه‌اندازی پس از ۱۵ دقیقه منقضی شد؛ هیچ تنظیمی ذخیره نشد. دوباره از مدیریت پنل‌ها شروع کن.", ADMIN_MENU)
+            return
+        step = state.get("step")
+        value = text.strip()
+        if step == "panel_id":
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", value):
+                await self.api.send_text(chat_id, "شناسه معتبر نیست. ۱ تا ۶۴ نویسه از حروف انگلیسی، عدد، نقطه، خط تیره یا زیرخط وارد کن.")
+                return
+            state["panel_id"] = value
+            state["step"] = "label"
+            await self.api.send_text(chat_id, "مرحله ۲ از ۵\nنام نمایشی پنل را وارد کن (۱ تا ۸۰ نویسه).")
+            return
+        if step == "label":
+            if not value or len(value) > 80 or any(ord(ch) < 32 for ch in value):
+                await self.api.send_text(chat_id, "نام نمایشی باید بین ۱ تا ۸۰ نویسه و بدون نویسه کنترلی باشد.")
+                return
+            state["label"] = value
+            state["step"] = "base_url"
+            await self.api.send_text(chat_id, "مرحله ۳ از ۵\nآدرس HTTPS پنل را وارد کن. رمز یا توکن را داخل URL قرار نده.")
+            return
+        if step == "base_url":
+            try:
+                parsed = urlsplit(value)
+                valid = (parsed.scheme.lower() == "https" and bool(parsed.hostname)
+                         and not parsed.username and not parsed.password
+                         and not parsed.query and not parsed.fragment)
+                _ = parsed.port
+            except ValueError:
+                valid = False
+            if not valid or len(value) > 2048 or any(ord(ch) < 32 for ch in value):
+                await self.api.send_text(chat_id, "آدرس معتبر نیست. یک URL از نوع HTTPS بدون نام‌کاربری، رمز، query یا fragment وارد کن.")
+                return
+            state["base_url"] = value.rstrip("/")
+            state["step"] = "secret_ref"
+            await self.api.send_text(
+                chat_id,
+                "مرحله ۴ از ۵\nمرجع متغیر محیطیِ اعتبارنامه را وارد کن، دقیقاً با قالب env:VARIABLE_NAME.\n"
+                "خود API Key، توکن، نام‌کاربری یا رمز را در تلگرام نفرست. متغیر باید از قبل به‌صورت امن در محیط اجرای ربات تنظیم شده باشد.",
+            )
+            return
+        if step == "secret_ref":
+            if not re.fullmatch(r"env:[A-Z][A-Z0-9_]{1,127}", value):
+                await self.api.send_text(chat_id, "مرجع پذیرفته نشد. فقط قالب env:VARIABLE_NAME با نام متغیر بزرگ انگلیسی مجاز است؛ مقدار محرمانه را ارسال نکن.")
+                return
+            state["secret_ref"] = value
+            state["metadata"] = {}
+            if state["provider"] == "sanaei":
+                state["step"] = "subscription_origin"
+                await self.api.send_text(
+                    chat_id,
+                    "مرحله ۵ از ۵ · تنظیم اختیاری لینک اشتراک Sanaei\n"
+                    "اگر Subscription Server جداگانه داری، فقط origin آن را وارد کن؛ مثل https://sub.example:2096\n"
+                    "اگر فعلاً لینک اشتراک لازم نیست، عبارت «رد کردن» را بفرست. این آدرس باید HTTPS و بدون مسیر باشد.",
+                )
+            else:
+                state["step"] = "enabled"
+                await self.api.send_text(chat_id, "تنظیمات آماده است. وضعیت فروش محلی را انتخاب کن:", self._panel_registration_enabled_keyboard())
+            return
+        if step == "subscription_origin":
+            if value.lower() in {"رد کردن", "skip"}:
+                state["metadata"] = {}
+                state["step"] = "enabled"
+                await self.api.send_text(chat_id, "لینک اشتراک Sanaei فعلاً پیکربندی نمی‌شود. وضعیت فروش محلی را انتخاب کن:", self._panel_registration_enabled_keyboard())
+                return
+            try:
+                parsed = urlsplit(value)
+                valid = (parsed.scheme.lower() == "https" and bool(parsed.hostname)
+                         and not parsed.username and not parsed.password
+                         and parsed.path in ("", "/") and not parsed.query and not parsed.fragment)
+                _ = parsed.port
+            except ValueError:
+                valid = False
+            if not valid or len(value) > 2048 or any(ord(ch) < 32 for ch in value):
+                await self.api.send_text(chat_id, "Origin معتبر نیست. فقط HTTPS origin بدون مسیر، اعتبارنامه، query یا fragment وارد کن؛ یا «رد کردن» را بفرست.")
+                return
+            state["metadata"]["subscription_base_url"] = value.rstrip("/")
+            state["step"] = "subscription_path"
+            await self.api.send_text(chat_id, "مسیر اشتراک را به‌صورت یک بخش وارد کن، مثلاً sub. مسیر کامل یا / ابتدایی وارد نکن.")
+            return
+        if step == "subscription_path":
+            path = value.strip("/")
+            if not re.fullmatch(r"[A-Za-z0-9._~-]{1,128}", path) or path in {".", ".."} or "/" in path:
+                await self.api.send_text(chat_id, "مسیر معتبر نیست. یک بخش ساده مانند sub وارد کن؛ از فاصله و چندبخشی‌کردن مسیر خودداری کن.")
+                return
+            state["metadata"]["subscription_path"] = path
+            state["step"] = "enabled"
+            await self.api.send_text(chat_id, "تنظیمات آماده است. وضعیت فروش محلی را انتخاب کن:", self._panel_registration_enabled_keyboard())
+            return
+        await self.api.send_text(chat_id, "مرحله فرم شناخته نشد؛ راه‌اندازی را لغو کن و دوباره شروع کن.", self._panel_registration_enabled_keyboard())
+
     async def _admin_panel_command(self, chat_id: int, text: str) -> None:
         # /panel add ID | label | provider | https://url | auth_mode | env:VARIABLE | enabled | metadata_json
         payload = text.partition(" ")[2].strip()
@@ -2697,14 +2863,39 @@ class CustomerBot:
                 provider = section.split(":",1)[1]
                 if provider not in {"pasarguard","rebecca","sanaei"}:
                     await self.api.send_text(chat_id,"نوع پنل معتبر نیست.",ADMIN_MENU); return
-                await self.api.send_text(chat_id, f"پنل {provider} انتخاب شد. روش احراز هویت را انتخاب کن:", {"inline_keyboard":[
-                    [{"text":"🔑 API Key / Token","callback_data":f"admin:auth:{provider}:api_key"}],
-                    [{"text":"👤 نام کاربری و رمز عبور","callback_data":f"admin:auth:{provider}:username_password"}],
-                    [{"text":"⬅️ بازگشت","callback_data":"admin:add_panel"}]]})
+                auth_modes = {
+                    "pasarguard": [("api_key", "🔑 API Key"), ("username_password", "👤 نام کاربری و رمز")],
+                    "rebecca": [("api_key", "🔑 API Key")],
+                    "sanaei": [("access_token", "🔐 Access Token"), ("username_password", "👤 نام کاربری و رمز")],
+                }[provider]
+                buttons = [[{"text": label, "callback_data": f"admin:auth:{provider}:{mode}"}]
+                           for mode, label in auth_modes]
+                buttons.append([{"text":"⬅️ بازگشت","callback_data":"admin:add_panel"}])
+                await self.api.send_text(chat_id, f"پنل {provider} انتخاب شد. روش احراز هویت سازگار را انتخاب کن:", {"inline_keyboard": buttons})
                 return
             elif section.startswith("auth:"):
                 _, provider, auth_mode = section.split(":",2)
-                await self.api.send_text(chat_id, f"روش انتخاب‌شده: {provider} / {auth_mode}\n\nاطلاعات پنل را با این قالب ثبت کن؛ مقدار محرمانه را در تلگرام ننویس و فقط مرجع متغیر محیطی بده:\n/panel add ID | نام | {provider} | https://panel.example | {auth_mode} | env:SECRET_VARIABLE | on | {{}}\n\nبرای روش نام کاربری/رمز عبور، secret variable باید به‌صورت امن در محیط سرور تنظیم شود.", ADMIN_MENU)
+                supported = {
+                    "pasarguard": {"api_key", "username_password"},
+                    "rebecca": {"api_key"},
+                    "sanaei": {"access_token", "username_password"},
+                }
+                if provider not in supported or auth_mode not in supported[provider]:
+                    await self.api.send_text(chat_id, "روش احراز هویت برای این پنل پشتیبانی نمی‌شود؛ نوع پنل را دوباره انتخاب کن.", ADMIN_MENU)
+                    return
+                await self._start_panel_registration(chat_id, uid, provider, auth_mode)
+                return
+            elif section == "cancel_panel_wizard":
+                self._pending_panel_registration.pop(uid, None)
+                await self.api.send_text(chat_id, "راه‌اندازی پنل لغو شد؛ هیچ تنظیمی ذخیره نشد.", ADMIN_MENU)
+                return
+            elif section.startswith("panel-wizard-enabled:"):
+                target = section.rsplit(":", 1)[-1]
+                state = self._pending_panel_registration.get(uid)
+                if target not in {"on", "off"} or not state or state.get("step") != "enabled":
+                    await self.api.send_text(chat_id, "این انتخاب قدیمی یا نامعتبر است؛ فرم را دوباره شروع کن.", ADMIN_MENU)
+                    return
+                await self._finish_panel_registration(chat_id, uid, enabled=(target == "on"))
                 return
             elif section == "list_panels":
                 body, keyboard = self._admin_panel_list_screen(0)

@@ -1331,6 +1331,135 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ربات فروش و خدمات",args[1]["caption"])
         self.assertIn("keyboard",args[1]["reply_markup"])
 
+    async def test_panel_registration_wizard_validates_and_saves_only_secret_reference(self):
+        uid = 6883349141
+        query = {"id": "wizard-add", "from": {"id": uid},
+                 "message": {"message_id": 49, "chat": {"id": uid, "type": "private"}},
+                 "data": "admin:add_panel"}
+        await self.bot._handle_callback(query)
+        query.update({"id": "wizard-provider", "data": "admin:provider:pasarguard"})
+        await self.bot._handle_callback(query)
+        auth_keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        auth_callbacks = {button.get("callback_data") for row in auth_keyboard for button in row}
+        self.assertIn("admin:auth:pasarguard:api_key", auth_callbacks)
+        self.assertIn("admin:auth:pasarguard:username_password", auth_callbacks)
+
+        self.bot.api.send_text.reset_mock()
+        query.update({"id": "wizard-auth", "data": "admin:auth:pasarguard:api_key"})
+        await self.bot._handle_callback(query)
+        self.assertEqual(self.bot._pending_panel_registration[uid]["step"], "panel_id")
+
+        async def message(text):
+            await self.bot._handle_message({"from": {"id": uid}, "chat": {"id": uid, "type": "private"}, "text": text})
+
+        await message("wizard-panel")
+        await message("Wizard panel")
+        await message("http://panel.example")
+        self.assertEqual(self.bot._pending_panel_registration[uid]["step"], "base_url")
+        await message("https://panel.example/api")
+        await message("THIS_IS_A_REAL_SECRET")
+        self.assertEqual(self.bot._pending_panel_registration[uid]["step"], "secret_ref")
+        await message("env:TEST_PANEL_SECRET")
+        self.assertEqual(self.bot._pending_panel_registration[uid]["step"], "enabled")
+        self.assertIsNone(self.bot.data.get_panel_connection("wizard-panel"))
+
+        keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        callbacks = {button.get("callback_data") for row in keyboard for button in row}
+        self.assertIn("admin:panel-wizard-enabled:on", callbacks)
+        self.assertTrue(all(len(value.encode("utf-8")) <= 64 for value in callbacks))
+
+        query.update({"id": "wizard-finish", "data": "admin:panel-wizard-enabled:on"})
+        await self.bot._handle_callback(query)
+        panel = self.bot.data.get_panel_connection("wizard-panel")
+        self.assertEqual(panel["label"], "Wizard panel")
+        self.assertEqual(panel["base_url"], "https://panel.example/api")
+        self.assertEqual(panel["secret_ref"], "env:TEST_PANEL_SECRET")
+        self.assertTrue(panel["enabled"])
+        self.assertEqual(panel["metadata"], {})
+        self.assertNotIn(uid, self.bot._pending_panel_registration)
+        body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("اتصال زنده", body)
+        self.assertIn("هیچ تغییری در پنل ارائه‌دهنده انجام نشده", body)
+
+    async def test_panel_registration_wizard_sanaei_subscription_metadata_is_optional_and_validated(self):
+        uid = 6883349141
+        query = {"id": "sanaei-add", "from": {"id": uid},
+                 "message": {"message_id": 50, "chat": {"id": uid, "type": "private"}},
+                 "data": "admin:provider:sanaei"}
+        await self.bot._handle_callback(query)
+        auth_keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        auth_callbacks = {button.get("callback_data") for row in auth_keyboard for button in row}
+        self.assertIn("admin:auth:sanaei:access_token", auth_callbacks)
+        self.assertNotIn("admin:auth:sanaei:api_key", auth_callbacks)
+
+        query.update({"id": "sanaei-auth", "data": "admin:auth:sanaei:access_token"})
+        await self.bot._handle_callback(query)
+        async def message(text):
+            await self.bot._handle_message({"from": {"id": uid}, "chat": {"id": uid, "type": "private"}, "text": text})
+
+        await message("sanaei-wizard")
+        await message("Sanaei Wizard")
+        await message("https://sanaei.example:2053")
+        await message("env:SANAEI_ACCESS_TOKEN")
+        await message("https://sub.example:2096/path")
+        self.assertEqual(self.bot._pending_panel_registration[uid]["step"], "subscription_origin")
+        await message("https://sub.example:2096")
+        await message("sub")
+        self.assertEqual(self.bot._pending_panel_registration[uid]["step"], "enabled")
+        query.update({"id": "sanaei-finish", "data": "admin:panel-wizard-enabled:off"})
+        await self.bot._handle_callback(query)
+        panel = self.bot.data.get_panel_connection("sanaei-wizard")
+        self.assertFalse(panel["enabled"])
+        self.assertEqual(panel["metadata"], {
+            "subscription_base_url": "https://sub.example:2096", "subscription_path": "sub",
+        })
+
+    async def test_panel_registration_wizard_refuses_to_overwrite_existing_panel_id(self):
+        uid = 6883349141
+        self.bot.data.register_panel_connection(
+            panel_id="existing-panel", label="Original panel", provider="pasarguard",
+            base_url="https://original.example", auth_mode="api_key",
+            secret_ref="env:ORIGINAL_PANEL_SECRET", enabled=False, metadata={"keep": True},
+        )
+        await self.bot._start_panel_registration(uid, uid, "pasarguard", "api_key")
+        self.bot._pending_panel_registration[uid].update({
+            "step": "enabled", "panel_id": "existing-panel", "label": "Replacement panel",
+            "base_url": "https://replacement.example", "secret_ref": "env:REPLACEMENT_SECRET",
+            "metadata": {},
+        })
+        await self.bot._finish_panel_registration(uid, uid, enabled=True)
+        panel = self.bot.data.get_panel_connection("existing-panel")
+        self.assertEqual(panel["label"], "Original panel")
+        self.assertEqual(panel["base_url"], "https://original.example")
+        self.assertFalse(panel["enabled"])
+        self.assertEqual(panel["metadata"], {"keep": True})
+        self.assertNotIn(uid, self.bot._pending_panel_registration)
+        self.assertIn("جلوگیری از جایگزینی ناخواسته", self.bot.api.send_text.await_args.args[1])
+
+    async def test_panel_registration_wizard_expires_without_saving(self):
+        uid = 6883349141
+        query = {"id": "expiry-add", "from": {"id": uid},
+                 "message": {"message_id": 47, "chat": {"id": uid, "type": "private"}},
+                 "data": "admin:auth:rebecca:api_key"}
+        await self.bot._handle_callback(query)
+        self.bot._pending_panel_registration[uid]["started_at"] -= 901
+        await self.bot._handle_message({"from": {"id": uid}, "chat": {"id": uid, "type": "private"}, "text": "expired-panel"})
+        self.assertNotIn(uid, self.bot._pending_panel_registration)
+        self.assertIsNone(self.bot.data.get_panel_connection("expired-panel"))
+        self.assertIn("پس از ۱۵ دقیقه منقضی شد", self.bot.api.send_text.await_args.args[1])
+
+    async def test_panel_registration_wizard_cancel_discards_unsaved_state(self):
+        uid = 6883349141
+        query = {"id": "cancel-add", "from": {"id": uid},
+                 "message": {"message_id": 48, "chat": {"id": uid, "type": "private"}},
+                 "data": "admin:auth:rebecca:api_key"}
+        await self.bot._handle_callback(query)
+        await self.bot._handle_message({"from": {"id": uid}, "chat": {"id": uid, "type": "private"}, "text": "pending-panel"})
+        await self.bot._handle_message({"from": {"id": uid}, "chat": {"id": uid, "type": "private"}, "text": "/cancel"})
+        self.assertNotIn(uid, self.bot._pending_panel_registration)
+        self.assertIsNone(self.bot.data.get_panel_connection("pending-panel"))
+        self.assertIn("هیچ تنظیمی ذخیره نشد", self.bot.api.send_text.await_args.args[1])
+
     async def test_admin_panel_list_is_paginated_and_uses_short_private_callbacks(self):
         for index in range(7):
             self.bot.data.register_panel_connection(

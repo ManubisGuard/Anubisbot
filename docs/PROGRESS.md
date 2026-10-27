@@ -33,18 +33,33 @@ Updated: 2026-10-27
 9. Full isolated suite: 466 tests passed in 61.863 seconds.
 10. Static checks passed: Python compileall, Bash syntax, Mini App JavaScript syntax, and git diff --check.
 
+## Latest checkpoint — guided panel registration (2026-10-27)
+
+- Implemented the multi-step Telegram admin wizard at `/admin → مدیریت پنل‌ها → افزودن پنل جدید`.
+- Provider-specific authentication options now match the local contract: PasarGuard supports API key or username/password; Rebecca offers API key only; Sanaei offers access token or username/password. Unsupported combinations fail closed.
+- The wizard gathers internal panel ID, display label, HTTPS URL, and an environment-variable secret reference. It rejects HTTP, embedded credentials, query/fragment URLs, invalid IDs, and raw credential text that does not use the exact `env:VARIABLE_NAME` reference format.
+- Sanaei can optionally collect a separate HTTPS subscription-server origin and one safe path segment. These values are validated by the UI and again by the data-store contract. Skipping the origin leaves subscription-link capability unconfigured.
+- The wizard asks whether local sales should be enabled, supports `/cancel`, expires after 15 minutes, and only saves after the final selection. It clearly states that registration does not verify live connectivity or mutate the provider.
+- The wizard refuses to overwrite an existing panel ID, avoiding accidental changes to a registered connection; intentional edits remain available through the existing explicit command path.
+- Added five end-to-end unit/mock journey tests: validation and secret-reference-only storage, Sanaei subscription metadata, cancellation without saving, expiry without saving, and duplicate-ID overwrite protection.
+- Focused customer-bot suite before the duplicate-ID guard: **120 tests passed in 24.082 seconds**; all five wizard-specific tests passed together in 0.839 seconds.
+- Full isolated suite after all wizard changes: **471 tests passed in 64.004 seconds (OK, exit 0)**.
+- Static checks passed: Python compileall, Bash syntax, Mini App JavaScript syntax, and `git diff --check`.
+- Research sources reviewed for behavior only: [PasarguardBot](https://github.com/AmirKenzo/PasarguardBot), [Faoxima](https://github.com/Mmd-Amir/Faoxima), and the [official Telegram Bot API](https://core.telegram.org/bots/api). No source code was copied. Telegram callback data remains bounded to 64 bytes.
+- No secrets were read or printed. No production DB, provider panel, N2, live Telegram process, systemd timer, deployment, or service restart was touched. Evidence remains E2 local unit/mock only.
+
 ## Current limits / do not overclaim
 
-- Panel list/details/check and audited local sales toggle are implemented. A guided panel-registration wizard is still missing; credentials must remain environment secret references and must never be requested as raw keys/passwords in Telegram.
+- The wizard state is in memory and is lost if the bot process restarts; it does not store partially completed forms. Registration does not prove credentials, API scopes, live connectivity, or compatibility with the installed provider version.
 - A read-only health check does not prove create/update/delete permissions or compatibility with the installed panel version.
 - PasarGuard, Rebecca and Sanaei acceptance is still E2 local mock evidence. Live mutation tests require a disposable authorized staging panel and must never be performed against production users.
-- Online payment gateways and signed gateway webhooks remain out of scope for this milestone. Manual card-to-card receipt review remains the current payment path.
+- Online payment gateways and signed gateway webhooks remain out of scope. Manual card-to-card receipt review remains the current payment path.
 - Billing systemd files are templates only; do not install or activate timers as part of this work.
 
 ## Next steps in order
 
-1. Add a multi-step panel-registration flow that collects non-secret metadata only and stores credentials only as environment secret references.
-2. Move product/category management from command-only help text toward guided screens while preserving quote revalidation, order snapshots, inventory atomicity and existing command fallbacks.
-3. Improve admin order/payment review navigation without weakening receipt verification, immutable wallet ledger, idempotency or reconciliation protections.
-4. Continue PasarGuard operation-by-operation contract review. Live staging acceptance remains blocked until a disposable panel and explicit authorization are provided.
-5. After each independent implementation step: focused tests, full ./scripts/run_isolated_tests.sh, static checks, reviewed-path-only staging, commit/push to feature/discount-codes. Never use git add -A; never restart services or deploy without explicit authorization.
+1. Build guided category/product management screens, beginning with safe category create/edit/enable and then product creation by fulfillment type. Preserve quote revalidation, order snapshots, inventory atomicity, existing command fallbacks, and the distinction between manual/inventory/file/panel fulfillment.
+2. Improve admin order/payment review navigation without weakening receipt verification, immutable wallet ledger, idempotency or reconciliation protections.
+3. Review PasarGuard operation contracts one by one and add focused mock tests for missing/invalid config, permissions unknown, and ambiguous provider mutation outcomes.
+4. Live staging acceptance remains blocked until a disposable panel and explicit authorization are provided.
+5. After each independent implementation step: focused tests, full `./scripts/run_isolated_tests.sh`, static checks, reviewed-path-only staging, commit/push to `feature/discount-codes`. Never use `git add -A`; never restart services or deploy without explicit authorization.
