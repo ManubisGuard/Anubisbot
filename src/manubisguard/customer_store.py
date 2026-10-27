@@ -462,7 +462,7 @@ class CustomerDataStore:
                     int(row["version"])
                     for row in db.execute("SELECT version FROM schema_migrations").fetchall()
                 }
-                unknown_versions = sorted(version for version in applied if version > 20)
+                unknown_versions = sorted(version for version in applied if version > 21)
                 if unknown_versions:
                     raise CustomerStoreError(
                         "Database schema is newer than this application supports"
@@ -952,6 +952,40 @@ class CustomerDataStore:
                     db.execute("INSERT INTO schema_migrations(version,name) VALUES(20,?)",
                                ("customer_payment_notification_outbox",))
                     applied.add(20)
+                if 21 not in applied:
+                    db.execute("""CREATE TABLE IF NOT EXISTS panel_connection_events (
+                        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tenant_id TEXT NOT NULL,
+                        panel_id TEXT NOT NULL,
+                        action_key TEXT NOT NULL,
+                        actor_telegram_id INTEGER NOT NULL CHECK(actor_telegram_id > 0),
+                        previous_enabled INTEGER NOT NULL CHECK(previous_enabled IN (0,1)),
+                        new_enabled INTEGER NOT NULL CHECK(new_enabled IN (0,1)),
+                        source TEXT NOT NULL CHECK(source IN ('telegram_admin_ui','telegram_admin_command')),
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(tenant_id,action_key),
+                        FOREIGN KEY(tenant_id,panel_id)
+                            REFERENCES panel_connections(tenant_id,panel_id)
+                    )""")
+                    db.execute("CREATE INDEX IF NOT EXISTS ix_panel_connection_events_recent "
+                               "ON panel_connection_events(tenant_id,panel_id,event_id DESC)")
+                    db.execute("""CREATE TRIGGER IF NOT EXISTS panel_connection_events_no_update
+                        BEFORE UPDATE ON panel_connection_events
+                        BEGIN SELECT RAISE(ABORT, 'panel connection events are append-only'); END""")
+                    db.execute("""CREATE TRIGGER IF NOT EXISTS panel_connection_events_no_delete
+                        BEFORE DELETE ON panel_connection_events
+                        BEGIN SELECT RAISE(ABORT, 'panel connection events are append-only'); END""")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(21,?)",
+                               ("panel_connection_state_audit",))
+                    applied.add(21)
+                # Reinstall append-only triggers if an older database has the table
+                # but lacks the current protection triggers.
+                db.execute("""CREATE TRIGGER IF NOT EXISTS panel_connection_events_no_update
+                    BEFORE UPDATE ON panel_connection_events
+                    BEGIN SELECT RAISE(ABORT, 'panel connection events are append-only'); END""")
+                db.execute("""CREATE TRIGGER IF NOT EXISTS panel_connection_events_no_delete
+                    BEFORE DELETE ON panel_connection_events
+                    BEGIN SELECT RAISE(ABORT, 'panel connection events are append-only'); END""")
                 db.commit()
             except Exception:
                 db.rollback()
@@ -2937,14 +2971,82 @@ class CustomerDataStore:
         except (ValueError, TypeError):
             return None
 
-    def set_panel_enabled(self, panel_id: str, enabled: bool) -> None:
+    def set_panel_enabled(self, panel_id: str, enabled: bool, *, actor_telegram_id: int,
+                          action_key: str | None = None,
+                          source: str = "telegram_admin_command",
+                          expected_enabled: bool | None = None) -> dict[str, Any]:
+        normalized_id = panel_id.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", normalized_id):
+            raise CustomerStoreError("Invalid panel ID")
+        if not isinstance(enabled, bool):
+            raise CustomerStoreError("Panel enabled state must be boolean")
+        if expected_enabled is not None and not isinstance(expected_enabled, bool):
+            raise CustomerStoreError("Expected panel state must be boolean")
+        if isinstance(actor_telegram_id, bool) or not isinstance(actor_telegram_id, int) or actor_telegram_id <= 0:
+            raise CustomerStoreError("A valid admin actor is required to change panel state")
+        if source not in {"telegram_admin_ui", "telegram_admin_command"}:
+            raise CustomerStoreError("Invalid panel state audit source")
+        action_key = action_key or f"panel-enable:{uuid.uuid4().hex}"
+        if not isinstance(action_key, str) or not re.fullmatch(r"[A-Za-z0-9:_-]{1,180}", action_key):
+            raise CustomerStoreError("Invalid panel state action key")
+        target = int(enabled)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute(
+                "SELECT event_id,panel_id,actor_telegram_id,previous_enabled,new_enabled,source "
+                "FROM panel_connection_events WHERE tenant_id=? AND action_key=?",
+                (self.tenant_id, action_key),
+            ).fetchone()
+            if existing:
+                if (existing["panel_id"] != normalized_id
+                        or int(existing["actor_telegram_id"]) != actor_telegram_id
+                        or int(existing["new_enabled"]) != target
+                        or existing["source"] != source
+                        or (expected_enabled is not None
+                            and int(existing["previous_enabled"]) != int(expected_enabled))):
+                    raise CustomerStoreError("Panel state action key was reused with different intent")
+                return {"panel_id": normalized_id, "previous_enabled": bool(existing["previous_enabled"]),
+                        "enabled": bool(existing["new_enabled"]), "changed": True,
+                        "event_id": int(existing["event_id"]), "replayed": True}
+            row = db.execute(
+                "SELECT enabled FROM panel_connections WHERE tenant_id=? AND panel_id=?",
+                (self.tenant_id, normalized_id),
+            ).fetchone()
+            if not row:
+                raise CustomerStoreError("Panel connection not found")
+            previous = int(row["enabled"])
+            if expected_enabled is not None and previous != int(expected_enabled):
+                raise CustomerStoreError("Panel state changed since confirmation; reopen panel details")
+            if previous == target:
+                return {"panel_id": normalized_id, "previous_enabled": bool(previous),
+                        "enabled": bool(target), "changed": False, "event_id": None, "replayed": False}
+            db.execute(
+                "UPDATE panel_connections SET enabled=?,updated_at=CURRENT_TIMESTAMP "
+                "WHERE tenant_id=? AND panel_id=?",
+                (target, self.tenant_id, normalized_id),
+            )
+            cursor = db.execute(
+                "INSERT INTO panel_connection_events "
+                "(tenant_id,panel_id,action_key,actor_telegram_id,previous_enabled,new_enabled,source) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (self.tenant_id, normalized_id, action_key, actor_telegram_id, previous, target, source),
+            )
+            return {"panel_id": normalized_id, "previous_enabled": bool(previous),
+                    "enabled": bool(target), "changed": True, "event_id": int(cursor.lastrowid),
+                    "replayed": False}
+
+    def list_panel_connection_events(self, panel_id: str, *, limit: int = 5) -> list[dict[str, Any]]:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", panel_id.strip()):
             raise CustomerStoreError("Invalid panel ID")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+            raise CustomerStoreError("Panel event limit must be between 1 and 50")
         with self._connect() as db:
-            cur = db.execute("UPDATE panel_connections SET enabled=?,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=? AND panel_id=?",
-                             (int(enabled), self.tenant_id, panel_id.strip()))
-            if cur.rowcount != 1:
-                raise CustomerStoreError("Panel connection not found")
+            rows = db.execute(
+                "SELECT event_id,panel_id,actor_telegram_id,previous_enabled,new_enabled,source,created_at "
+                "FROM panel_connection_events WHERE tenant_id=? AND panel_id=? ORDER BY event_id DESC LIMIT ?",
+                (self.tenant_id, panel_id.strip(), limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def record_panel_check(self, *, panel_id: str, status: str, capabilities: dict[str, Any]) -> None:
         if status not in {"healthy_read_only", "failed", "not_tested"}:

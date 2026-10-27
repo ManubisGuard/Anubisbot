@@ -691,8 +691,15 @@ class CustomerBot:
                 await self.api.send_text(chat_id, "فرمت: /panel-enable PANEL_ID on|off", menu)
             else:
                 try:
-                    self.data.set_panel_enabled(parts[1], parts[2].lower() == "on")
-                    await self.api.send_text(chat_id, "وضعیت اتصال پنل ذخیره شد؛ محصولات وابسته به پنل خاموش از فروش پنهان می‌شوند.", menu)
+                    result = self.data.set_panel_enabled(
+                        parts[1], parts[2].lower() == "on", actor_telegram_id=uid,
+                        source="telegram_admin_command",
+                    )
+                    if result["changed"]:
+                        message_text = "وضعیت فروش پنل ذخیره و در گزارش مدیریتی ثبت شد؛ محصولات وابسته به پنل خاموش از فروش پنهان می‌شوند."
+                    else:
+                        message_text = "وضعیت فروش از قبل همین بود؛ تغییری اعمال نشد و رویداد جدیدی ثبت نشد."
+                    await self.api.send_text(chat_id, message_text, menu)
                 except CustomerStoreError as exc:
                     await self.api.send_text(chat_id, f"وضعیت پنل تغییر نکرد: {exc}", menu)
             return
@@ -1675,6 +1682,38 @@ class CustomerBot:
         body = f"فهرست پنل‌ها · صفحه {page + 1} از {page_count}\n"
         body += "برای دیدن جزئیات یا بررسی خواندنی، یک پنل را انتخاب کن." if panels else "هنوز پنلی ثبت نشده است."
         return body, {"inline_keyboard": buttons}
+
+    def _admin_panel_detail_screen(self, panel: dict[str, Any], *, notice: str = "") -> tuple[str, dict[str, Any]]:
+        panel_id = str(panel["panel_id"])
+        token = self._panel_callback_token(panel_id)
+        enabled = bool(panel.get("enabled"))
+        lines = [
+            "🖥 جزئیات پنل",
+            f"نام: {panel['label']}",
+            f"شناسه: {panel_id}",
+            f"نوع: {panel['provider']}",
+            f"وضعیت فروش: {'فعال' if enabled else 'غیرفعال'}",
+            f"آخرین بررسی: {panel.get('last_check_at') or 'هنوز بررسی نشده'}",
+            f"نتیجه بررسی: {panel.get('last_check_status') or 'نامشخص'}",
+        ]
+        if notice:
+            lines.extend(["", notice])
+        events = self.data.list_panel_connection_events(panel_id, limit=3)
+        if events:
+            lines.extend(["", "آخرین تغییرات مدیریتی:"])
+            for event in events:
+                state = "فعال شد" if event["new_enabled"] else "غیرفعال شد"
+                lines.append(f"• {state} · مدیر {event['actor_telegram_id']} · {event['created_at']}")
+        lines.extend(["", "تغییر وضعیت فقط فروش جدید را کنترل می‌کند؛ سرویس‌های موجود حذف یا در پنل ارائه‌دهنده تغییر داده نمی‌شوند."])
+        toggle_target = "off" if enabled else "on"
+        toggle_label = "⏸ توقف فروش این پنل" if enabled else "▶️ فعال‌کردن فروش این پنل"
+        keyboard = {"inline_keyboard": [
+            [{"text": toggle_label, "callback_data": f"admin:panel-toggle-confirm:{token}:{toggle_target}"}],
+            [{"text": "🔎 بررسی خواندنی اتصال", "callback_data": f"admin:panel-check:{token}"}],
+            [{"text": "📋 فهرست پنل‌ها", "callback_data": "admin:list_panels"}],
+            [{"text": "⬅️ بازگشت به مدیریت", "callback_data": "admin:panels"}],
+        ]}
+        return "\n".join(lines), keyboard
 
     async def _admin_panel_command(self, chat_id: int, text: str) -> None:
         # /panel add ID | label | provider | https://url | auth_mode | env:VARIABLE | enabled | metadata_json
@@ -2699,13 +2738,71 @@ class CustomerBot:
                         {"text": "📋 فهرست پنل‌ها", "callback_data": "admin:list_panels"}],
                         [{"text": "⬅️ بازگشت", "callback_data": "admin:panels"}]]})
                     return
-                body = (f"🖥 جزئیات پنل\n\nنام: {panel['label']}\nشناسه: {panel['panel_id']}\nنوع: {panel['provider']}\n"
-                        f"وضعیت فروش: {'فعال' if panel['enabled'] else 'غیرفعال'}\nآخرین بررسی: {panel.get('last_check_at') or 'هنوز بررسی نشده'}\n"
-                        f"نتیجه بررسی: {panel.get('last_check_status') or 'نامشخص'}\n\nباز کردن بررسی فقط‌خواندنی هیچ تغییر یا ری‌استارتی انجام نمی‌دهد.")
-                await self.api.send_text(chat_id, body, {"inline_keyboard": [
-                    [{"text": "🔎 بررسی خواندنی اتصال", "callback_data": f"admin:panel-check:{token}"}],
-                    [{"text": "📋 فهرست پنل‌ها", "callback_data": "admin:list_panels"}],
-                    [{"text": "⬅️ بازگشت به مدیریت", "callback_data": "admin:panels"}]]})
+                body, keyboard = self._admin_panel_detail_screen(panel)
+                await self.api.send_text(chat_id, body, keyboard)
+                return
+            elif section.startswith("panel-toggle-confirm:"):
+                parts = section.split(":")
+                token = parts[1] if len(parts) > 1 else ""
+                target = parts[2] if len(parts) > 2 else ""
+                panel = self._panel_from_callback_token(token)
+                if not panel or target not in {"on", "off"}:
+                    await self.api.send_text(chat_id, "درخواست نامعتبر یا قدیمی است؛ جزئیات پنل را دوباره باز کن.", BACK_MENU)
+                    return
+                desired = target == "on"
+                if bool(panel["enabled"]) == desired:
+                    body, keyboard = self._admin_panel_detail_screen(panel, notice="وضعیت فروش از قبل همین است؛ تغییری انجام نشد.")
+                    await self.api.send_text(chat_id, body, keyboard)
+                    return
+                expected = "on" if panel["enabled"] else "off"
+                action_label = "فعال‌کردن فروش" if desired else "توقف فروش"
+                impact = ("محصولات این پنل دوباره برای خریدهای جدید نمایش داده می‌شوند." if desired
+                          else "محصولات این پنل از فروش جدید پنهان می‌شوند و خرید نمایندگی جدید متوقف می‌شود.")
+                await self.api.send_text(chat_id,
+                    f"⚠️ تأیید {action_label}\n\nپنل: {panel['label']} ({panel['panel_id']})\n{impact}\n"
+                    "سرویس‌های موجود و تنظیمات پنل ارائه‌دهنده تغییر نمی‌کنند. این تغییر در گزارش مدیریتی ثبت می‌شود.\n\nادامه می‌دهی؟",
+                    {"inline_keyboard": [
+                        [{"text": f"✅ بله، {action_label}", "callback_data": f"admin:panel-toggle:{token}:{target}:{expected}"}],
+                        [{"text": "لغو و بازگشت", "callback_data": f"admin:panel-detail:{token}"}],
+                        [{"text": "⬅️ فهرست پنل‌ها", "callback_data": "admin:list_panels"}]]})
+                return
+            elif section.startswith("panel-toggle:"):
+                parts = section.split(":")
+                token = parts[1] if len(parts) > 1 else ""
+                target = parts[2] if len(parts) > 2 else ""
+                expected = parts[3] if len(parts) > 3 else ""
+                panel = self._panel_from_callback_token(token)
+                if (not panel or target not in {"on", "off"}
+                        or expected not in {"on", "off"} or expected == target):
+                    await self.api.send_text(chat_id, "درخواست نامعتبر یا قدیمی است؛ تغییری انجام نشد.", BACK_MENU)
+                    return
+                if not isinstance(callback_id, str) or not callback_id:
+                    await self.api.send_text(chat_id, "شناسه تأیید معتبر نیست؛ جزئیات پنل را دوباره باز کن.", BACK_MENU)
+                    return
+                desired = target == "on"
+                action_key = f"panel-toggle:{uuid.uuid5(uuid.NAMESPACE_URL, callback_id).hex}"
+                try:
+                    result = self.data.set_panel_enabled(
+                        str(panel["panel_id"]), desired, actor_telegram_id=uid,
+                        action_key=action_key, source="telegram_admin_ui",
+                        expected_enabled=expected == "on",
+                    )
+                except CustomerStoreError as exc:
+                    await self.api.send_text(chat_id, f"وضعیت فروش تغییر نکرد: {exc}", BACK_MENU)
+                    return
+                updated_panel = self.data.get_panel_connection(str(panel["panel_id"]))
+                if not updated_panel:
+                    await self.api.send_text(chat_id, "وضعیت ثبت شد، اما پنل برای نمایش دوباره پیدا نشد؛ فهرست را باز کن.", {"inline_keyboard": [
+                        [{"text": "📋 فهرست پنل‌ها", "callback_data": "admin:list_panels"}]]})
+                    return
+                if result["replayed"]:
+                    notice = "این درخواست قبلاً ثبت شده بود؛ تغییر تکراری اجرا نشد."
+                elif result["changed"]:
+                    notice = "وضعیت فروش تغییر کرد و رویداد مدیریتی به‌صورت تغییرناپذیر ثبت شد."
+                else:
+                    notice = "وضعیت فروش از قبل همین بود؛ تغییری ثبت نشد."
+                body, keyboard = self._admin_panel_detail_screen(updated_panel, notice=notice)
+                await self.api.send_text(chat_id, body, keyboard)
                 return
             elif section.startswith("panel-check:"):
                 token = section.partition(":")[2]

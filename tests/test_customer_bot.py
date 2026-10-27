@@ -1395,6 +1395,83 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback(query)
         self.assertIn("دکمه قدیمی است", self.bot.api.send_text.await_args.args[1])
 
+    async def test_admin_panel_toggle_requires_confirmation_and_audits_state_change(self):
+        panel_id = "panel-toggle-ui"
+        self.bot.data.register_panel_connection(
+            panel_id=panel_id, label="Toggle panel", provider="pasarguard",
+            base_url="https://panel.example", auth_mode="api_key",
+            secret_ref="env:TEST_PANEL_SECRET", enabled=True, metadata={},
+        )
+        token = self.bot._panel_callback_token(panel_id)
+        query = {"id": "toggle-detail", "from": {"id": 6883349141},
+                 "message": {"message_id": 53, "chat": {"id": 6883349141, "type": "private"}},
+                 "data": f"admin:panel-detail:{token}"}
+        await self.bot._handle_callback(query)
+        detail_keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        callbacks = {button.get("callback_data") for row in detail_keyboard for button in row}
+        self.assertIn(f"admin:panel-toggle-confirm:{token}:off", callbacks)
+
+        self.bot.api.send_text.reset_mock()
+        query.update({"id": "toggle-confirm", "data": f"admin:panel-toggle-confirm:{token}:off"})
+        await self.bot._handle_callback(query)
+        self.assertIn("تأیید توقف فروش", self.bot.api.send_text.await_args.args[1])
+        self.assertTrue(self.bot.data.get_panel_connection(panel_id)["enabled"])
+        self.assertEqual(self.bot.data.list_panel_connection_events(panel_id), [])
+        confirm_keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        confirm_callbacks = {button.get("callback_data") for row in confirm_keyboard for button in row}
+        self.assertIn(f"admin:panel-toggle:{token}:off:on", confirm_callbacks)
+        self.assertTrue(all(len(value.encode("utf-8")) <= 64 for value in confirm_callbacks))
+
+        self.bot.api.send_text.reset_mock()
+        query.update({"id": "toggle-commit-1", "data": f"admin:panel-toggle:{token}:off:on"})
+        await self.bot._handle_callback(query)
+        self.assertFalse(self.bot.data.get_panel_connection(panel_id)["enabled"])
+        events = self.bot.data.list_panel_connection_events(panel_id)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["actor_telegram_id"], 6883349141)
+        self.assertEqual(events[0]["source"], "telegram_admin_ui")
+        self.assertEqual((events[0]["previous_enabled"], events[0]["new_enabled"]), (1, 0))
+        body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("رویداد مدیریتی", body)
+        self.assertIn("مدیر 6883349141", body)
+
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback(query)
+        self.assertEqual(len(self.bot.data.list_panel_connection_events(panel_id)), 1)
+        self.assertIn("قبلاً ثبت شده بود", self.bot.api.send_text.await_args.args[1])
+
+    async def test_admin_panel_toggle_rejects_confirmation_after_state_changed(self):
+        panel_id = "panel-stale-toggle"
+        self.bot.data.register_panel_connection(
+            panel_id=panel_id, label="Stale toggle panel", provider="pasarguard",
+            base_url="https://panel.example", auth_mode="api_key",
+            secret_ref="env:TEST_PANEL_SECRET", enabled=True, metadata={},
+        )
+        token = self.bot._panel_callback_token(panel_id)
+        query = {"id": "stale-detail", "from": {"id": 6883349141},
+                 "message": {"message_id": 54, "chat": {"id": 6883349141, "type": "private"}},
+                 "data": f"admin:panel-detail:{token}"}
+        await self.bot._handle_callback(query)
+        self.bot.api.send_text.reset_mock()
+        query.update({"id": "stale-confirm-screen", "data": f"admin:panel-toggle-confirm:{token}:off"})
+        await self.bot._handle_callback(query)
+        action_keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        action_callback = next(button["callback_data"] for row in action_keyboard for button in row
+                               if button.get("callback_data", "").startswith("admin:panel-toggle:"))
+
+        self.bot.data.set_panel_enabled(
+            panel_id, False, actor_telegram_id=7002, action_key="panel-toggle:external-change",
+            source="telegram_admin_command",
+        )
+        self.bot.api.send_text.reset_mock()
+        query.update({"id": "stale-toggle-execute", "data": action_callback})
+        await self.bot._handle_callback(query)
+        self.assertFalse(self.bot.data.get_panel_connection(panel_id)["enabled"])
+        events = self.bot.data.list_panel_connection_events(panel_id)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["actor_telegram_id"], 7002)
+        self.assertIn("state changed since confirmation", self.bot.api.send_text.await_args.args[1])
+
     async def test_admin_menu_is_separate_and_denied_to_customer(self):
         await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},"text":"/admin"})
         self.assertIn("فقط برای مدیر مجاز است", self.bot.api.send_text.await_args.args[1])
