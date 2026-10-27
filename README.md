@@ -86,7 +86,7 @@ Both Telegram admin interfaces now expose **مدیریت متن‌ها و لوگ
 ### Useful commands
 
 - Customers: `/start`, `/shop`, `/wallet`, `/deposit 100000 IRR`, `/myservices`, `/myresellers`, `/support`, `/mytickets`, `/ticket TICKET_ID`, `/ticket-reply TICKET_ID | message`, `/resume-service SERVICE_ID`, `/reseller-resume ACCOUNT_ID`.
-- Admin panel setup: `/panel add ...` (re-run with the same ID to edit), `/panel-enable PANEL_ID on|off`, `/panels`, `/panel-check PANEL_ID`, `/panel-roles PANEL_ID` (PasarGuard only). Disabling a panel hides its products and stops new reseller purchases; existing services are not deleted.
+- Admin panel management: open `/admin → مدیریت پنل‌ها` for a paginated list, per-panel details, and an explicitly requested read-only connection check. Command fallbacks remain: `/panel add ...` (re-run with the same ID to edit), `/panel-enable PANEL_ID on|off`, `/panels`, `/panel-check PANEL_ID`, `/panel-roles PANEL_ID` (PasarGuard only). Disabling a panel hides its products and stops new reseller purchases; existing services are not deleted.
 - Product catalog: `/category add ID | title | optional description`, `/categories`, `/category enable ID on|off`; `/product add ID | title | mode | price_minor | unit_price_minor | currency | duration_hours | traffic_GiB | panel_id | group/service/inbound_ids | optional_category_id` (the 10-field form remains supported), `/product bind ID | panel_id | IDs`, `/product enable ID on|off`, `/products`. Every published product must be bound to an enabled panel and have provider-specific IDs; the six-field legacy form auto-binds only when exactly one enabled panel has valid defaults.
 - Manual products: `/manual-product add ID | title | price_minor | currency | instant/inventory/manual | delivery_text | description | category_id? | purchase_cap? | sort_order? | terms_text? | image_url?`, `/manual-product edit` uses the same optional fields; terms are shown at checkout and snapshotted on the order. Optional image URLs must use HTTPS; obvious local/private host forms are rejected, but DNS resolution is not checked. Use `-` in the final field to clear an existing image. Product cards use Telegram photos with a text fallback if image delivery fails. `/manual-key add PRODUCT_ID | KEY`, `/manual-orders [pending_delivery|fulfilled|all]`, `/manual-fulfill ORDER_ID | delivery_text`, `/manual-notification-retry ORDER_ID` (for dead-lettered customer delivery notifications).
 - Reseller plans: `/reseller-plan add ...` (12-field basic or 21-field extended form), `/reseller-plans`.
@@ -95,12 +95,13 @@ Both Telegram admin interfaces now expose **مدیریت متن‌ها و لوگ
 
 Provider limitations, wallet/debt behavior, and operational boundaries are summarized in the **Current implementation** section above. The separate provider-matrix and metered-billing guides are not included in this source checkout.
 
-## Verification status (2026-10-20)
+## Verification status (2026-10-27)
 
-- Session 97 static pass: `python3 -m compileall -q -f src tests scripts`, `bash -n scripts/*.sh`, `node --check customer_webapp/app.js`, and `git diff --check` all passed after backup-policy and WAL changes.
-- Latest `./scripts/run_isolated_tests.sh`: **335 tests passed (`OK`) in 62.911 seconds** (Session 97). Coverage includes provider reconciliation identity checks, SQLite backup/restore safety, Mini App auth/origin/user scoping, order/wallet history, support ticket idempotency/outbox/group-topic routing/dead-letter requeue, backup-policy validation/timezone/DST and tenant isolation, SQLite WAL/full-sync settings, wallet purchase idempotency, and customer-bot Web App launch gating.
+- Latest full isolated run after the customer-bot panel-management UI change: **463 tests passed (`OK`) in 63.244 seconds**. The focused customer-bot suite passed **114 tests in 24.224 seconds**.
+- Static checks passed: `python3 -m compileall -q -f src tests scripts`, `bash -n scripts/*.sh`, `node --check customer_webapp/app.js`, and `git diff --check`.
 - The isolated runner creates temporary HOME/TMP/cache directories, clears inherited environment variables, blocks IPv4/IPv6 network connections, and enforces a 20-second per-test timeout by default.
+- The customer-bot admin panel menu now has a paginated panel list, per-panel details, and a read-only connection-check action. Callback data uses short hashed panel references to remain below Telegram's 64-byte limit; stale or ambiguous references fail closed.
 - Test evidence is local unit/mock only. It does not prove live Telegram delivery, live provider CRUD/usage, automatic gateway/webhook processing, or production database behavior.
 - `deploy/systemd/anubis-billing.service` and `.timer` are templates only. They have not been installed or activated; their paths need review before any future staging use.
 
-**Operational boundary:** no production panel, N2, live mother-bot process, or production deployment was changed during this session. No live provider or payment gateway acceptance is claimed.
+**Operational boundary:** work was performed in the isolated checkout `/root/bot/workspace/AnubisBot`. No production panel, N2, live bot process, production database, or deployment was changed. No process was restarted, and no live provider or payment gateway acceptance is claimed. See `docs/PROGRESS.md` for the current checkpoint and next steps.

@@ -1632,6 +1632,50 @@ class CustomerBot:
         except Exception as exc:
             LOG.warning("Trust notification queued/delivery failed (%s)", type(exc).__name__)
 
+    @staticmethod
+    def _panel_callback_token(panel_id: str) -> str:
+        # Keep callback_data under Telegram's 64-byte limit without embedding IDs.
+        return hashlib.sha256(panel_id.encode("utf-8")).hexdigest()[:12]
+
+    def _panel_from_callback_token(self, token: str) -> dict[str, Any] | None:
+        if not re.fullmatch(r"[0-9a-f]{12}", token):
+            return None
+        matches = [
+            panel for panel in self.data.list_panel_connections()
+            if self._panel_callback_token(str(panel.get("panel_id") or "")) == token
+        ]
+        # Fail closed even in the astronomically unlikely event of a token collision.
+        return matches[0] if len(matches) == 1 else None
+
+    def _admin_panel_list_screen(self, page: int = 0, *, action: str = "detail") -> tuple[str, dict[str, Any]]:
+        panels = self.data.list_panel_connections()
+        page_size = 5
+        page_count = max(1, (len(panels) + page_size - 1) // page_size)
+        page = min(max(0, page), page_count - 1)
+        start = page * page_size
+        visible = panels[start:start + page_size]
+        buttons: list[list[dict[str, Any]]] = []
+        for panel in visible:
+            token = self._panel_callback_token(str(panel["panel_id"]))
+            label = str(panel.get("label") or panel["panel_id"])[:36]
+            status = "فعال" if panel.get("enabled") else "غیرفعال"
+            callback = f"admin:panel-check:{token}" if action == "check" else f"admin:panel-detail:{token}"
+            buttons.append([{"text": f"{'🟢' if panel.get('enabled') else '⚪'} {label} · {status}",
+                             "callback_data": callback}])
+        navigation: list[dict[str, Any]] = []
+        if page > 0:
+            navigation.append({"text": "⬅️ قبلی", "callback_data": f"admin:panel-page:{page - 1}:{action}"})
+        if page + 1 < page_count:
+            navigation.append({"text": "بعدی ➡️", "callback_data": f"admin:panel-page:{page + 1}:{action}"})
+        if navigation:
+            buttons.append(navigation)
+        buttons.append([{"text": "⬅️ بازگشت به مدیریت پنل‌ها", "callback_data": "admin:panels"}])
+        if not panels:
+            buttons.insert(0, [{"text": "➕ افزودن پنل", "callback_data": "admin:add_panel"}])
+        body = f"فهرست پنل‌ها · صفحه {page + 1} از {page_count}\n"
+        body += "برای دیدن جزئیات یا بررسی خواندنی، یک پنل را انتخاب کن." if panels else "هنوز پنلی ثبت نشده است."
+        return body, {"inline_keyboard": buttons}
+
     async def _admin_panel_command(self, chat_id: int, text: str) -> None:
         # /panel add ID | label | provider | https://url | auth_mode | env:VARIABLE | enabled | metadata_json
         payload = text.partition(" ")[2].strip()
@@ -1670,14 +1714,14 @@ class CustomerBot:
         except Exception as exc:
             LOG.warning("Panel-check notification enqueue failed (%s)", type(exc).__name__)
 
-    async def _admin_panel_check(self, chat_id: int, text: str) -> None:
+    async def _admin_panel_check(self, chat_id: int, text: str, *, keyboard: dict[str, Any] | None = None) -> None:
         parts = text.split(maxsplit=1)
         if len(parts) != 2:
-            await self.api.send_text(chat_id, "فرمت: /panel-check PANEL_ID", self._customer_menu())
+            await self.api.send_text(chat_id, "فرمت: /panel-check PANEL_ID", keyboard or self._customer_menu())
             return
         row = self.data.get_panel_connection(parts[1].strip())
         if not row:
-            await self.api.send_text(chat_id, "پنل پیدا نشد.", self._customer_menu())
+            await self.api.send_text(chat_id, "پنل پیدا نشد.", keyboard or self._customer_menu())
             return
         from manubisguard.panels.contracts import PanelConnection
         connection = PanelConnection(id=row["panel_id"], tenant_id=self.data.tenant_id, name=row["label"],
@@ -1714,11 +1758,11 @@ class CustomerBot:
                         status_text = status
                     lines.append(f"• {operation}: {status_text}")
             lines.append("این بررسی فقط خواندنی است؛ مجوز عملیات تغییردهنده یا سازگاری نسخهٔ نصب‌شده را اثبات نمی‌کند.")
-            await self.api.send_text(chat_id, "\n".join(lines), self._customer_menu())
+            await self.api.send_text(chat_id, "\n".join(lines), keyboard or self._customer_menu())
         except Exception as exc:
             self.data.record_panel_check(panel_id=connection.id, status="failed", capabilities={})
             self._queue_panel_check_notification(chat_id=chat_id, status="failed", reason_code="panel_check_error")
-            await self.api.send_text(chat_id, f"بررسی پنل ناموفق بود: {type(exc).__name__}", self._customer_menu())
+            await self.api.send_text(chat_id, f"بررسی پنل ناموفق بود: {type(exc).__name__}", keyboard or self._customer_menu())
 
     async def _admin_panel_roles(self, chat_id: int, text: str) -> None:
         parts = text.split(maxsplit=1)
@@ -2624,10 +2668,57 @@ class CustomerBot:
                 await self.api.send_text(chat_id, f"روش انتخاب‌شده: {provider} / {auth_mode}\n\nاطلاعات پنل را با این قالب ثبت کن؛ مقدار محرمانه را در تلگرام ننویس و فقط مرجع متغیر محیطی بده:\n/panel add ID | نام | {provider} | https://panel.example | {auth_mode} | env:SECRET_VARIABLE | on | {{}}\n\nبرای روش نام کاربری/رمز عبور، secret variable باید به‌صورت امن در محیط سرور تنظیم شود.", ADMIN_MENU)
                 return
             elif section == "list_panels":
-                panels = self.data.list_panel_connections()
-                body = "\n".join(f"• {p['panel_id']} — {p['label']} ({p['provider']}) — {'فعال' if p['enabled'] else 'غیرفعال'} — {p['last_check_status']}" for p in panels) or "هنوز پنلی ثبت نشده است."
+                body, keyboard = self._admin_panel_list_screen(0)
+                await self.api.send_text(chat_id, body, keyboard)
+                return
             elif section == "check_panel":
-                body = "برای بررسی فقط‌خواندنی اجرا کن: /panel-check PANEL_ID"
+                panels = self.data.list_panel_connections()
+                if not panels:
+                    await self.api.send_text(chat_id, "هنوز پنلی ثبت نشده است.", {"inline_keyboard": [[
+                        {"text": "➕ افزودن پنل", "callback_data": "admin:add_panel"}],
+                        [{"text": "⬅️ بازگشت", "callback_data": "admin:panels"}]]})
+                    return
+                body, keyboard = self._admin_panel_list_screen(0, action="check")
+                await self.api.send_text(chat_id, "پنل موردنظر را برای بررسی خواندنی انتخاب کن. این کار فقط وضعیت اتصال و قابلیت‌های محلی را بررسی می‌کند؛ هیچ تغییری در پنل انجام نمی‌دهد.\n\n" + body, keyboard)
+                return
+            elif section.startswith("panel-page:"):
+                parts = section.split(":")
+                try:
+                    page = max(0, int(parts[1]))
+                except (IndexError, ValueError):
+                    page = 0
+                action = parts[2] if len(parts) > 2 and parts[2] == "check" else "detail"
+                body, keyboard = self._admin_panel_list_screen(page, action=action)
+                await self.api.send_text(chat_id, body, keyboard)
+                return
+            elif section.startswith("panel-detail:"):
+                token = section.partition(":")[2]
+                panel = self._panel_from_callback_token(token)
+                if not panel:
+                    await self.api.send_text(chat_id, "پنل پیدا نشد یا دکمه قدیمی است؛ فهرست را دوباره باز کن.", {"inline_keyboard": [[
+                        {"text": "📋 فهرست پنل‌ها", "callback_data": "admin:list_panels"}],
+                        [{"text": "⬅️ بازگشت", "callback_data": "admin:panels"}]]})
+                    return
+                body = (f"🖥 جزئیات پنل\n\nنام: {panel['label']}\nشناسه: {panel['panel_id']}\nنوع: {panel['provider']}\n"
+                        f"وضعیت فروش: {'فعال' if panel['enabled'] else 'غیرفعال'}\nآخرین بررسی: {panel.get('last_check_at') or 'هنوز بررسی نشده'}\n"
+                        f"نتیجه بررسی: {panel.get('last_check_status') or 'نامشخص'}\n\nباز کردن بررسی فقط‌خواندنی هیچ تغییر یا ری‌استارتی انجام نمی‌دهد.")
+                await self.api.send_text(chat_id, body, {"inline_keyboard": [
+                    [{"text": "🔎 بررسی خواندنی اتصال", "callback_data": f"admin:panel-check:{token}"}],
+                    [{"text": "📋 فهرست پنل‌ها", "callback_data": "admin:list_panels"}],
+                    [{"text": "⬅️ بازگشت به مدیریت", "callback_data": "admin:panels"}]]})
+                return
+            elif section.startswith("panel-check:"):
+                token = section.partition(":")[2]
+                panel = self._panel_from_callback_token(token)
+                if not panel:
+                    await self.api.send_text(chat_id, "پنل پیدا نشد یا دکمه قدیمی است؛ فهرست را دوباره باز کن.", {"inline_keyboard": [[
+                        {"text": "📋 فهرست پنل‌ها", "callback_data": "admin:list_panels"}]]})
+                    return
+                await self._admin_panel_check(chat_id, f"/panel-check {panel['panel_id']}", keyboard={"inline_keyboard": [
+                    [{"text": "⬅️ بازگشت به جزئیات پنل", "callback_data": f"admin:panel-detail:{token}"}],
+                    [{"text": "📋 فهرست پنل‌ها", "callback_data": "admin:list_panels"}],
+                    [{"text": "⬅️ پنل‌ها", "callback_data": "admin:panels"}]]})
+                return
             elif section == "products":
                 body = ("🛍 مدیریت فروشگاه\nمحصولات پنلی: /product add ...\n"
                         "محصول دستی: /manual-product add ID | عنوان | قیمت | ارز | instant/inventory/manual | متن-تحویل | توضیح | category_id | سقف خرید | ترتیب | شرایط خرید | image_url HTTPS | visible_from_utc | visible_until_utc\n"

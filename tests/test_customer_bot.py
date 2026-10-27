@@ -1331,6 +1331,70 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ربات فروش و خدمات",args[1]["caption"])
         self.assertIn("keyboard",args[1]["reply_markup"])
 
+    async def test_admin_panel_list_is_paginated_and_uses_short_private_callbacks(self):
+        for index in range(7):
+            self.bot.data.register_panel_connection(
+                panel_id=f"panel-{index}", label=f"Panel {index}", provider="pasarguard",
+                base_url="https://panel.example", auth_mode="api_key",
+                secret_ref="env:TEST_PANEL_SECRET", enabled=index % 2 == 0, metadata={},
+            )
+        query = {"id": "panel-list", "from": {"id": 6883349141},
+                 "message": {"message_id": 51, "chat": {"id": 6883349141, "type": "private"}},
+                 "data": "admin:list_panels"}
+        await self.bot._handle_callback(query)
+        body = self.bot.api.send_text.await_args.args[1]
+        keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        callbacks = [button.get("callback_data", "") for row in keyboard for button in row]
+        detail_callbacks = [value for value in callbacks if value.startswith("admin:panel-detail:")]
+        self.assertIn("صفحه 1 از 2", body)
+        self.assertEqual(len(detail_callbacks), 5)
+        self.assertTrue(all(len(value.encode("utf-8")) <= 64 for value in callbacks))
+        self.assertTrue(all("panel-0" not in value for value in detail_callbacks))
+        self.assertIn("admin:panel-page:1:detail", callbacks)
+
+        self.bot.api.send_text.reset_mock()
+        query.update({"id": "panel-page-two", "data": "admin:panel-page:1:detail"})
+        await self.bot._handle_callback(query)
+        page_two = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        second_page_callbacks = [button.get("callback_data", "") for row in page_two for button in row]
+        self.assertIn("صفحه 2 از 2", self.bot.api.send_text.await_args.args[1])
+        self.assertEqual(len([value for value in second_page_callbacks if value.startswith("admin:panel-detail:")]), 2)
+
+        self.bot.api.send_text.reset_mock()
+        detail_callback = next(value for value in second_page_callbacks if value.startswith("admin:panel-detail:"))
+        query.update({"id": "panel-detail", "data": detail_callback})
+        await self.bot._handle_callback(query)
+        self.assertIn("جزئیات پنل", self.bot.api.send_text.await_args.args[1])
+        detail_keyboard = self.bot.api.send_text.await_args.args[2]["inline_keyboard"]
+        self.assertIn("admin:panel-check:" + detail_callback.rsplit(":", 1)[1],
+                      {button.get("callback_data") for row in detail_keyboard for button in row})
+
+    async def test_admin_panel_check_callback_resolves_panel_and_keeps_admin_navigation(self):
+        panel_id = "panel-" + ("long-id-" * 6)
+        self.bot.data.register_panel_connection(
+            panel_id=panel_id, label="Long ID panel", provider="pasarguard",
+            base_url="https://panel.example", auth_mode="api_key",
+            secret_ref="env:TEST_PANEL_SECRET", enabled=True, metadata={},
+        )
+        token = self.bot._panel_callback_token(panel_id)
+        query = {"id": "panel-check-ui", "from": {"id": 6883349141},
+                 "message": {"message_id": 52, "chat": {"id": 6883349141, "type": "private"}},
+                 "data": f"admin:panel-check:{token}"}
+        with patch.object(self.bot, "_admin_panel_check", new=AsyncMock()) as check:
+            await self.bot._handle_callback(query)
+        check.assert_awaited_once()
+        args = check.await_args
+        self.assertEqual(args.args[1], f"/panel-check {panel_id}")
+        self.assertEqual(args.kwargs["keyboard"]["inline_keyboard"][0][0]["callback_data"],
+                         f"admin:panel-detail:{token}")
+        self.assertTrue(all(len(button.get("callback_data", "").encode("utf-8")) <= 64
+                            for row in args.kwargs["keyboard"]["inline_keyboard"] for button in row))
+
+        self.bot.api.send_text.reset_mock()
+        query.update({"id": "panel-check-stale", "data": "admin:panel-detail:000000000000"})
+        await self.bot._handle_callback(query)
+        self.assertIn("دکمه قدیمی است", self.bot.api.send_text.await_args.args[1])
+
     async def test_admin_menu_is_separate_and_denied_to_customer(self):
         await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},"text":"/admin"})
         self.assertIn("فقط برای مدیر مجاز است", self.bot.api.send_text.await_args.args[1])
