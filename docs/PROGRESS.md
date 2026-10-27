@@ -174,3 +174,48 @@ Updated: 2026-10-28
 - Fetched the published branch and synchronized the workspace. Local HEAD and `origin/feature/discount-codes` matched `eff83db34d9a0116ca507da6158f8b84faab07cd`; all nine local file blob hashes matched the published GitHub content SHAs; `git status --short --branch` was clean.
 - After synchronization, compileall, Bash syntax, JavaScript syntax and `git diff --check` passed again (`STATIC_CHECKS_OK`). The full 504-test isolated suite passed before publication.
 - Evidence remains E2 local unit/mock only. No live provider, staging, production, Telegram or deployment operation was performed.
+
+## Handoff and phased roadmap clarified — 2026-10-28
+
+### Fixed behavioral reference bots
+
+The user-confirmed behavioral reference set is:
+1. **Faoxima** — multi-panel/server, capability reports, manual/inventory fulfillment, panel backup, trust channel, test account, reservation/auto activation, gateways, dynamic exchange rate, tickets, Mini App.
+2. **PasarguardBot** — panel/service integration, service lifecycle, activation/sales/renewal behavior.
+3. **PGClockBot** — renewal preview, mutation lock, “my services”, paid-but-undelivered recovery, receipt review, tickets, roles, jobs, backup/restore.
+4. **MirzaBot** — driver registry, web-admin customization, languages, phone/channel gates, expiry/payment/notification jobs.
+
+These are behavior references only; no source-code copying. Provider adapters are separate and must be handled in order PasarGuard → Rebecca → Sanaei/3x-ui. Sanaei does not support reseller creation; do not advertise it.
+
+### Last-known passing tests — do not repeat without a reason
+
+- Most recent full isolated suite: **504 passed in 64.246 seconds**, exit 0, `./scripts/run_isolated_tests.sh`.
+- Most recent focused combined adapter suites: **76 passed** (PasarGuard, Rebecca, Sanaei).
+- Static checks passed: `python3 -m compileall -q -f src tests scripts`; `bash -n scripts/*.sh`; `node --check customer_webapp/app.js`; `git diff --check`.
+- Latest source/test commit: `eff83db34d9a0116ca507da6158f8b84faab07cd`. The subsequent docs-only publication-verification commit is `f74be144d15ad87b4ed1f55c8d5c2cc0f0e5f80b`. Always verify live Git state before continuing.
+- Evidence level: E2 local unit/mock only. No live provider acceptance is established.
+
+**Anti-duplication rule:** do not rerun the 76 adapter tests or 504-test full suite merely as a startup ritual. These results remain the baseline until code changes, a concrete new defect/contract gap, or a necessary regression check gives a reason to run relevant tests. A docs-only change does not justify rerunning all tests. Record exact commands/counts/results whenever a justified run occurs.
+
+### Immediate next step — Phase 1: pagination contract research (not tests)
+
+Inspect existing list-users call paths and pinned SDK/API contracts. Review provider-version-specific official docs or source for total/offset/limit/cursor/next-page metadata and determine whether well-formed pages can be silently truncated. Do not implement automatic pagination or add adapter tests until evidence proves the contract and safe continuation behavior. Record URLs, version caveats, findings and uncertainty in docs/PROVIDER_CAPABILITY_MATRIX.md. If the contract cannot be established, mark completeness unknown and preserve caller-controlled pagination capped at 200. This phase is source/code research only; do not repeat completed adapter tests.
+
+### Remaining phases — do not skip or restart completed work
+
+- **Phase 2 — Customer purchase journey:** audit and complete catalog/category → detail/quote → confirmation → payment choice → order status. Reuse existing code and quote/snapshot guards.
+- **Phase 3 — Payments, wallet, discounts and recovery:** manual receipt submission/review, immutable wallet ledger, idempotency, discount validation, audit, and paid-but-undelivered reconciliation. Online gateways remain deferred; no blind retry/refund on ambiguous provider outcomes.
+- **Phase 4 — Fulfillment state machine:** manual, code/account inventory, file and panel fulfillment under one order lifecycle; atomic inventory reservation and replay-safe delivery.
+- **Phase 5 — PasarGuard first-provider acceptance:** complete contract/capability/reconciliation gaps and, only after explicit authorization, test on a disposable staging panel.
+- **Phase 6 — Support and notifications:** tickets, durable outbox, retry/idempotency and trust-channel behavior. Do not activate timers without authorization.
+- **Phase 7 — Rebecca:** fill only evidenced gaps, then staging acceptance under the same gate.
+- **Phase 8 — Sanaei/3x-ui:** fill evidenced gaps; honor token/legacy differences and whole-GiB quota; no reseller feature.
+- **Phase 9 — Admin operations:** reports, audit, backup/restore, installer and recovery UX.
+- **Phase 10 — Mini App:** after core purchase and fulfillment journeys; accessible responsive UI, reduced motion and CSS glass treatment only in the Web App.
+- **Phase 11 — Live acceptance/release:** authorized disposable staging only. No production panel, N2, mother bot, live process, secret, deployment or restart without separate explicit authorization.
+
+At the start of each phase, first map what already exists and the acceptance gap. Prefer a user-visible product milestone over an isolated test-only loop. Preserve the Telegram API rule in the master prompt: check latest official Bot API docs before meaningful UI/API changes, use only supported button styles and keep callback data within 1–64 bytes.
+
+### Safety and evidence
+
+No live panel/provider calls, production database, N2, active Telegram process, timers, deployments, restarts or secrets were touched in this documentation update. This entry is a handoff/roadmap clarification, not a claim of new product acceptance.
