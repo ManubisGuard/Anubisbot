@@ -61,7 +61,7 @@ UI quality requirements:
 - Completed locally/published: panel management/read-only checks; guided panel registration; category management; guided product creation for manual/inventory/file/panel fulfillment; guarded manual receipt review with audit navigation.
 - Latest adapter hardening (2026-10-28): PasarGuard rejects boolean/negative/malformed counters and incomplete auth before secret resolution. Rebecca and Sanaei reject boolean expiry/usage/quota fields; Sanaei fails closed on malformed mapped usage instead of silently returning zero. All three user-list APIs now reject a missing list envelope; Sanaei also rejects malformed list entries/settings instead of silently returning a partial snapshot. Mock timeout tests assert no blind retry for create/update/delete.
 - Phase 1 pagination public-source research is recorded; exact deployed versions and completeness remain unknown. Do not repeat adapter tests or implement auto-pagination without new version-specific evidence.
-- Phase 2 first slice completed: customer shop now separates category selection from product listing, pages four catalog items at a time, and keeps each category/product keyboard at eight buttons or fewer. Latest focused customer-bot suite: 141 passed in 26.378 seconds; latest full suite: 504 passed in 63.972 seconds. Continue Phase 2 with product detail/quote presentation, insufficient-wallet recovery and order-status journey.
+- Phase 2 progress: compact category/catalog navigation, insufficient-wallet recovery, and customer order-history status/support follow-up are implemented. Order history now explains `provisioning`, `active`, paid/pending-delivery and failed states in Persian, provides support-ticket navigation for orders needing follow-up, and warns against repeat purchases while provider outcome is uncertain. Latest focused customer-bot suite: 144 passed in 27.748 seconds; latest full isolated suite: 507 passed in 65.876 seconds. Next inspect whether history can safely distinguish a sanitized reconciliation-required state from ordinary provisioning; never expose provider references/payloads or trigger automatic retry/refund.
 - Live staging acceptance is blocked until a disposable panel and explicit authorization exist.
 - Online gateways remain deferred. Mini App expansion is later roadmap work.
 
@@ -83,10 +83,11 @@ Do not conflate reference bots with provider adapters. The supported provider or
 ## Test ledger and anti-duplication rule
 
 Latest verified checkpoint on 2026-10-28:
-- Latest full isolated suite after insufficient-wallet purchase recovery: **506 tests passed in 66.650 seconds**, exit 0, command `./scripts/run_isolated_tests.sh`.
+- Latest full isolated suite after order-status and paid-but-undelivered recovery clarity: **507 tests passed in 65.876 seconds**, exit 0, command `./scripts/run_isolated_tests.sh`.
+- Latest focused customer bot UI suite: **144 tests passed in 27.748 seconds**, exit 0, command `PYTHONPATH=src:scripts/test_support python3 -m unittest discover -s tests -p 'test_customer_bot.py' -v`.
 - Focused combined provider adapter suites: **76 tests passed** across PasarGuard, Rebecca and Sanaei.
 - Static checks passed: `python3 -m compileall -q -f src tests scripts`; `bash -n scripts/*.sh`; `node --check customer_webapp/app.js`; `git diff --check`.
-- Latest published baseline before the current uncommitted Phase 2 slice: `1647fb4142f98450c5572d19e024feb03c4fb829` (`Improve compact customer shop navigation`). Verify live branch/HEAD before relying on these values.
+- Published baseline before the latest order-status slice: `5c4dffe56048119771766cb1d33b249d7000c577` (`Improve insufficient-wallet purchase recovery`). For the current source of truth, verify the branch/HEAD and read the latest commit entry in `docs/PROGRESS.md`; do not rely on a stale static SHA.
 - Evidence is **E2 local unit/mock**. These results do not prove live provider compatibility or permissions.
 
 Do not rerun the adapter suite or full suite merely to “check again” at the start of the next session. Preserve these as the last-known passing results. Run tests again only when a code change can affect them, a new behavior/contract gap is identified, or a focused regression check is necessary. For docs-only changes, use diff/format/status/hash verification; do not spend a full test run repeating unchanged code. If tests are run for a genuine reason, record exact command, count, duration and exit status.
@@ -112,6 +113,8 @@ After Phase 1, proceed through these product-first phases. Before each phase, in
 
 1. Read this master prompt, then docs/PROGRESS.md, README.md, and docs/PROVIDER_CAPABILITY_MATRIX.md.
 2. Verify device label, repository path, branch, local/remote HEAD, clean status and latest GitHub commit. Do not trust old chat state.
-3. Continue **Phase 2 customer purchase journey** from the next gap: order-status and paid-but-undelivered recovery clarity. Compact category/catalog navigation and insufficient-wallet recovery are implemented and tested; do not rebuild them. Phase 1 version-specific/live pagination completeness remains unresolved. Do not begin by rerunning adapter tests.
+3. Continue **Phase 2 customer purchase journey** from the next gap: determine whether order history should distinguish ordinary provisioning from a sanitized reconciliation-required state. Compact category/catalog navigation, insufficient-wallet recovery, and basic order-status/support follow-up are implemented and tested; do not rebuild them. Phase 1 version-specific/live pagination completeness remains unresolved. Do not begin by rerunning adapter tests.
 4. Keep the four reference bots and provider order above; preserve product-first milestones and evidence labels.
 5. After a meaningful step, update this file only if the governing rules/roadmap changed; append the actual evidence to docs/PROGRESS.md. Keep these two files as the single source of handoff truth.
+
+[executed on device: 8017638839-32c511 (fc69b50d-fe64-47f9-ab6a-705be5de41dc)]

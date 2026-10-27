@@ -290,3 +290,31 @@ Catalog navigation is now compact, but both manual-product and panel-product pur
 ### Next Phase 2 task
 
 Continue with **order-status and paid-but-undelivered recovery clarity**. Inspect the existing order history/status labels and recovery/reconciliation callbacks first; preserve idempotency and never blindly retry a provider mutation or automatically refund an ambiguous outcome. Do not revisit catalog navigation or rerun adapter tests separately.
+
+
+## Phase 2 slice 3 — order status and paid-but-undelivered recovery clarity (2026-10-28)
+
+### Audit finding
+
+The existing order history already combines panel and manual orders, scopes history to the customer, and supports safe file redelivery without charging again. However, real panel-order states `provisioning` and `active` were rendered as raw internal labels, and paid/manual orders awaiting delivery had no direct support follow-up from the history screen.
+
+### Implemented
+
+- Added customer-facing Persian labels for actual `provisioning` and `active` states, plus clearer paid/pending-delivery and failed/reconciliation wording.
+- Added per-order support follow-up buttons for paid, provisioning, pending-delivery, failed, and reconciliation-needed states. The history screen tells customers to include the order ID in their ticket.
+- Added explicit guidance not to repeat a purchase while provider outcome is uncertain; existing reconciliation logic remains read-only until an operator finalizes verified evidence. No automatic refund, provider mutation retry, or new recovery mutation was added.
+- Preserved existing owner-scoped file redelivery, which only serves a fulfilled file order and does not debit the wallet again.
+- Added a focused regression test for provisioning/pending-delivery/active status clarity and support navigation without offering a repeat purchase.
+
+### Validation
+
+- Focused customer bot UI suite: **144 tests passed in 27.748 seconds**, exit 0. Command: `PYTHONPATH=src:scripts/test_support python3 -m unittest discover -s tests -p 'test_customer_bot.py' -v`. The new test first caught a Persian half-space assertion mismatch; assertion was corrected and both the targeted test and full focused suite passed.
+- Full isolated suite: **507 tests passed in 65.876 seconds**, exit 0. Command: `./scripts/run_isolated_tests.sh`. Adapter tests ran only as part of this required full-suite regression run; no standalone adapter suite was run.
+- Static checks passed: `python3 -m compileall -q -f src tests scripts`; `bash -n scripts/*.sh`; `node --check customer_webapp/app.js`; `git diff --check`.
+- Evidence remains E2 local unit/mock only. No live Telegram bot, provider API, production panel/database, N2, timer, deployment, restart, or secret was touched.
+
+### Next Phase 2 task
+
+Audit whether order-history status needs a customer-safe distinction between a panel order that is still provisioning and one flagged for reconciliation. The provider marker is intentionally not exposed in the customer history query today; if adding this distinction, expose only a sanitized boolean/state label and never provider references or provisioning payloads. Preserve no-blind-retry/no-auto-refund rules. Do not rebuild catalog navigation or insufficient-wallet recovery.
+
+[executed on device: 8017638839-32c511 (fc69b50d-fe64-47f9-ab6a-705be5de41dc)]
