@@ -2179,6 +2179,22 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.api.call.await_args.args[1]["document"], "history-telegram-file-id")
         self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 800)
 
+    async def test_order_history_links_active_panel_orders_to_services_and_caps_keyboard_at_eight(self):
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        orders = [{"order_id": f"active-panel-{index}", "title": f"Panel {index}",
+            "amount_minor": 500, "currency": "IRR", "status": "active",
+            "created_at": f"2026-10-{28-index:02d} 00:00:00", "updated_at": "2026-10-28 00:01:00",
+            "discount_code": "", "discount_amount_minor": 0, "order_kind": "panel",
+            "can_redeliver_file": False, "can_redeliver_delivery": False} for index in range(5)]
+        with patch.object(self.bot.data, "list_customer_orders", return_value=orders):
+            await self.bot._handle_callback({"id":"active-panel-history","from":{"id":999},
+                "message":{"message_id":756,"chat":{"id":999,"type":"private"}}, "data":"customer:orders:0"})
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        callbacks = [button.get("callback_data") for row in keyboard["inline_keyboard"] for button in row]
+        self.assertIn("customer:services", callbacks)
+        self.assertIn("صفحه 1 از 2", body)
+        self.assertLessEqual(sum(len(row) for row in keyboard["inline_keyboard"]), 8)
+
     async def test_order_history_redelivers_inventory_payload_only_to_owner_without_recharge(self):
         self.bot.api.call = AsyncMock(return_value={"ok": True})
         self.bot.data.ensure_customer(999, first_name="Buyer")

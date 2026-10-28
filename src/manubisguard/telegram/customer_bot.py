@@ -3991,7 +3991,8 @@ class CustomerBot:
             except ValueError:
                 page = 0
             orders = self.data.list_customer_orders(uid, limit=50)
-            page_size = 5
+            # Four orders per page keeps worst-case actions + navigation + Home/Shop at eight buttons.
+            page_size = 4
             page_count = max(1, (len(orders) + page_size - 1) // page_size)
             page = min(page, page_count - 1)
             status_labels = {
@@ -4007,6 +4008,7 @@ class CustomerBot:
             lines = [f"🧾 سفارش‌های من — صفحه {page + 1} از {page_count}"]
             selected = orders[page * page_size:(page + 1) * page_size]
             file_buttons = []
+            service_buttons = []
             followup_buttons = []
             for order in selected:
                 status = str(order.get("status") or "unknown")
@@ -4019,12 +4021,15 @@ class CustomerBot:
                        if order.get("discount_code") else "")
                     + (f"\nآخرین تغییر: {order['updated_at']}" if order.get("updated_at") else "")
                 )
-                if order.get("can_redeliver_delivery") or order.get("can_redeliver_file"):
+                if status == "active" and order.get("order_kind") == "panel":
+                    service_buttons.append([{"text": f"⚙️ مشاهده سرویس‌ها {str(order['order_id'])[:8]}",
+                        "callback_data": "customer:services"}])
+                elif order.get("can_redeliver_delivery") or order.get("can_redeliver_file"):
                     mode = str(order.get("delivery_mode") or "")
                     label = "📥 دریافت فایل دوباره" if mode == "file" or order.get("can_redeliver_file") else "📦 دریافت دوباره اطلاعات تحویل"
                     file_buttons.append([{"text": f"{label} {str(order['order_id'])[:8]}",
                         "callback_data": f"customer:delivery_retry:{order['order_id']}"}])
-                if status in {"paid", "provisioning", "pending_delivery", "failed", "reconcile_required"}:
+                elif status in {"paid", "provisioning", "pending_delivery", "failed", "reconcile_required"}:
                     followup_buttons.append([{"text": f"🎫 پیگیری سفارش {str(order['order_id'])[:8]}",
                         "callback_data": "customer:support:new"}])
             if followup_buttons:
@@ -4040,6 +4045,7 @@ class CustomerBot:
             if navigation:
                 rows.append(navigation)
             rows.extend(file_buttons)
+            rows.extend(service_buttons)
             rows.extend(followup_buttons)
             rows.extend([
                 [{"text": "🛒 بازگشت به فروشگاه", "callback_data": "customer:shop"}],

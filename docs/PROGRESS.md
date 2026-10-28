@@ -405,3 +405,29 @@ The order history exposed redelivery only for fulfilled file orders. Instant/man
 ### Next Phase 2 task
 
 Continue the customer purchase journey audit for any remaining gaps in product detail/quote clarity and delivery notifications. Confirm all modes (manual, file, inventory, panel) recover from Telegram send failures without repeat charges, while avoiding duplicate payload exposure in public catalog/history views. Do not add online gateways or trigger live panel tests.
+
+
+## Phase 2 slice 7 — order history navigation and button budget (2026-10-28)
+
+### Audit finding
+
+If the immediate Telegram message for a panel purchase is missed, the created service is still available in the customer's private service list, but order history did not provide a direct route to that list. Order history also displayed five orders per page; when each order had a follow-up action, the keyboard could exceed the project's eight-button UX limit.
+
+### Implemented
+
+- Active panel orders now show a direct `customer:services` action, so customers can recover the created service and open its private details without making a second purchase.
+- Order history now displays four orders per page. In the worst case this permits four per-order actions, two pagination buttons, Shop and Home: eight buttons total.
+- Kept actions mutually exclusive per order: active panel order -> services; fulfilled manual order -> saved delivery redelivery; pending/uncertain/failed order -> support follow-up.
+- No purchase, provider mutation, wallet debit, or refund occurs when using the new services navigation.
+- Added regression coverage for active panel service navigation, pagination, and the eight-button ceiling.
+
+### Validation
+
+- Focused customer bot suite: **146 tests passed in 27.120 seconds**, exit 0. Command: `PYTHONPATH=src:scripts/test_support python3 -m unittest discover -s tests -p 'test_customer_bot.py' -v`.
+- Full isolated suite: **511 tests passed in 62.408 seconds**, exit 0. Command: `./scripts/run_isolated_tests.sh`.
+- Static checks passed: `python3 -m compileall -q -f src tests scripts`; `bash -n scripts/*.sh`; `node --check customer_webapp/app.js`; `git diff --check`.
+- Evidence remains E2 local unit/mock only. No live Telegram bot, provider API, production panel/database, N2, timer, deployment, restart, or secret was touched.
+
+### Next Phase 2 task
+
+Audit notification durability for panel purchases after a service is created but the immediate customer Telegram response fails. Prefer a durable, idempotent customer outbox that references the saved service/order and never repeats provider creation. Keep private subscription URLs out of generic logs and trust-channel payloads. Do not add online gateways or run live adapter tests.
