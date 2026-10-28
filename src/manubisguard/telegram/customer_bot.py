@@ -397,6 +397,43 @@ class CustomerBot:
                             item["order_id"], type(exc).__name__)
         return counts
 
+    async def _deliver_customer_panel_order_notifications(self, *, now: float | None = None,
+                                                           limit: int = 20) -> dict[str, int]:
+        """Recover customer delivery after panel creation without repeating provider mutations."""
+        counts = {"sent": 0, "retry": 0, "dead": 0}
+        for item in self.data.claim_customer_panel_order_notifications(limit=limit, now=now):
+            order_id = str(item["order_id"])
+            target = int(item["telegram_id"])
+            title = str(item.get("product_title") or item.get("product_id") or "سرویس")
+            username = str(item.get("username") or "")
+            body = (f"✅ سرویس خریداری‌شده آماده است.\nمحصول: {title}\n"
+                    f"شناسه سفارش: {order_id}\nنام کاربری: {username}\n"
+                    f"مبلغ اولیه: {int(item['amount_minor']):,} {item['currency']}\n"
+                    "برای مشاهده جزئیات، از بخش سرویس‌های من استفاده کن.")
+            subscription_url = str(item.get("subscription_url") or "").strip()
+            if subscription_url:
+                body += f"\n\nلینک خصوصی اشتراک:\n{subscription_url}"
+            markup = {"inline_keyboard": [
+                [{"text": "🔐 سرویس‌های من", "callback_data": "customer:services", "style": "primary"}],
+                [{"text": "🧾 سفارش‌های من", "callback_data": "customer:orders:0"}],
+            ]}
+            try:
+                await self.api.send_text(target, body, markup)
+                self.data.mark_customer_panel_order_notification_sent(order_id, now=now)
+                counts["sent"] += 1
+            except Exception as exc:
+                try:
+                    status = self.data.retry_customer_panel_order_notification(
+                        int(item["notification_id"]), attempt=int(item["attempts"]),
+                        error_code=type(exc).__name__.lower(), now=now, max_attempts=8)
+                    counts["dead" if status == "dead" else "retry"] += 1
+                except Exception as state_exc:
+                    LOG.error("Panel-order notification state update failed for order %s (%s)",
+                              order_id[:20], type(state_exc).__name__)
+                LOG.warning("Panel-order customer notification failed for order %s (%s)",
+                            order_id[:20], type(exc).__name__)
+        return counts
+
     async def _deliver_admin_notifications(self, *, now: float | None = None, limit: int = 20) -> dict[str, int]:
         """Deliver shared admin events one destination at a time; successful routes are never retried."""
         counts = {"sent": 0, "retry": 0, "dead": 0}
@@ -4265,6 +4302,7 @@ class CustomerBot:
                         {"public_order_id": outcome.order_id[:20], "amount_minor": outcome.amount_minor,
                          "currency": outcome.currency}, f"purchase:{outcome.order_id}")
                 await self.api.send_text(chat_id, body, BACK_MENU)
+                self.data.mark_customer_panel_order_notification_sent(outcome.order_id)
             except PurchaseNeedsReconciliation as exc:
                 await self.api.send_text(chat_id, f"سفارش برای جلوگیری از ساخت تکراری در وضعیت بررسی قرار گرفت. مبلغ رزرو شده است و باید نتیجه پنل بررسی شود.\n{exc}", BACK_MENU)
             except (CustomerStoreError, ValueError) as exc:
@@ -4349,6 +4387,7 @@ class CustomerBot:
                 body = f"کانفیگ نمایندگی ساخته شد.\nشناسه سفارش: {outcome.order_id}\nنام کاربری: {outcome.username}"
                 if outcome.subscription_url: body += f"\nلینک کانفیگ/اشتراک:\n{outcome.subscription_url}"
                 await self.api.send_text(chat_id, body, BACK_MENU)
+                self.data.mark_customer_panel_order_notification_sent(outcome.order_id)
             except (CustomerStoreError, PurchaseNeedsReconciliation) as exc:
                 await self.api.send_text(chat_id, f"ساخت کانفیگ انجام نشد یا نیازمند بررسی است: {exc}", BACK_MENU)
             return
@@ -4585,6 +4624,10 @@ class CustomerBot:
                     await self._deliver_customer_payment_notifications(limit=20)
                 except Exception as exc:
                     LOG.warning("Customer payment notification worker failed (%s)", type(exc).__name__)
+                try:
+                    await self._deliver_customer_panel_order_notifications(limit=20)
+                except Exception as exc:
+                    LOG.warning("Panel-order customer notification worker failed (%s)", type(exc).__name__)
                 try:
                     await self._deliver_admin_notifications(limit=20)
                 except Exception as exc:

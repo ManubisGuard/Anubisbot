@@ -462,7 +462,7 @@ class CustomerDataStore:
                     int(row["version"])
                     for row in db.execute("SELECT version FROM schema_migrations").fetchall()
                 }
-                unknown_versions = sorted(version for version in applied if version > 21)
+                unknown_versions = sorted(version for version in applied if version > 22)
                 if unknown_versions:
                     raise CustomerStoreError(
                         "Database schema is newer than this application supports"
@@ -978,6 +978,30 @@ class CustomerDataStore:
                     db.execute("INSERT INTO schema_migrations(version,name) VALUES(21,?)",
                                ("panel_connection_state_audit",))
                     applied.add(21)
+                # v22 queues customer-facing panel-order delivery by reference. Private
+                # subscription URLs stay in customer_services, never in outbox payloads.
+                if 22 not in applied:
+                    db.execute("""CREATE TABLE IF NOT EXISTS customer_panel_order_notifications (
+                        notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tenant_id TEXT NOT NULL,
+                        order_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending'
+                            CHECK(status IN ('pending','processing','sent','dead')),
+                        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                        available_at REAL NOT NULL,
+                        created_at REAL NOT NULL,
+                        claimed_at REAL,
+                        sent_at REAL,
+                        last_error_code TEXT,
+                        UNIQUE(tenant_id,order_id),
+                        FOREIGN KEY(tenant_id,order_id)
+                            REFERENCES customer_orders(tenant_id,order_id)
+                    )""")
+                    db.execute("CREATE INDEX IF NOT EXISTS ix_customer_panel_order_notifications_due "
+                               "ON customer_panel_order_notifications(tenant_id,status,available_at,notification_id)")
+                    db.execute("INSERT INTO schema_migrations(version,name) VALUES(22,?)",
+                               ("durable_panel_order_customer_notification",))
+                    applied.add(22)
                 # Reinstall append-only triggers if an older database has the table
                 # but lacks the current protection triggers.
                 db.execute("""CREATE TRIGGER IF NOT EXISTS panel_connection_events_no_update
@@ -3797,6 +3821,11 @@ class CustomerDataStore:
             if not service or service_id != order_id or int(service["telegram_id"]) != int(row["telegram_id"]) or service["product_id"] != row["product_id"]:
                 raise CustomerStoreError("Provisioned service does not match the reserved order")
             db.execute("UPDATE customer_orders SET status='active',provider_reference=?,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=? AND order_id=?", (provider_reference[:256], self.tenant_id, order_id))
+            notification_now = time.time()
+            db.execute("""INSERT OR IGNORE INTO customer_panel_order_notifications
+                (tenant_id,order_id,status,attempts,available_at,created_at)
+                VALUES(?,?,'pending',0,?,?)""",
+                (self.tenant_id, order_id, notification_now + 30, notification_now))
             self._enqueue_trust_event_in_transaction(db, event_type="new_subscription",
                 idempotency_key=f"purchase:{order_id}", payload={"public_order_id": order_id[:20],
                     "amount_minor": int(row["amount_minor"]), "currency": str(row["currency"])})
@@ -3805,6 +3834,97 @@ class CustomerDataStore:
             db.rollback(); raise
         finally:
             db.close()
+
+    def claim_customer_panel_order_notifications(self, *, limit: int = 20, now: float | None = None,
+                                                 lease_seconds: int = 300) -> list[dict[str, Any]]:
+        """Claim due customer notices and resolve private delivery data from the saved service."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise CustomerStoreError("Panel-order notification batch limit must be between 1 and 100")
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or not 30 <= lease_seconds <= 3600:
+            raise CustomerStoreError("Panel-order notification lease must be between 30 and 3600 seconds")
+        ts = time.time() if now is None else float(now)
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""UPDATE customer_panel_order_notifications
+                SET status='pending',claimed_at=NULL,available_at=?
+                WHERE tenant_id=? AND status='processing' AND claimed_at<=?""",
+                (ts, self.tenant_id, ts - lease_seconds))
+            rows = db.execute("""SELECT n.notification_id
+                FROM customer_panel_order_notifications n
+                JOIN customer_orders o ON o.tenant_id=n.tenant_id AND o.order_id=n.order_id
+                JOIN customer_services s ON s.tenant_id=o.tenant_id AND s.service_id=o.order_id
+                WHERE n.tenant_id=? AND n.status='pending' AND n.available_at<=?
+                  AND o.status='active' AND s.status='active'
+                  AND s.telegram_id=o.telegram_id
+                ORDER BY n.notification_id LIMIT ?""", (self.tenant_id, ts, limit)).fetchall()
+            claimed: list[dict[str, Any]] = []
+            for row in rows:
+                notification_id = int(row["notification_id"])
+                cur = db.execute("""UPDATE customer_panel_order_notifications
+                    SET status='processing',attempts=attempts+1,claimed_at=?
+                    WHERE tenant_id=? AND notification_id=? AND status='pending'""",
+                    (ts, self.tenant_id, notification_id))
+                if cur.rowcount != 1:
+                    continue
+                item = db.execute("""SELECT n.notification_id,n.order_id,n.attempts,
+                    o.telegram_id,o.product_id,o.amount_minor,o.currency,
+                    COALESCE(p.title,o.product_id) AS product_title,
+                    s.username,s.subscription_url
+                    FROM customer_panel_order_notifications n
+                    JOIN customer_orders o ON o.tenant_id=n.tenant_id AND o.order_id=n.order_id
+                    JOIN customer_services s ON s.tenant_id=o.tenant_id AND s.service_id=o.order_id
+                    LEFT JOIN customer_products p ON p.tenant_id=o.tenant_id AND p.product_id=o.product_id
+                    WHERE n.tenant_id=? AND n.notification_id=? AND o.status='active' AND s.status='active'
+                      AND s.telegram_id=o.telegram_id""", (self.tenant_id, notification_id)).fetchone()
+                if item:
+                    claimed.append(dict(item))
+            db.commit()
+            return claimed
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def mark_customer_panel_order_notification_sent(self, order_id: str, *, now: float | None = None) -> bool:
+        ts = time.time() if now is None else float(now)
+        with self._connect() as db:
+            cur = db.execute("""UPDATE customer_panel_order_notifications
+                SET status='sent',sent_at=?,claimed_at=NULL,last_error_code=NULL
+                WHERE tenant_id=? AND order_id=? AND status IN ('pending','processing')""",
+                (ts, self.tenant_id, order_id))
+        return cur.rowcount == 1
+
+    def retry_customer_panel_order_notification(self, notification_id: int, *, attempt: int,
+                                                error_code: str, now: float | None = None,
+                                                max_attempts: int = 8) -> str:
+        safe_code = str(error_code).lower()
+        if not re.fullmatch(r"[a-z0-9_-]{1,80}", safe_code):
+            raise CustomerStoreError("Panel-order notification error code must be short and non-sensitive")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise CustomerStoreError("Invalid panel-order notification attempt")
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+            raise CustomerStoreError("Invalid maximum panel-order notification attempts")
+        ts = time.time() if now is None else float(now)
+        status = "dead" if attempt >= max_attempts else "pending"
+        next_at = ts + min(3600, 2 ** min(attempt, 10))
+        with self._connect() as db:
+            cur = db.execute("""UPDATE customer_panel_order_notifications
+                SET status=?,available_at=?,claimed_at=NULL,last_error_code=?
+                WHERE tenant_id=? AND notification_id=? AND status='processing'""",
+                (status, next_at, safe_code, self.tenant_id, notification_id))
+            if cur.rowcount != 1:
+                raise CustomerStoreError("Panel-order notification is not in processing state")
+        return status
+
+    def get_customer_panel_order_notification(self, order_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute("""SELECT notification_id,tenant_id,order_id,status,attempts,
+                available_at,created_at,claimed_at,sent_at,last_error_code
+                FROM customer_panel_order_notifications WHERE tenant_id=? AND order_id=?""",
+                (self.tenant_id, order_id)).fetchone()
+        return dict(row) if row else None
 
     def resolve_product_order_target_present(self, *, order_id: str, actor_telegram_id: int,
                                              provider_kind: str, provider_user_id: str, username: str,

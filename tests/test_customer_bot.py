@@ -2024,6 +2024,34 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
             "message":{"chat":{"id":999,"type":"private"},"message_id":12},"data":callback})
         self.assertEqual(self.bot.purchase_service.buy_from_wallet.await_args.kwargs["expected_quote_hash"], quote_hash)
 
+    async def test_panel_order_outbox_recovers_customer_message_with_private_service_details(self):
+        self.bot.data.ensure_customer(999, username="buyer", first_name="Buyer")
+        self.bot.data.put_product(product_id="notify-panel", title="Recovery plan", price_minor=1500,
+            currency="IRR", panel_id="panel-notify", duration_hours=24, traffic_bytes=1024)
+        order = self.bot.data.create_order(order_id="notify-panel-order", telegram_id=999,
+            product_id="notify-panel", idempotency_key="notify-panel-key")
+        self.bot.data.transition_order(order_id=order["order_id"], new_status="paid")
+        self.bot.data.transition_order(order_id=order["order_id"], new_status="provisioning")
+        private_url = "https://subscription.example/private/secret-token"
+        self.bot.data.create_metered_service(service_id=order["order_id"], telegram_id=999,
+            product={"product_id":"notify-panel", "panel_id":"panel-notify", "pricing_mode":"fixed",
+                     "currency":"IRR", "unit_price_minor":0, "duration_hours":24, "traffic_bytes":1024},
+            provider_user_id="provider-notify", username="alice-notify", subscription_url=private_url, now=1000)
+        self.bot.data.finalize_product_order(order_id=order["order_id"], service_id=order["order_id"],
+                                             provider_reference="provider-notify")
+        notification = self.bot.data.get_customer_panel_order_notification(order["order_id"])
+        result = await self.bot._deliver_customer_panel_order_notifications(now=notification["available_at"] + 1)
+        self.assertEqual(result, {"sent": 1, "retry": 0, "dead": 0})
+        args = self.bot.api.send_text.await_args
+        self.assertEqual(args.args[0], 999)
+        self.assertIn("Recovery plan", args.args[1])
+        self.assertIn(order["order_id"], args.args[1])
+        self.assertIn(private_url, args.args[1])
+        callbacks = {button.get("callback_data") for row in args.args[2]["inline_keyboard"] for button in row}
+        self.assertIn("customer:services", callbacks)
+        self.assertIn("customer:orders:0", callbacks)
+        self.assertEqual(self.bot.data.get_customer_panel_order_notification(order["order_id"])["status"], "sent")
+
     async def test_manual_purchase_insufficient_wallet_offers_deposit_recovery(self):
         self.bot.data.ensure_customer(999, first_name="Buyer")
         self.bot.data.put_manual_product(product_id="low-balance-manual", title="Paid item",

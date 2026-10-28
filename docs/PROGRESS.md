@@ -431,3 +431,35 @@ If the immediate Telegram message for a panel purchase is missed, the created se
 ### Next Phase 2 task
 
 Audit notification durability for panel purchases after a service is created but the immediate customer Telegram response fails. Prefer a durable, idempotent customer outbox that references the saved service/order and never repeats provider creation. Keep private subscription URLs out of generic logs and trust-channel payloads. Do not add online gateways or run live adapter tests.
+
+
+## Phase 2 slice 8 — durable customer notice after panel service creation (2026-10-28)
+
+### Audit finding
+
+A panel-backed purchase persisted the service and marked the order active before sending the immediate Telegram confirmation. If Telegram delivery failed after the provider create/finalization succeeded, the customer could recover the service through My Services/order history, but there was no durable customer-notification record to retry the original confirmation. The existing trust-channel outbox intentionally filters subscription URLs and therefore cannot serve as a private customer-delivery queue.
+
+### Implemented
+
+- Added schema migration v22 with a tenant-scoped, unique-per-order `customer_panel_order_notifications` outbox. It references the saved order; it does not duplicate a subscription URL or other delivery payload into the outbox row.
+- `finalize_product_order()` now enqueues the customer notice in the same SQLite transaction as the transition to active and trust-channel event. The notice becomes eligible after a 30-second grace window so the normal immediate response can mark it sent first.
+- Added atomic claim/lease recovery, retry backoff, sanitized error codes, dead-letter status, tenant scoping and sent-state updates. The worker only resolves delivery details by joining an active order to its matching active, owner-scoped saved service; it never calls a provider or repeats a purchase.
+- Added a customer notification worker to the existing polling loop. If immediate delivery succeeds, the handler marks the queued notice sent; if it fails or the process exits after service finalization, the durable worker can retry. The private subscription URL is sent only in the customer's private chat and is not stored in the outbox or written to logs/trust-channel events.
+- Recovery messages include order ID plus My Services and order-history navigation. The Telegram keyboard uses existing supported button types/styles; no unsupported native glass effect is claimed.
+- Added regression coverage for delayed availability, tenant isolation, private URL exclusion from outbox storage, successful delivery and sent-state persistence.
+
+### Validation
+
+- Customer store suite: **111 tests passed in 18.336 seconds**, exit 0. Command: `PYTHONPATH=src:scripts/test_support python3 -m unittest discover -s tests -p 'test_customer_store.py' -v`.
+- Targeted customer notification-worker regression: **1 test passed in 0.195 seconds**, exit 0. Command: `PYTHONPATH=src:scripts/test_support python3 -m unittest tests.test_customer_bot.CustomerBotUITests.test_panel_order_outbox_recovers_customer_message_with_private_service_details -v`.
+- Full isolated regression suite: **513 tests passed in 65.413 seconds**, exit 0. Command: `./scripts/run_isolated_tests.sh`.
+- Static checks passed: `python3 -m compileall -q -f src tests scripts`; `bash -n scripts/*.sh`; `node --check customer_webapp/app.js`; `git diff --check`.
+- Telegram API documentation was checked before this UI-related implementation: official Bot API **10.3**, dated 2026-08-24: https://core.telegram.org/bots/api and https://core.telegram.org/bots/api-changelog. This change uses the existing `sendMessage` flow and standard inline keyboard behavior; no new Bot API method is assumed.
+- Evidence level is **E2 local unit/mock** only. No live Telegram API call, live provider API, production panel/database, N2, mother bot, deployment, service restart, timer activation or secret access was performed.
+- Publication status: the six-file change is committed locally using the repository's verified existing author identity. A non-force push was attempted and rejected because this workspace has no GitHub HTTPS credentials (`could not read Username`); remote `feature/discount-codes` remains at `11c0073f977381598dbbb2eb58a87e30917a8ee1`. Do not force-push. Publish this local commit non-forcefully after GitHub authentication is restored.
+
+### Known limits and next step
+
+- Telegram delivery is at-least-once, not exactly-once: a network failure after Telegram accepted a message but before the client received confirmation can still cause a duplicate notice. The worker never repeats provider creation or wallet charging.
+- There is no operator-facing dead-letter requeue command for this new panel-order queue yet; dead letters remain visible in SQLite for a future admin-operations slice. The normal My Services and order-history paths remain available as customer recovery paths.
+- Continue Phase 2 by auditing product detail/quote clarity and verifying fulfillment-state alignment across manual, file, inventory and panel-backed orders. Do not repeat completed navigation/wallet recovery work or run live panel tests.
