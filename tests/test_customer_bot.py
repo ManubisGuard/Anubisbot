@@ -2170,7 +2170,7 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("History download", body)
         self.assertNotIn("history-telegram-file-id", body)
         retry_button = next(button for row in keyboard["inline_keyboard"] for button in row
-                            if button["callback_data"] == f"customer:file_retry:{order['order_id']}")
+                            if button["callback_data"] == f"customer:delivery_retry:{order['order_id']}")
         self.assertIn("دریافت فایل", retry_button["text"])
         await self.bot._handle_callback({"id":"history-file-retry","from":{"id":999},
             "message":{"message_id":751,"chat":{"id":999,"type":"private"}},
@@ -2178,6 +2178,32 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.bot.api.call.assert_awaited_once()
         self.assertEqual(self.bot.api.call.await_args.args[1]["document"], "history-telegram-file-id")
         self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 800)
+
+    async def test_order_history_redelivers_inventory_payload_only_to_owner_without_recharge(self):
+        self.bot.api.call = AsyncMock(return_value={"ok": True})
+        self.bot.data.ensure_customer(999, first_name="Buyer")
+        self.bot.data.post_wallet_entry(telegram_id=999, idempotency_key="history-inventory-fund", amount_minor=1000, entry_type="deposit")
+        self.bot.data.put_manual_product(product_id="history-inventory", title="History key", price_minor=400,
+            currency="IRR", delivery_mode="inventory")
+        self.bot.data.add_manual_inventory_key(product_id="history-inventory", secret_payload="UNIQUE-SECRET-KEY")
+        order = self.bot.data.buy_manual_product(telegram_id=999, product_id="history-inventory",
+            idempotency_key="history-inventory-order")
+        await self.bot._handle_callback({"id":"history-inventory-list","from":{"id":999},
+            "message":{"message_id":753,"chat":{"id":999,"type":"private"}}, "data":"customer:orders:0"})
+        body, keyboard = self.bot.api.send_text.await_args.args[1:3]
+        self.assertNotIn("UNIQUE-SECRET-KEY", body)
+        button = next(button for row in keyboard["inline_keyboard"] for button in row
+            if button.get("callback_data") == f"customer:delivery_retry:{order['order_id']}")
+        self.assertIn("اطلاعات تحویل", button["text"])
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"history-inventory-redeliver","from":{"id":999},
+            "message":{"message_id":754,"chat":{"id":999,"type":"private"}}, "data":button["callback_data"]})
+        self.assertIn("UNIQUE-SECRET-KEY", self.bot.api.send_text.await_args.args[1])
+        self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 600)
+        self.bot.api.send_text.reset_mock()
+        await self.bot._handle_callback({"id":"history-inventory-other-owner","from":{"id":1000},
+            "message":{"message_id":755,"chat":{"id":1000,"type":"private"}}, "data":button["callback_data"]})
+        self.assertNotIn("UNIQUE-SECRET-KEY", self.bot.api.send_text.await_args.args[1])
 
     async def test_order_history_explains_inflight_orders_and_offers_safe_support_followup(self):
         self.bot.data.ensure_customer(999, first_name="Buyer")

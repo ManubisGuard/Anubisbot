@@ -377,3 +377,31 @@ The customer wallet already mapped the core manual payment states correctly, but
 ### Next Phase 2 task
 
 Review product detail and quote screens for customer clarity, then verify the displayed fulfillment state for manual, file and inventory orders remains aligned with actual order status and notification state. Avoid rebuilding completed catalog navigation and wallet recovery; preserve idempotency and never expose inventory payloads before purchase.
+
+
+## Phase 2 slice 6 — fulfilled manual-order redelivery recovery (2026-10-28)
+
+### Audit finding
+
+The order history exposed redelivery only for fulfilled file orders. Instant/manual and inventory-backed orders also retain their exact delivery payload in the immutable order snapshot, but a customer who lost the original message had no history action to retrieve that already-purchased payload. Repeating the purchase was not a safe recovery path.
+
+### Implemented
+
+- The minimal order-history result now includes a safe `can_redeliver_delivery` flag for fulfilled manual orders with a non-empty saved payload, plus the non-secret delivery mode. It never returns the payload or Telegram file ID in history.
+- The owner-scoped delivery lookup now supports any fulfilled manual-order delivery mode, not just files. It still requires the exact tenant, order ID, owning Telegram user, fulfilled state and non-empty saved payload.
+- Order history now offers a generic redelivery action for fulfilled file, instant, inventory and manually fulfilled orders. Existing `file_retry` callbacks remain supported for older file-delivery messages; new history actions use `delivery_retry`.
+- File orders still use Telegram `sendDocument`; other fulfillment modes resend the original saved delivery text. This reads the existing order only: it does not run purchase, consume inventory again, mutate status or debit the wallet.
+- Added store and UI regression tests for inventory payload redelivery, no secret in order history, owner/tenant boundary, and unchanged wallet balance. Existing file redelivery and failure-retry coverage remains intact.
+
+### Validation
+
+- Customer store suite: **110 tests passed in 17.363 seconds**, exit 0.
+- Customer bot suite: **145 tests passed in 27.127 seconds**, exit 0. Command: `PYTHONPATH=src:scripts/test_support python3 -m unittest discover -s tests -p 'test_customer_bot.py' -v`.
+- Full isolated suite: **510 tests passed in 66.282 seconds**, exit 0. Command: `./scripts/run_isolated_tests.sh`.
+- Static checks passed: `python3 -m compileall -q -f src tests scripts`; `bash -n scripts/*.sh`; `node --check customer_webapp/app.js`; `git diff --check`.
+- One first-pass UI assertion exposed a legacy file retry callback expectation; kept that legacy callback supported and reran the affected tests plus the full focused and isolated suites successfully.
+- Evidence remains E2 local unit/mock only. No live Telegram bot, provider API, production panel/database, N2, timer, deployment, restart or secret was touched.
+
+### Next Phase 2 task
+
+Continue the customer purchase journey audit for any remaining gaps in product detail/quote clarity and delivery notifications. Confirm all modes (manual, file, inventory, panel) recover from Telegram send failures without repeat charges, while avoiding duplicate payload exposure in public catalog/history views. Do not add online gateways or trigger live panel tests.

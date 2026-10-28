@@ -1274,7 +1274,7 @@ class CustomerDataStore:
                 raise CustomerStoreError("Manual product variant not found")
 
     def get_manual_order_delivery(self, *, order_id: str, telegram_id: int) -> dict[str, Any] | None:
-        """Return a file delivery only to its owning customer and only for a fulfilled file order."""
+        """Return a fulfilled manual-order payload only to its owning customer."""
         with self._connect() as db:
             row = db.execute(
                 """SELECT o.order_id,o.telegram_id,o.product_id,o.amount_minor,o.currency,o.status,
@@ -1286,7 +1286,7 @@ class CustomerDataStore:
                    WHERE o.tenant_id=? AND o.order_id=? AND o.telegram_id=?""",
                 (self.tenant_id, str(order_id), int(telegram_id)),
             ).fetchone()
-        if not row or row["status"] != "fulfilled" or row["delivery_mode_snapshot"] != "file" or not row["delivery_payload"]:
+        if not row or row["status"] != "fulfilled" or not str(row["delivery_payload"] or "").strip():
             return None
         return dict(row)
 
@@ -1884,7 +1884,9 @@ class CustomerDataStore:
             ).fetchall()
             manual_rows = db.execute(
                 """SELECT order_id,product_id,amount_minor,currency,status,created_at,
-                          product_title_snapshot,delivery_mode_snapshot
+                          product_title_snapshot,delivery_mode_snapshot,
+                          CASE WHEN status='fulfilled' AND COALESCE(TRIM(delivery_payload),'')<>''
+                               THEN 1 ELSE 0 END AS has_delivery_payload
                    FROM manual_product_orders
                    WHERE tenant_id=? AND telegram_id=?
                    ORDER BY created_at DESC,order_id DESC LIMIT ?""",
@@ -1908,7 +1910,10 @@ class CustomerDataStore:
         for row in manual_rows:
             item = dict(row)
             delivery_mode = str(item.pop("delivery_mode_snapshot", "") or "")
-            item["can_redeliver_file"] = item.get("status") == "fulfilled" and delivery_mode == "file"
+            has_delivery_payload = bool(item.pop("has_delivery_payload", False))
+            item["can_redeliver_file"] = item.get("status") == "fulfilled" and delivery_mode == "file" and has_delivery_payload
+            item["can_redeliver_delivery"] = item.get("status") == "fulfilled" and has_delivery_payload
+            item["delivery_mode"] = delivery_mode
             item["title"] = str(item.pop("product_title_snapshot", "") or item["product_id"])
             item["amount_minor"] = int(item["amount_minor"])
             item["discount_amount_minor"] = 0

@@ -2062,7 +2062,7 @@ class CustomerDataStoreTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=19 AND name='manual_product_telegram_file_delivery'").fetchone()[0], 1)
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
-    def test_customer_order_history_flags_only_owned_fulfilled_file_orders_for_redelivery(self):
+    def test_customer_order_history_flags_only_owned_fulfilled_orders_with_payload_for_redelivery(self):
         self.store.ensure_customer(1001, first_name="Buyer")
         self.store.post_wallet_entry(telegram_id=1001, idempotency_key="history-file-fund", amount_minor=1000, entry_type="deposit")
         self.store.put_manual_product(product_id="history-file", title="History file", price_minor=400,
@@ -2073,9 +2073,30 @@ class CustomerDataStoreTests(unittest.TestCase):
         history = self.store.list_customer_orders(1001)
         self.assertEqual(history[0]["order_id"], order["order_id"])
         self.assertTrue(history[0]["can_redeliver_file"])
+        self.assertTrue(history[0]["can_redeliver_delivery"])
+        self.assertEqual(history[0]["delivery_mode"], "file")
         self.assertNotIn("delivery_payload", history[0])
         self.assertNotIn("delivery_mode_snapshot", history[0])
         self.assertFalse(CustomerDataStore(self.path, tenant_id="bot-beta").list_customer_orders(1001))
+
+    def test_customer_order_history_allows_owner_only_redelivery_of_fulfilled_inventory_payload(self):
+        self.store.ensure_customer(1001, first_name="Buyer")
+        self.store.post_wallet_entry(telegram_id=1001, idempotency_key="history-inventory-fund", amount_minor=1000, entry_type="deposit")
+        self.store.put_manual_product(product_id="history-inventory", title="History key", price_minor=400,
+            currency="IRR", delivery_mode="inventory")
+        self.store.add_manual_inventory_key(product_id="history-inventory", secret_payload="UNIQUE-SECRET-KEY")
+        order = self.store.buy_manual_product(telegram_id=1001, product_id="history-inventory",
+            idempotency_key="history-inventory-order")
+        history = self.store.list_customer_orders(1001)
+        row = next(item for item in history if item["order_id"] == order["order_id"])
+        self.assertTrue(row["can_redeliver_delivery"])
+        self.assertFalse(row["can_redeliver_file"])
+        self.assertEqual(row["delivery_mode"], "inventory")
+        self.assertNotIn("UNIQUE-SECRET-KEY", str(row))
+        owned = self.store.get_manual_order_delivery(order_id=order["order_id"], telegram_id=1001)
+        self.assertEqual(owned["delivery_payload"], "UNIQUE-SECRET-KEY")
+        self.assertIsNone(self.store.get_manual_order_delivery(order_id=order["order_id"], telegram_id=1002))
+        self.assertEqual(self.store.wallet_balance(1001, "IRR"), 600)
 
     def test_manual_variant_file_delivery_uses_variant_snapshot_and_owner_scope(self):
         self.store.post_wallet_entry(telegram_id=1001, idempotency_key="variant-file-fund", amount_minor=1000, entry_type="deposit")

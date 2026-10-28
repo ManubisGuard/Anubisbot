@@ -3142,6 +3142,7 @@ class CustomerBot:
             LOG.warning("Security alert enqueue failed (%s)", type(exc).__name__)
 
     async def _send_manual_file_delivery(self, chat_id: int, order: dict[str, Any]) -> None:
+        """Deliver a file order, with a no-charge retry path if Telegram send fails."""
         order_id = str(order.get("order_id") or "")
         caption = (f"✅ سفارش {order_id[:20]}\nمحصول: {str(order.get('title') or '')[:180]}\n"
                    f"مبلغ: {int(order.get('amount_minor') or 0):,} {order.get('currency') or ''}")[:1024]
@@ -3154,6 +3155,28 @@ class CustomerBot:
             LOG.warning("Manual file delivery failed for order %s (%s)", order_id[:20], type(exc).__name__)
             await self.api.send_text(chat_id,
                 f"خرید ثبت شده و مبلغ دوباره کسر نمی‌شود؛ ارسال فایل ناموفق بود. با دکمه زیر دوباره تلاش کن.\nشناسه سفارش: {order_id}", keyboard)
+
+    async def _send_manual_order_delivery(self, chat_id: int, order: dict[str, Any]) -> None:
+        """Redeliver the exact fulfilled order payload; never re-run purchase or debit."""
+        if str(order.get("delivery_mode") or order.get("delivery_mode_snapshot") or "") == "file":
+            await self._send_manual_file_delivery(chat_id, order)
+            return
+        order_id = str(order.get("order_id") or "")
+        title = str(order.get("title") or "")
+        payload = str(order.get("delivery_payload") or "")
+        keyboard = {"inline_keyboard": [[{"text": "📦 دریافت دوباره اطلاعات تحویل",
+            "callback_data": f"customer:delivery_retry:{order_id}"}],
+            [{"text": "🏠 منوی اصلی", "callback_data": "customer:home"}]]}
+        body = (f"✅ اطلاعات تحویل سفارش قبلی\nمحصول: {title}\nشناسه سفارش: {order_id}\n\n"
+                f"اطلاعات تحویل:\n{payload}")
+        try:
+            await self.api.send_text(chat_id, body, keyboard)
+        except Exception as exc:
+            LOG.warning("Manual order redelivery failed for order %s (%s)", order_id[:20], type(exc).__name__)
+            # Keep the failure generic: the user can retry from their order history.
+            await self.api.send_text(chat_id,
+                f"ارسال اطلاعات این سفارش ناموفق بود و مبلغ دوباره کسر نمی‌شود. از تاریخچه سفارش دوباره تلاش کن.\nشناسه سفارش: {order_id}",
+                {"inline_keyboard": [[{"text": "📦 تاریخچه سفارش‌ها", "callback_data": "customer:orders:0"}]]})
 
     async def _handle_callback(self, query: dict[str, Any]) -> None:
         callback_id = query.get("id")
@@ -3996,9 +4019,11 @@ class CustomerBot:
                        if order.get("discount_code") else "")
                     + (f"\nآخرین تغییر: {order['updated_at']}" if order.get("updated_at") else "")
                 )
-                if order.get("can_redeliver_file"):
-                    file_buttons.append([{"text": f"📥 دریافت فایل {str(order['order_id'])[:8]}",
-                        "callback_data": f"customer:file_retry:{order['order_id']}"}])
+                if order.get("can_redeliver_delivery") or order.get("can_redeliver_file"):
+                    mode = str(order.get("delivery_mode") or "")
+                    label = "📥 دریافت فایل دوباره" if mode == "file" or order.get("can_redeliver_file") else "📦 دریافت دوباره اطلاعات تحویل"
+                    file_buttons.append([{"text": f"{label} {str(order['order_id'])[:8]}",
+                        "callback_data": f"customer:delivery_retry:{order['order_id']}"}])
                 if status in {"paid", "provisioning", "pending_delivery", "failed", "reconcile_required"}:
                     followup_buttons.append([{"text": f"🎫 پیگیری سفارش {str(order['order_id'])[:8]}",
                         "callback_data": "customer:support:new"}])
@@ -4067,13 +4092,13 @@ class CustomerBot:
         if key == "trials":
             await self.api.send_text(chat_id, "🧪 قابلیت تست/اشتراک آزمایشی هنوز پیاده‌سازی نشده و فعلاً در دسترس نیست. این گزینه تا زمان اتصال جریان واقعی فعال نخواهد شد.", BACK_MENU)
             return
-        if key.startswith("file_retry:"):
+        if key.startswith(("delivery_retry:", "file_retry:")):
             order_id = key.partition(":")[2].strip()
             order = self.data.get_manual_order_delivery(order_id=order_id, telegram_id=uid) if order_id else None
             if not order:
-                await self.api.send_text(chat_id, "فایل این سفارش در دسترس نیست یا سفارش متعلق به حساب شما نیست.", BACK_MENU)
+                await self.api.send_text(chat_id, "اطلاعات تحویل این سفارش در دسترس نیست یا سفارش متعلق به حساب شما نیست.", BACK_MENU)
                 return
-            await self._send_manual_file_delivery(chat_id, order)
+            await self._send_manual_order_delivery(chat_id, order)
             return
         if key.startswith("manualbuy_variants:"):
             parts = key.removeprefix("manualbuy_variants:").rsplit(":", 1)
