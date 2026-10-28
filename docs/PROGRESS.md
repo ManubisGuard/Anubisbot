@@ -490,3 +490,29 @@ The panel-product confirmation screen displayed the internal pricing mode in Eng
 ### Next Phase 2 task
 
 Audit the discount-code preview and final confirmation as one journey: show the undiscounted price, discount amount and final payable amount clearly; ensure expiry/use-limit/disabled-code failures return to a recoverable screen without wallet debit; keep the quote bound to discount configuration and reject stale confirmation. Do not add online gateways or run live panel tests.
+
+
+## Phase 2 slice 10 — discount preview clarity and recoverable invalid-code path (2026-10-28)
+
+### Audit finding
+
+The discount preview already showed the original price, percentage and final price, and its quote token was bound to the discount configuration. However, it did not show the exact currency amount saved or repeat service duration/traffic details at the final discounted confirmation step. Invalid/disabled codes kept the user in the code-entry path, but this recovery behavior lacked a focused regression test.
+
+### Implemented
+
+- Discount preview now shows the original amount, exact discount amount, percentage and final amount separately.
+- Added Persian pricing-mode label plus configured service duration and traffic cap, matching the normal panel quote.
+- Hourly/usage products repeat the wallet-billing and low-balance suspension-queue explanation on the discounted confirmation screen.
+- Added a regression test confirming disabled-code entry remains recoverable, does not create a purchase and does not debit the wallet.
+- Kept the existing quote hash, atomic discount claim and purchase-service validation; no payment or provider behavior was changed.
+
+### Validation
+
+- Focused customer bot suite: **149 tests passed in 28.154 seconds**, exit 0. Command: `PYTHONPATH=src:scripts/test_support python3 -m unittest discover -s tests -p 'test_customer_bot.py' -v`.
+- Full isolated suite: **515 tests passed in 64.588 seconds**, exit 0. Command: `./scripts/run_isolated_tests.sh`.
+- Static checks passed: `python3 -m compileall -q -f src tests scripts`; `bash -n scripts/*.sh`; `node --check customer_webapp/app.js`; `git diff --check`.
+- Evidence remains E2 local unit/mock only. No live Telegram bot, provider API, production panel/database, N2, timer, deployment, restart or secret was touched.
+
+### Next Phase 2 task
+
+Finish the customer purchase journey audit by checking the user-visible delivery/status messaging across manual fulfillment, file, inventory and panel orders against actual persisted state and notification retry behavior. Prioritize any mismatch that could imply delivery before it is persisted, cause a second charge, or expose a private payload. Do not add online gateways or run live panel tests.

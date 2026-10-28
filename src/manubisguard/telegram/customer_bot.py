@@ -2197,11 +2197,26 @@ class CustomerBot:
         self._pending_purchase_discount[telegram_id] = {"product_id": product_id, "discount_code": code,
             "quote_hash": quote_hash}
         original = int(product["price_minor"])
-        final = original - (original * int(discount["percentage"]) // 100)
+        discount_amount = original * int(discount["percentage"]) // 100
+        final = original - discount_amount
+        mode = str(product.get("pricing_mode") or "fixed")
+        mode_names = {"fixed":"قیمت ثابت", "unlimited":"حجم نامحدود", "hourly":"صورتحساب ساعتی", "usage":"صورتحساب بر اساس مصرف"}
+        duration_hours = int(product.get("duration_hours") or 0)
+        duration_line = f"\nمدت سرویس: {duration_hours:,} ساعت" if duration_hours else ""
+        traffic_bytes = int(product.get("traffic_bytes") or 0)
+        traffic_line = f"\nسقف ترافیک: {traffic_bytes / (1024 ** 3):g} GiB" if traffic_bytes > 0 else ""
+        billing_note = (
+            "\nهزینه مصرف زمان از کیف پول کسر می‌شود؛ با اتمام موجودی، سرویس برای تعلیق به صف می‌رود."
+            if mode == "hourly" else
+            "\nهزینه ترافیک مصرفی از کیف پول کسر می‌شود؛ با اتمام موجودی، سرویس برای تعلیق به صف می‌رود."
+            if mode == "usage" else ""
+        )
         await self.api.send_text(chat_id,
-            f"🎟 پیش‌نمایش کد تخفیف\nمحصول: {product['title']}\nقیمت فعلی: {original:,} {product['currency']}\n"
-            f"تخفیف: {int(discount['percentage'])}٪\nمبلغ نهایی: {final:,} {product['currency']}\n"
-            "قیمت و سهمیه هنگام تأیید دوباره در پایگاه داده بررسی می‌شود.",
+            f"🎟 پیش‌نمایش کد تخفیف\nمحصول: {product['title']}\nمدل پرداخت: {mode_names.get(mode, 'تعریف‌نشده')}"
+            f"{duration_line}{traffic_line}\nقیمت قبل از تخفیف: {original:,} {product['currency']}\n"
+            f"مبلغ تخفیف: {discount_amount:,} {product['currency']} ({int(discount['percentage'])}٪)\n"
+            f"مبلغ نهایی: {final:,} {product['currency']}\n"
+            f"قیمت و سهمیه هنگام تأیید دوباره در پایگاه داده بررسی می‌شود.{billing_note}",
             {"inline_keyboard":[
                 [{"text":"تأیید خرید با تخفیف","callback_data":f"customer:bd:{product_id}:{quote_hash}"}],
                 [{"text":"لغو","callback_data":"customer:discount_cancel"}]

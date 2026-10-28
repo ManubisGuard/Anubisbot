@@ -2137,7 +2137,12 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
             "from":{"id":999},"chat":{"id":999,"type":"private"},"text":"save20",
         })
         quote=self.bot.api.send_text.await_args.args[1]
-        self.assertIn("2,000",quote)
+        self.assertIn("قیمت قبل از تخفیف: 2,500 IRR", quote)
+        self.assertIn("مبلغ تخفیف: 500 IRR (20٪)", quote)
+        self.assertIn("مبلغ نهایی: 2,000 IRR", quote)
+        self.assertIn("مدل پرداخت: قیمت ثابت", quote)
+        self.assertIn("مدت سرویس: 24 ساعت", quote)
+        self.assertIn("سقف ترافیک: 1 GiB", quote)
         keyboard=self.bot.api.send_text.await_args.args[2]
         discount_confirm_callback = keyboard["inline_keyboard"][0][0]["callback_data"]
         self.assertTrue(discount_confirm_callback.startswith("customer:bd:basic:"))
@@ -2159,6 +2164,26 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(":discount:SAVE20",self.bot.purchase_service.buy_from_wallet.await_args.kwargs["idempotency_key"])
         self.assertNotIn(999,self.bot._pending_purchase_discount)
 
+
+    async def test_disabled_discount_code_returns_to_recoverable_input_without_purchase(self):
+        self.bot.data.register_panel_connection(panel_id="disabled-discount-panel", label="Fake", provider="pasarguard",
+            base_url="https://panel.example", auth_mode="api_key", secret_ref="env:PANEL_KEY", enabled=True)
+        self.bot.data.put_product(product_id="discount-recovery", title="Discount recovery", price_minor=1000,
+            panel_id="disabled-discount-panel", traffic_bytes=1024**3, duration_hours=24, group_ids=["1"])
+        self.bot.data.put_discount_code(code="OFF", percentage=10, max_uses=1)
+        self.bot.data.set_discount_code_enabled("OFF", False)
+        self.bot.purchase_service.buy_from_wallet = AsyncMock()
+        await self.bot._handle_callback({"id":"discount-recovery-start", "from":{"id":999},
+            "message":{"chat":{"id":999,"type":"private"},"message_id":23},
+            "data":"customer:buy_discount:discount-recovery"})
+        await self.bot._handle_message({"from":{"id":999},"chat":{"id":999,"type":"private"},"text":"OFF"})
+        body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("کد تخفیف معتبر یا فعال نیست", body)
+        self.assertIn("کد دیگری بفرست", body)
+        self.assertEqual(self.bot._pending_purchase_discount[999],
+            {"product_id":"discount-recovery", "discount_code":""})
+        self.bot.purchase_service.buy_from_wallet.assert_not_awaited()
+        self.assertEqual(self.bot.data.wallet_balance(999, "IRR"), 0)
 
     async def test_admin_attaches_file_and_customer_receives_replayable_document_without_second_charge(self):
         self.bot.api.call = AsyncMock(return_value={"ok": True})
