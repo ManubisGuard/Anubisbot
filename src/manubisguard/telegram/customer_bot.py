@@ -4239,18 +4239,40 @@ class CustomerBot:
             if not product:
                 await self.api.send_text(chat_id, "این محصول دیگر فعال نیست.", BACK_MENU)
                 return
-            mode = product["pricing_mode"]
+            mode = str(product["pricing_mode"])
+            mode_names = {"fixed":"قیمت ثابت", "unlimited":"حجم نامحدود", "hourly":"صورتحساب ساعتی", "usage":"صورتحساب بر اساس مصرف"}
             rate = int(product["unit_price_minor"])
             price = int(product["price_minor"])
             price_line = f"هزینه اولیه: {price:,} {product['currency']}"
-            if mode == "hourly": price_line += f"\nنرخ مصرف زمان: {rate:,} {product['currency']} در ساعت"
-            elif mode == "usage": price_line += f"\nنرخ ترافیک: {rate:,} {product['currency']} به‌ازای هر GiB"
+            if mode == "hourly":
+                price_line += f"\nنرخ مصرف زمان: {rate:,} {product['currency']} در ساعت"
+            elif mode == "usage":
+                price_line += f"\nنرخ ترافیک: {rate:,} {product['currency']} به‌ازای هر GiB"
+            duration_hours = int(product.get("duration_hours") or 0)
+            duration_line = f"\nمدت سرویس: {duration_hours:,} ساعت" if duration_hours else ""
+            traffic_bytes = int(product.get("traffic_bytes") or 0)
+            traffic_line = f"\nسقف ترافیک: {traffic_bytes / (1024 ** 3):g} GiB" if traffic_bytes > 0 else ""
+            description = str(product.get("description") or "").strip()
+            description_line = "\n\nتوضیحات: " + (description if len(description) <= 900 else description[:897].rstrip() + "...") if description else ""
+            billing_note = (
+                "\nهزینه بر اساس مصرف زمان از کیف پول محاسبه می‌شود؛ با اتمام موجودی، سرویس برای تعلیق به صف می‌رود."
+                if mode == "hourly" else
+                "\nهزینه بر اساس ترافیک مصرف‌شده از کیف پول محاسبه می‌شود؛ با اتمام موجودی، سرویس برای تعلیق به صف می‌رود."
+                if mode == "usage" else
+                "\nمبلغ اولیه هنگام تأیید از کیف پول رزرو می‌شود."
+            )
             try:
                 quote_hash = self.data.product_purchase_quote_hash(product_id)
             except CustomerStoreError:
                 await self.api.send_text(chat_id, "این محصول دیگر برای خرید در دسترس نیست.", BACK_MENU)
                 return
-            await self.api.send_text(chat_id, f"تأیید خرید «{product['title']}»\nمدل: {mode}\n{price_line}\nموجودی فعلی: {self.data.wallet_balance(uid, product['currency']):,} {product['currency']}\n\nبا تأیید، مبلغ اولیه از کیف پول رزرو می‌شود و درخواست ساخت سرویس به پنل ارسال خواهد شد. اگر قیمت یا تنظیمات تغییر کند، باید این صفحه را دوباره باز کنی.", {"inline_keyboard":[[{"text":"تأیید خرید","callback_data":f"customer:buy_confirm:{product_id}:{quote_hash}","style":"success"}],[{"text":"🎟 ورود کد تخفیف","callback_data":f"customer:buy_discount:{product_id}"}],[{"text":"انصراف","callback_data":"customer:shop"}]]})
+            quote_body = (
+                f"تأیید خرید «{product['title']}»\nمدل پرداخت: {mode_names.get(mode, 'تعریف‌نشده')}\n"
+                f"{price_line}{duration_line}{traffic_line}{description_line}\n"
+                f"موجودی فعلی کیف پول: {self.data.wallet_balance(uid, product['currency']):,} {product['currency']}"
+                f"{billing_note}\n\nاگر قیمت یا تنظیمات خرید تغییر کند، این پیش‌نمایش منقضی می‌شود و باید دوباره بررسی‌اش کنی."
+            )
+            await self.api.send_text(chat_id, quote_body, {"inline_keyboard":[[{"text":"تأیید خرید","callback_data":f"customer:buy_confirm:{product_id}:{quote_hash}","style":"success"}],[{"text":"🎟 ورود کد تخفیف","callback_data":f"customer:buy_discount:{product_id}"}],[{"text":"انصراف","callback_data":"customer:shop"}]]})
             return
         if key == "discount_cancel":
             self._pending_purchase_discount.pop(uid, None)

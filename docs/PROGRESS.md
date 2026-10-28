@@ -463,3 +463,30 @@ A panel-backed purchase persisted the service and marked the order active before
 - Telegram delivery is at-least-once, not exactly-once: a network failure after Telegram accepted a message but before the client received confirmation can still cause a duplicate notice. The worker never repeats provider creation or wallet charging.
 - There is no operator-facing dead-letter requeue command for this new panel-order queue yet; dead letters remain visible in SQLite for a future admin-operations slice. The normal My Services and order-history paths remain available as customer recovery paths.
 - Continue Phase 2 by auditing product detail/quote clarity and verifying fulfillment-state alignment across manual, file, inventory and panel-backed orders. Do not repeat completed navigation/wallet recovery work or run live panel tests.
+
+
+## Phase 2 slice 9 — panel product quote clarity (2026-10-28)
+
+### Audit finding
+
+The panel-product confirmation screen displayed the internal pricing mode in English (`fixed`, `usage`, etc.) and omitted the product duration, traffic quota and public description. The catalog gave some metered-billing guidance, but the last confirmation screen did not repeat the recurring billing behavior or what happens when the wallet is depleted.
+
+### Implemented
+
+- Replaced internal pricing identifiers with Persian customer-facing labels: fixed price, unlimited traffic, hourly billing and usage-based billing.
+- Added configured service duration and traffic quota to the confirmation quote when present.
+- Added bounded public product description (maximum 900 characters plus truncation marker); no provider binding, secret, service identifier or private subscription URL is displayed.
+- Clarified that the initial amount is reserved at confirmation, and for hourly/usage plans that charges accrue from the wallet and service suspension is queued if the wallet runs out.
+- Preserved the existing quote hash and confirmation callback, so the purchase still rejects stale price/configuration before wallet debit or provider mutation.
+- Added regression tests for fixed quote details and metered usage billing copy.
+
+### Validation
+
+- Focused customer bot suite: **148 tests passed in 28.183 seconds**, exit 0. Command: `PYTHONPATH=src:scripts/test_support python3 -m unittest discover -s tests -p 'test_customer_bot.py' -v`.
+- Full isolated suite: **514 tests passed in 65.077 seconds**, exit 0. Command: `./scripts/run_isolated_tests.sh`.
+- Static checks passed: `python3 -m compileall -q -f src tests scripts`; `bash -n scripts/*.sh`; `node --check customer_webapp/app.js`; `git diff --check`.
+- Evidence remains E2 local unit/mock only. No live Telegram bot, provider API, production panel/database, N2, timer, deployment, restart or secret was touched.
+
+### Next Phase 2 task
+
+Audit the discount-code preview and final confirmation as one journey: show the undiscounted price, discount amount and final payable amount clearly; ensure expiry/use-limit/disabled-code failures return to a recoverable screen without wallet debit; keep the quote bound to discount configuration and reject stale confirmation. Do not add online gateways or run live panel tests.

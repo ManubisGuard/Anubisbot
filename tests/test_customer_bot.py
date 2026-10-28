@@ -2013,6 +2013,12 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback({"id":"quote-product-select","from":{"id":999},
             "message":{"chat":{"id":999,"type":"private"},"message_id":11},
             "data":"customer:buy:quote-product"})
+        quote_body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("مدل پرداخت: قیمت ثابت", quote_body)
+        self.assertIn("مدت سرویس: 24 ساعت", quote_body)
+        self.assertIn("سقف ترافیک: 1 GiB", quote_body)
+        self.assertIn("مبلغ اولیه هنگام تأیید", quote_body)
+        self.assertNotIn("مدل: fixed", quote_body)
         callback = self.bot.api.send_text.await_args.args[2]["inline_keyboard"][0][0]["callback_data"]
         self.assertTrue(callback.startswith("customer:buy_confirm:quote-product:"))
         quote_hash = callback.rsplit(":",1)[1]
@@ -2023,6 +2029,23 @@ class CustomerBotUITests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback({"id":"quote-product-confirm","from":{"id":999},
             "message":{"chat":{"id":999,"type":"private"},"message_id":12},"data":callback})
         self.assertEqual(self.bot.purchase_service.buy_from_wallet.await_args.kwargs["expected_quote_hash"], quote_hash)
+
+    async def test_metered_panel_quote_explains_recurring_wallet_billing_in_persian(self):
+        self.bot.data.register_panel_connection(panel_id="metered-quote-panel", label="Fake", provider="pasarguard",
+            base_url="https://panel.example", auth_mode="api_key", secret_ref="env:PANEL_KEY", enabled=True)
+        self.bot.data.put_product(product_id="metered-quote", title="Metered plan", price_minor=500,
+            panel_id="metered-quote-panel", pricing_mode="usage", unit_price_minor=120,
+            traffic_bytes=5 * 1024**3, duration_hours=72, group_ids=["1"], description="توضیح محصول")
+        await self.bot._handle_callback({"id":"metered-quote-select", "from":{"id":999},
+            "message":{"chat":{"id":999,"type":"private"},"message_id":21},
+            "data":"customer:buy:metered-quote"})
+        body = self.bot.api.send_text.await_args.args[1]
+        self.assertIn("مدل پرداخت: صورتحساب بر اساس مصرف", body)
+        self.assertIn("نرخ ترافیک: 120 IRR به‌ازای هر GiB", body)
+        self.assertIn("مدت سرویس: 72 ساعت", body)
+        self.assertIn("سقف ترافیک: 5 GiB", body)
+        self.assertIn("با اتمام موجودی، سرویس برای تعلیق به صف می‌رود", body)
+        self.assertIn("توضیحات: توضیح محصول", body)
 
     async def test_panel_order_outbox_recovers_customer_message_with_private_service_details(self):
         self.bot.data.ensure_customer(999, username="buyer", first_name="Buyer")
